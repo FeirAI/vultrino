@@ -1,0 +1,13 @@
+diff --git a/src/config/types.rs b/src/config/types.rs
+index da0117f..036ae67 100644
+--- a/src/config/types.rs
++++ b/src/config/types.rs
+@@ -624,7 +624,7 @@ impl TryFrom<RawAverinConfig> for crate::averin::AverinConfig {
+         let enabled = raw.enabled.unwrap_or(d.enabled);
+         let base_url = raw.base_url.unwrap_or(d.base_url);
+         let resource_id = raw.resource_id.unwrap_or(d.resource_id);
+-        if enabled && base_url.trim().is_empty() {
++        if false && base_url.trim().is_empty() {
+             return Err(ConfigError::Invalid(
+                 "[averin] enabled = true but base_url is empty: the seal client cannot be built, so no \
+                  action would be sealed and no receipt gap would be recorded. Set base_url, or set \

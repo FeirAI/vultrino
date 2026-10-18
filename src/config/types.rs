@@ -643,12 +643,46 @@ impl TryFrom<RawAverinConfig> for crate::averin::AverinConfig {
                     .to_string(),
             ));
         }
+        // FEI-33: an `enabled = true` block that cannot build a seal client used to start the
+        // server with the client silently off (a warn line), so every Observe action then ran with
+        // no receipt and no evidence.receipt_gap event. Refuse to start instead: the operator asked
+        // for evidence and cannot be given it.
+        let enabled = raw.enabled.unwrap_or(d.enabled);
+        let base_url = raw.base_url.unwrap_or(d.base_url);
+        let resource_id = raw.resource_id.unwrap_or(d.resource_id);
+        if enabled && base_url.trim().is_empty() {
+            return Err(ConfigError::Invalid(
+                "[averin] enabled = true but base_url is empty: the seal client cannot be built, so no \
+                 action would be sealed and no receipt gap would be recorded. Set base_url, or set \
+                 enabled = false."
+                    .to_string(),
+            ));
+        }
+        if enabled && resource_id.trim().is_empty() {
+            return Err(ConfigError::Invalid(
+                "[averin] enabled = true but resource_id is empty (it must equal averin's \
+                 AVERIN_RESOURCE_ID): the seal client cannot be built, so no action would be sealed \
+                 and no receipt gap would be recorded. Set resource_id, or set enabled = false."
+                    .to_string(),
+            ));
+        }
+        // The same URL parse and plain-http refusal (VUL-29) the client constructor applies: a base_url
+        // that cannot be parsed, or plain http:// to a public address, makes `AverinClient::new` fail.
+        if enabled {
+            if let Err(why) = crate::plain_http::check(&base_url) {
+                return Err(ConfigError::Invalid(format!(
+                    "[averin] enabled = true but base_url {base_url:?} is refused ({why}): the seal \
+                     client cannot be built, so no action would be sealed and no receipt gap would \
+                     be recorded. Fix base_url, or set enabled = false."
+                )));
+            }
+        }
         Ok(Self {
-            enabled: raw.enabled.unwrap_or(d.enabled),
-            base_url: raw.base_url.unwrap_or(d.base_url),
+            enabled,
+            base_url,
             project_id: raw.project_id.unwrap_or(d.project_id),
             session_id: raw.session_id.unwrap_or(d.session_id),
-            resource_id: raw.resource_id.unwrap_or(d.resource_id),
+            resource_id,
             // Sourced from AVERIN_API_KEY at startup, never TOML.
             api_key: None,
             mode,
@@ -710,6 +744,13 @@ pub struct RawApprovalConfig {
 pub struct RawTelegramConfig {
     pub bot_token: String,
     pub chat_id: String,
+    /// FEI-16: attribute each button press to the Telegram user who pressed it. Needs a numeric
+    /// `chat_id` and `[approvals.telegram.approvers]`. Default off (URL buttons).
+    #[serde(default)]
+    pub callback_decisions: Option<bool>,
+    /// Telegram user id (as a string key) -> the named approver identity that person decides as.
+    #[serde(default)]
+    pub approvers: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -843,10 +884,36 @@ impl TryFrom<RawApprovalConfig> for crate::approval::ApprovalConfig {
             enabled,
             ttl_secs: raw.ttl_secs.unwrap_or(3600),
             public_base_url: raw.public_base_url,
-            telegram: raw.telegram.map(|t| crate::approval::TelegramConfig {
-                bot_token: t.bot_token,
-                chat_id: t.chat_id,
-            }),
+            telegram: raw
+                .telegram
+                .map(|t| -> Result<crate::approval::TelegramConfig, ConfigError> {
+                    let callback = if t.callback_decisions.unwrap_or(false) {
+                        let pairs: Vec<(String, String)> = t.approvers.into_iter().collect();
+                        Some(
+                            crate::approval::telegram_callbacks::TelegramCallbackConfig::build(
+                                &t.chat_id, &pairs,
+                            )
+                            .map_err(ConfigError::Invalid)?,
+                        )
+                    } else if !t.approvers.is_empty() {
+                        return Err(ConfigError::Invalid(
+                            "approvals.telegram.approvers is set but callback_decisions is not true; \
+                             the table would be ignored and every verdict would still be recorded as \
+                             oob_approver_identity. Set callback_decisions = true or remove the table"
+                                .to_string(),
+                        ));
+                    } else {
+                        None
+                    };
+                    Ok(crate::approval::TelegramConfig {
+                        bot_token: t.bot_token,
+                        chat_id: t.chat_id,
+                        api_base: crate::approval::telegram_callbacks::TELEGRAM_API_BASE
+                            .to_string(),
+                        callback,
+                    })
+                })
+                .transpose()?,
             webhook: raw.webhook.map(|w| crate::approval::WebhookConfig {
                 url: w.url,
                 auth_header: w.auth_header,
@@ -1412,6 +1479,74 @@ action = "deny"
         }
     }
 
+    /// FEI-33: `enabled = true` with no base_url or no resource_id cannot build a seal client; the
+    /// server used to start with it silently off, so no Observe action got a receipt or a gap event.
+    /// Now the config does not load. A disabled block (staged, not turned on) is not judged.
+    #[test]
+    fn fei33_enabled_averin_without_base_url_or_resource_id_refuses_to_load() {
+        for (toml, names) in [
+            ("[averin]\nenabled = true", "base_url"),
+            (
+                "[averin]\nenabled = true\nbase_url = \"  \"\nresource_id = \"r\"",
+                "base_url",
+            ),
+            (
+                "[averin]\nenabled = true\nbase_url = \"http://x\"",
+                "resource_id",
+            ),
+            (
+                "[averin]\nenabled = true\nbase_url = \"http://x\"\nresource_id = \" \"",
+                "resource_id",
+            ),
+        ] {
+            let msg = Config::parse(toml)
+                .expect_err("an enabled averin block that cannot build a client must refuse")
+                .to_string();
+            assert!(
+                msg.contains(names) && msg.contains("receipt"),
+                "{toml:?}: {msg}"
+            );
+        }
+        assert!(Config::parse("[averin]\nenabled = false").is_ok());
+        assert!(Config::parse(
+            "[averin]\nenabled = true\nbase_url = \"http://x\"\nresource_id = \"r\""
+        )
+        .is_ok());
+    }
+
+    /// FEI-33 (review round 1): a base_url the seal client constructor refuses (it does not parse, or
+    /// it is plain http:// to a public address, VUL-29) used to start the server with the client off
+    /// behind a warn line. It must not load. The same values on a disabled block are not judged, and
+    /// https or a private http address still load.
+    #[test]
+    fn fei33_enabled_averin_with_an_unusable_base_url_refuses_to_load() {
+        for url in [
+            "averin:8080",
+            "not a url",
+            "http://203.0.113.9:8080",
+            "ftp://10.0.0.1/",
+        ] {
+            let toml = format!("[averin]\nenabled = true\nbase_url = {url:?}\nresource_id = \"r\"");
+            let msg = Config::parse(&toml)
+                .expect_err("an enabled averin block with an unusable base_url must refuse")
+                .to_string();
+            assert!(
+                msg.contains("base_url") && msg.contains("receipt"),
+                "{url}: {msg}"
+            );
+            let off = toml.replace("enabled = true", "enabled = false");
+            assert!(Config::parse(&off).is_ok(), "{url} on a disabled block");
+        }
+        for url in [
+            "https://averin.example.com",
+            "http://10.0.0.5:8080",
+            "http://127.0.0.1:8080",
+        ] {
+            let toml = format!("[averin]\nenabled = true\nbase_url = {url:?}\nresource_id = \"r\"");
+            assert!(Config::parse(&toml).is_ok(), "{url}");
+        }
+    }
+
     #[test]
     fn averin_mode_is_closed_and_typos_fail_config_load() {
         for mode in ["Observe", "require-evidnce", "best_effort", ""] {
@@ -1445,10 +1580,12 @@ action = "deny"
         // byte-identical-to-087 default.
         assert!(!Config::parse("").unwrap().averin.durable);
         assert!(
-            !Config::parse("[averin]\nenabled = true")
-                .unwrap()
-                .averin
-                .durable
+            !Config::parse(
+                "[averin]\nenabled = true\nbase_url = \"http://x\"\nresource_id = \"r\""
+            )
+            .unwrap()
+            .averin
+            .durable
         );
         // Explicit durable = true (with the default Observe mode) parses fine.
         let cfg = Config::parse(
@@ -1457,5 +1594,60 @@ action = "deny"
         .unwrap();
         assert!(cfg.averin.durable);
         assert_eq!(cfg.averin.mode, crate::averin::AverinMode::Observe);
+    }
+
+    // ---- FEI-16: Telegram callback decisions ------------------------------------------
+
+    fn tg_cfg(extra: &str) -> String {
+        format!(
+            "[approvals]\noob_approver_identity = \"oncall@example.com\"\n\
+             [approvals.telegram]\nbot_token = \"123:abc\"\nchat_id = \"-1001\"\n{extra}"
+        )
+    }
+
+    #[test]
+    fn fei16_callback_decisions_parse_into_a_user_to_identity_table() {
+        let cfg = Config::parse(&tg_cfg(
+            "callback_decisions = true\n[approvals.telegram.approvers]\n\"11\" = \"alice@example.com\"\n\"22\" = \"bob@example.com\"\n",
+        ))
+        .unwrap();
+        let cb = cfg
+            .approval
+            .telegram
+            .unwrap()
+            .callback
+            .expect("callback mode on");
+        assert_eq!(cb.chat_id, -1001);
+        assert_eq!(cb.identity_for(11), Some("alice@example.com"));
+        assert_eq!(cb.identity_for(22), Some("bob@example.com"));
+    }
+
+    #[test]
+    fn fei16_default_is_the_url_buttons_with_one_identity() {
+        let cfg = Config::parse(&tg_cfg("")).unwrap();
+        assert!(cfg.approval.telegram.unwrap().callback.is_none());
+    }
+
+    #[test]
+    fn fei16_an_approvers_table_without_callback_decisions_is_refused() {
+        // Otherwise the table is silently ignored and every verdict stays one identity.
+        let err = Config::parse(&tg_cfg(
+            "[approvals.telegram.approvers]\n\"11\" = \"alice@example.com\"\n",
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("callback_decisions"), "{err}");
+    }
+
+    #[test]
+    fn fei16_callback_mode_refuses_ambiguous_tables() {
+        // No approvers; a channel name; two people on one identity.
+        assert!(Config::parse(&tg_cfg("callback_decisions = true\n")).is_err());
+        let named = "[approvals]\noob_approver_identity = \"o@x\"\n[approvals.telegram]\nbot_token = \"1:a\"\nchat_id = \"@chan\"\ncallback_decisions = true\n[approvals.telegram.approvers]\n\"11\" = \"a@x\"\n";
+        assert!(Config::parse(named).is_err());
+        assert!(Config::parse(&tg_cfg(
+            "callback_decisions = true\n[approvals.telegram.approvers]\n\"11\" = \"a@x\"\n\"22\" = \"A@X\"\n"
+        ))
+        .is_err());
     }
 }

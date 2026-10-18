@@ -1,0 +1,12 @@
+diff --git a/src/approval/telegram_callbacks.rs b/src/approval/telegram_callbacks.rs
+index 7b24292..e57a4bc 100644
+--- a/src/approval/telegram_callbacks.rs
++++ b/src/approval/telegram_callbacks.rs
+@@ -320,7 +320,6 @@ pub async fn run_callback_loop(
+     // The bot token is in every request path and each press is a decision: same rules as every
+     // other secret-bearing client (plain http only to a private address, never an ambient proxy).
+     let client = match crate::plain_http::guard(reqwest::Client::builder(), &tg.api_base)
+-        .no_proxy()
+         .redirect(reqwest::redirect::Policy::none())
+         .connect_timeout(std::time::Duration::from_secs(10))
+         .timeout(std::time::Duration::from_secs(40))

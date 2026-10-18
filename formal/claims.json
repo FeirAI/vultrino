@@ -529,6 +529,30 @@
     "vault-file-gone-compact-rename-unchecked": {
       "tier": "fast"
     },
+    "receipt-gap-async-seal-failure-not-recorded": {
+      "tier": "fast"
+    },
+    "receipt-gap-dead-letter-not-recorded": {
+      "tier": "full"
+    },
+    "telegram-callback-unlisted-user-falls-back-to-shared-identity": {
+      "tier": "fast"
+    },
+    "secret-fp-relationship-not-in-message": {
+      "tier": "fast"
+    },
+    "posture-unusable-approver-key-reported": {
+      "tier": "fast"
+    },
+    "posture-averin-key-reported-while-seal-client-off": {
+      "tier": "full"
+    },
+    "averin-enabled-config-accepts-empty-base-url": {
+      "tier": "full"
+    },
+    "averin-enabled-config-accepts-empty-resource-id": {
+      "tier": "full"
+    },
     "url-exact-prompt-refused-in-default-deny": {
       "tier": "full",
       "claim": "policy-write-refuses-warned-deny-prompt-patterns"
@@ -669,6 +693,46 @@
       "tier": "fast",
       "claim": "egress-no-ambient-proxy"
     },
+    "workspace-scope-server-strip-removed": {
+      "tier": "fast",
+      "claim": "anthropic-workspace-id-operator-owned"
+    },
+    "workspace-scope-plugin-strip-removed": {
+      "tier": "fast",
+      "claim": "anthropic-workspace-id-operator-owned"
+    },
+    "workspace-scope-not-injected": {
+      "tier": "fast",
+      "claim": "anthropic-workspace-id-operator-owned"
+    },
+    "workspace-scope-use-time-recheck-removed": {
+      "tier": "fast",
+      "claim": "anthropic-workspace-id-operator-owned"
+    },
+    "workspace-scope-applied-after-consume": {
+      "tier": "fast",
+      "claim": "anthropic-workspace-id-operator-owned"
+    },
+    "workspace-id-format-check-removed": {
+      "tier": "fast",
+      "claim": "anthropic-workspace-id-operator-owned"
+    },
+    "posture-workload-assertion-not-reported": {
+      "tier": "full",
+      "claim": "secret-fingerprint-report"
+    },
+    "posture-workload-reports-only-first-secret": {
+      "tier": "full",
+      "claim": "secret-fingerprint-report"
+    },
+    "averin-enabled-config-accepts-unusable-base-url": {
+      "tier": "full",
+      "claim": "observe-receipt-gap-recorded"
+    },
+    "averin-enabled-server-start-ignores-client-error": {
+      "tier": "fast",
+      "claim": "observe-receipt-gap-recorded"
+    },
     "vault-fence-reader-skips-writer-gate": {
       "tier": "full"
     },
@@ -708,29 +772,11 @@
     "vault-backup-ignores-restore-pending": {
       "tier": "full"
     },
-    "workspace-scope-server-strip-removed": {
-      "tier": "fast",
-      "claim": "anthropic-workspace-id-operator-owned"
+    "posture-averin-api-key-configured-not-reported": {
+      "tier": "full"
     },
-    "workspace-scope-plugin-strip-removed": {
-      "tier": "fast",
-      "claim": "anthropic-workspace-id-operator-owned"
-    },
-    "workspace-scope-not-injected": {
-      "tier": "fast",
-      "claim": "anthropic-workspace-id-operator-owned"
-    },
-    "workspace-scope-use-time-recheck-removed": {
-      "tier": "fast",
-      "claim": "anthropic-workspace-id-operator-owned"
-    },
-    "workspace-scope-applied-after-consume": {
-      "tier": "fast",
-      "claim": "anthropic-workspace-id-operator-owned"
-    },
-    "workspace-id-format-check-removed": {
-      "tier": "fast",
-      "claim": "anthropic-workspace-id-operator-owned"
+    "posture-averin-api-key-configured-hardcoded-false": {
+      "tier": "full"
     }
   },
   "claims": [
@@ -2356,7 +2402,7 @@
         {
           "path": "src/main.rs",
           "symbol": "run_web_server",
-          "sha256": "801726ec90b0c88d2a366686dc62ab37dcf72d3d1aaec8b47b66a243dca477f6"
+          "sha256": "36ffcf25d3c521e2f74c7d7a99dfb00c86bbd226a1d0994271c101c0c42746b7"
         },
         {
           "path": "src/main.rs",
@@ -2366,7 +2412,7 @@
         {
           "path": "src/main.rs",
           "symbol": "run_mcp_server",
-          "sha256": "9cca123afa27f04a4b0da83752183d3e697e6eea8fff57a621f96f6fc6d3e728"
+          "sha256": "1f5bfaabc470beae24351f4f7c68ee7e9265b981edae53bd7e1130bdaaa44d5f"
         }
       ],
       "mutants": [
@@ -3151,7 +3197,7 @@
     },
     {
       "id": "posture-report-live",
-      "statement": "GET /api/v1/posture answers only to a global (untenanted) admin key and reports, from the running process, the policy engine's live default (deny or allow), whether separation of duty is enforced, whether the approver-identity key is configured, distinct from the govder key, or on the shared-key escape, which tenants are in observe mode, which enforced policies have a RateLimit condition with a non-deny default, whether an explicit upstream proxy is configured (never its URL) and that the plugin egress client does not honour the ambient proxy variables (the field plugin_ambient_proxy_honoured; the approval notifier client also ignores them, the outbox, govder and averin clients still do), whether an inbound [identity] header is configured and its signing key is present, the [averin] D8 evidence floor mode as configured and as in effect (it takes effect only with d8_complete_evidence on), the vault format version this binary writes, and the rustc and git commit it was built with. The report holds booleans, counts and identifiers only.",
+      "statement": "GET /api/v1/posture answers only to a global (untenanted) admin key and reports, from the running process, the policy engine's live default (deny or allow), whether separation of duty is enforced, whether the approver-identity key is configured, distinct from the govder key, or on the shared-key escape, which tenants are in observe mode, which enforced policies have a RateLimit condition with a non-deny default, whether an explicit upstream proxy is configured (never its URL) and that the plugin egress client does not honour the ambient proxy variables (the field plugin_ambient_proxy_honoured; the approval notifier client also ignores them, the outbox, govder and averin clients still do), whether an inbound [identity] header is configured and its signing key is present, the [averin] D8 evidence floor mode as configured and as in effect (it takes effect only with d8_complete_evidence on), the vault format version this binary writes, and the rustc and git commit it was built with. The report holds booleans, counts, identifiers and secret fingerprints only (see secret-fingerprint-report).",
       "method": "test",
       "artifacts": [
         "src/web/posture.rs",
@@ -3169,12 +3215,12 @@
         {
           "path": "src/web/posture.rs",
           "symbol": "build_posture",
-          "sha256": "98d0c68d70d9c963cbda393a1a5323857bb0dbc72a6f91039115d0060176ef98"
+          "sha256": "7494e006c6b111bc88fad30597516b7b7ea8b18612ec434d89a29b42deafdcc7"
         },
         {
           "path": "src/web/api.rs",
           "symbol": "api_posture",
-          "sha256": "3e91735e5717fcb0a343c6ff4747c200f63d52995f0f497a474e8bd943a02dfd"
+          "sha256": "4a678ddb19951c265eb234fcf3a21598dea30340a538bcf970da29813236259d"
         },
         {
           "path": "src/policy/types.rs",
@@ -3201,11 +3247,205 @@
         "rate-limit-predicate-inverted"
       ],
       "does_not_establish": "That the process enforces what it reports beyond the code paths those fields are read from: the report reads the engine and config objects the request handlers use, it does not re-run a policy decision. It does not prove the approver key is strong, rotated or known only to the broker, that the vault file on disk is at the reported format version (the field is the version this binary writes, a vault is migrated when opened), that no second vultrino process shares the vault (a process cannot see its peers), or that a deployment actually calls the endpoint: that is the feir-os posture verifier. The git commit is the one the build script saw; a build from an archive reports unknown. The detector runs the endpoint against an in-memory test router, not a deployed binary. The egress and identity fields report configuration, not what any request did.",
-      "evidence_run": "38762181897"
+      "evidence_run": "38667982636"
+    },
+    {
+      "id": "observe-receipt-gap-recorded",
+      "statement": "With [averin] enabled in Observe mode, every use receipt that does not reach Averin is recorded as an individual gap, not only counted: a failed or timed-out async seal, a seal dropped because the async fan-out was saturated, params over max_seal_params_bytes (async and durable paths), a failed local durable enqueue, a durable use receipt that exhausted its delivery attempts (a dead-lettered grant is not a receipt and records none), and a seal task lost before it recorded an outcome; each gap carries the token id, project, request id, use sequence number, one of six fixed reasons and a detail clipped to 200 characters, and never the params; the pending buffer holds at most 4096 gaps and a gap that does not fit is counted in receipt_gaps_overflowed; gaps returned for retry go back to the front in their original order; and flush_receipt_gaps_once appends each pending gap to the signed outbox as one evidence.receipt_gap event whose subject is the use token id, so the oldest gap is the first appended and a second flush appends nothing. The action itself is never blocked or failed by any of this. An [averin] block with enabled = true and an empty resource_id, or a base_url that is empty, does not parse or is plain http:// to a public address, does not load (config error naming the field and that no receipt would be recorded), and VultrinoServer::try_new refuses to start when the seal client still cannot be built, so Observe cannot run silently without a seal client; a disabled block is not judged.",
+      "method": "test",
+      "artifacts": [
+        "src/averin/mod.rs",
+        "src/server/mod.rs",
+        "src/outbox.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- fei33_",
+      "covers": [
+        {
+          "path": "src/averin/mod.rs",
+          "symbol": "AverinClient::record_receipt_gap",
+          "sha256": "a341536f9b3066e713406ad4d8c362a27900c06c23b323f04b21b73c07f5fcd9"
+        },
+        {
+          "path": "src/averin/mod.rs",
+          "symbol": "AverinClient::requeue_receipt_gaps",
+          "sha256": "cd5a4b179989a91f7c478dfa87ec5ebf73b144a34e2e7158f8a32b2270565b9f"
+        },
+        {
+          "path": "src/averin/mod.rs",
+          "symbol": "AverinClient::spawn_use_seal",
+          "sha256": "acd1763d818778d411199c17c0feff2d700fd16e98aa8d13f90b42d122abeea6"
+        },
+        {
+          "path": "src/averin/mod.rs",
+          "symbol": "AverinClient::durable_use_oversize_drop",
+          "sha256": "0b981b07102c5ece889c597c2ecb4f92e105409247ddd5d5a9057507068bf4de"
+        },
+        {
+          "path": "src/averin/mod.rs",
+          "symbol": "Drop for InflightGuard::drop",
+          "sha256": "f815e0cb5c613f01d321d3ff415151c0d7457089aa6c38e6895eac561c63def9"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::handle_durable_use_enqueue_result",
+          "sha256": "a496618812f65765a0ce34c93d0147c97c790a602b9cebd04b48d8981e0555db"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "flush_receipt_gaps_once",
+          "sha256": "04503f3ed512865ee2499f19118f50f544c1018f2ef31975e3c6d7c429fe1e5d"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "deliver_averin_outbox_once",
+          "sha256": "fff571e6352c6e8f23989f87fb1de59e6d8e9052b912d66113c09c4e1b8a1e1d"
+        },
+        {
+          "path": "src/config/types.rs",
+          "symbol": "AverinConfig::try_from",
+          "sha256": "1c5f660536711549e99b29901628016d8ac932216fcf2ca8db307978208af2ed"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::try_new",
+          "sha256": "7c74d2e58847813e76e872fd8da38ec61f9b4d8898a34efc583968f5fe6fc356"
+        }
+      ],
+      "mutants": [
+        "receipt-gap-async-seal-failure-not-recorded",
+        "receipt-gap-oversize-drop-not-recorded",
+        "receipt-gap-buffer-unbounded",
+        "receipt-gap-requeue-reorders",
+        "receipt-gap-enqueue-failure-not-recorded",
+        "receipt-gap-dead-letter-not-recorded",
+        "receipt-gap-lost-task-not-recorded",
+        "averin-enabled-config-accepts-empty-base-url",
+        "averin-enabled-config-accepts-empty-resource-id",
+        "averin-enabled-config-accepts-unusable-base-url",
+        "averin-enabled-server-start-ignores-client-error"
+      ],
+      "does_not_establish": "Gaps are held in memory and appended to the outbox every two seconds: a process that is killed before an append loses the gaps it had not yet written, and the counters with them. flush_receipt_gaps_once puts a gap back for retry when an outbox append fails, but no test makes an append fail, so that branch is not exercised here (the requeue order is). A gap says an action ran without a receipt; it does not say the action's own side effect succeeded, and it is not a proof that no other receipt is missing: a seal that Averin accepted but recorded wrongly, a seal that never started because Averin is disabled, undeclared actions, and receipts lost to a crash between the action and the seal enqueue are outside it. The on_execute (synchronous) Observe arms record gaps by the same call but are not exercised by a test here; only the production async and durable paths are. The outbox event reaches a consumer only if one polls or is pushed to; nothing here shows that anything alerts on it. The vacuity of the name filter: the detector selects tests whose name contains fei33_, so a renamed test drops out of it. The refusal covers a client that cannot be built: a block that builds but names an unreachable averin, or an AVERIN_API_KEY averin rejects, still starts, and every Observe action is then recorded as a receipt gap rather than refused. The gap is an outbox event, and the outbox prunes every event older than [outbox] retention_secs (2 days by default) whether or not it was delivered, so this claim does not keep a gap past that window: keeping it is the consumer's job (govder stores each gap before acknowledging the push, govder claim receipt-gap-durable-record), and a consumer that is down or unconfigured for longer than the window loses the gaps in it. The plain-http check resolves a host name when the config loads; a name that resolves to a public address only later is caught by the connect-time guard, not by the load refusal. The binary's three server constructions use try_new; the library's VultrinoServer::new panics instead of returning the error.",
+      "evidence_run": "38694664010"
+    },
+    {
+      "id": "telegram-callback-attribution",
+      "statement": "With [approvals.telegram] callback_decisions = true, the Telegram notifier posts callback buttons carrying only the approval id (no decision link or token is in the message), and a button press is decided as the person Telegram reports: a user listed in [approvals.telegram.approvers] is recorded under their mapped identity with channel telegram:<user id>, so two different users are two approvers and complete a dual-control request only together, and the same user pressing twice is one approver; a user who is not listed, a press from outside the configured chat, data that is not this module's, an unknown approval and an approval that is already decided each record nothing and answer the presser; config load refuses a non-numeric chat id, an empty approvers table, two Telegram users mapped to one identity (compared case-insensitively), a user listed twice, a non-positive or non-numeric user id, a blank identity, an identity with the reserved verified: or agg: prefix, and an approvers table without callback_decisions = true; and the default URL buttons are unchanged, whose decision-link route records the single oob_approver_identity, so two link clicks never complete a two-person action while one link click plus one sign-off under another identity does (a link verdict is one approver of unknown identity, possibly the same person as the other sign-off); and a Telegram identity collides with a verified panel sign-off only when the mapped string equals the IdP subject (unit tests fei16_a_link_is_one_unknown_identity... and fei16_telegram_and_panel_dedupe...).",
+      "method": "test",
+      "artifacts": [
+        "src/approval/telegram_callbacks.rs",
+        "src/approval/mod.rs",
+        "src/config/types.rs",
+        "tests/web_smoke.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- approval::telegram_callbacks:: config::types::tests::fei16_ approval::tests::fei16_ && cargo test --locked --no-default-features --test web_smoke -- fei16_decision_links_cannot_complete_a_two_person_action",
+      "covers": [
+        {
+          "path": "src/approval/telegram_callbacks.rs",
+          "symbol": "handle_callback_query",
+          "sha256": "ede92696a52c85aeb0927e8e124b2626f104603116a26827bff71eb3e4ef13da"
+        },
+        {
+          "path": "src/approval/telegram_callbacks.rs",
+          "symbol": "TelegramCallbackConfig::build",
+          "sha256": "616d4f6832707200dda6ebc841aa3a42afc341fbd725241e2691e56bfeca5fb8"
+        },
+        {
+          "path": "src/approval/telegram_callbacks.rs",
+          "symbol": "callback_data",
+          "sha256": "7e69813ba2c84f763a99d67a2a47e5219433c77cc0ee19cefefd92fdfb0ddf75"
+        },
+        {
+          "path": "src/approval/telegram_callbacks.rs",
+          "symbol": "parse_callback_data",
+          "sha256": "6feeabadbd3a9857164fb1aead4c61a8acf3ffad6a7bffd63ed6e8c0f923309c"
+        },
+        {
+          "path": "src/approval/telegram_callbacks.rs",
+          "symbol": "run_callback_loop",
+          "sha256": "c333de97fe939b53474251566e61a9e643193abc6fd58404195661c881473be4"
+        },
+        {
+          "path": "src/approval/mod.rs",
+          "symbol": "ApprovalNotifier for TelegramNotifier::notify",
+          "sha256": "ca7f617527cf5a5ca838676f666209b8038d37702dee9906c4d8155f4d1495a7"
+        },
+        {
+          "path": "src/config/types.rs",
+          "symbol": "ApprovalConfig::try_from",
+          "sha256": "e71b438662c6839970b675b439ba017a5be0618a92bc90a3de605c2e1d084ccd"
+        }
+      ],
+      "mutants": [
+        "telegram-callback-unlisted-user-falls-back-to-shared-identity",
+        "telegram-callback-chat-not-checked",
+        "telegram-callback-config-allows-shared-identity",
+        "telegram-callback-mode-still-posts-url-buttons",
+        "telegram-approvers-table-without-callback-is-ignored"
+      ],
+      "does_not_establish": "The identity is the operator's mapping from a Telegram user id, taken from callback_query.from.id as Telegram's servers report it; the tests use a stand-in Telegram server, so they do not show what the real API sends, that its user ids are unforgeable in a chat (that is Telegram's property, not checked here), or that a Telegram account is held by the person the mapping names (a stolen or shared account is that person). A press carries no approver class, so an approval gated by a govder recipe that names classes cannot be satisfied this way; the tests do not run such a recipe. A bot can have one getUpdates consumer and a webhook disables polling: a second consumer or a set webhook makes the loop retry with backoff and log, and no test shows that. Only the web process starts the poll loop. The mapping to the IdP subject is an operator duty that nothing checks: a Telegram user mapped to an email is counted as a different person from the same human's verified panel sign-off. The webhook notifier's links are unchanged and still unattributed; the tests cover only the Telegram link route's behaviour for a two-person request. The callback path records the decision and resumes the action through the same functions as the link and panel paths, but the resume itself is not exercised here.",
+      "evidence_run": "38694664010"
+    },
+    {
+      "id": "secret-fingerprint-report",
+      "statement": "The secret-alignment fingerprint is the first 16 bytes (32 lowercase hex characters) of HMAC-SHA256 keyed by the secret over `feir-secret-alignment/v1:` followed by the relationship name, reproduces every vector of vectors/secret-fingerprint.v1.json (generated by an independent Python reference, owned by feir-os), is different for two relationships under one secret, and does not exist for an empty secret; and GET /api/v1/posture reports, per relationship, the fingerprints of the values vultrino is configured with: vultrino-outbox-poll (the [outbox] hmac_secret), vultrino-approval-push (the same secret, only while push delivery is enabled and has a URL), workload-assertion (one fingerprint per verifier secret the workload exchange accepts, the same comma-separated list it verifies with, so a rotation overlap reports both, and only while the exchange is configured and valid), tenant-assertion (the secret it signs calls to govder with), averin-api-key (the AVERIN_API_KEY it sends to averin, only while the [averin] seal client is enabled, with the posture averin.api_key_configured flag true under the same condition, which feir-os's averin_use_checks reads) and approver-key (the key that verifies the broker's approver decisions, absent when that key is unset, equal to the shared key or blank), omits a relationship whose secret is unset, and carries no secret value in the body.",
+      "method": "differential-vectors",
+      "artifacts": [
+        "src/secret_fp.rs",
+        "vectors/secret-fingerprint.v1.json",
+        "src/web/posture.rs",
+        "src/web/workload_exchange.rs",
+        "tests/workload_exchange_integration.rs",
+        "tests/posture_averin_report.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- secret_fp::tests web::posture::tests::report_carries_a_fingerprint_per_relationship_and_no_secret web::posture::tests::report_omits_the_push_relationship_when_the_outbox_does_not_push web::posture::tests::report_omits_unset_secrets_and_an_unusable_approver_key web::posture::tests::report_carries_the_averin_key_fingerprint_only_while_the_seal_client_is_on web::posture::tests::report_carries_averin_api_key_configured_with_the_fingerprint_condition web::posture::tests::report_carries_a_workload_assertion_fingerprint_per_verifier_secret && cargo test --locked --no-default-features --test workload_exchange_integration -- --exact posture_reports_exactly_the_secrets_the_exchange_verifies_with && cargo test --locked --no-default-features --test posture_averin_report",
+      "covers": [
+        {
+          "path": "src/secret_fp.rs",
+          "symbol": "fingerprint",
+          "sha256": "049e78961da2aa33ca7dc8239221600e2de0a3d57460c789fb7004b8a1d1aa87"
+        },
+        {
+          "path": "src/web/posture.rs",
+          "symbol": "secret_fingerprints",
+          "sha256": "d75c549cdd2926422fcf7fad4c34a478e7fd6a2ed49217cb8e475193fa19efbe"
+        },
+        {
+          "path": "src/web/posture.rs",
+          "symbol": "build_posture",
+          "sha256": "7494e006c6b111bc88fad30597516b7b7ea8b18612ec434d89a29b42deafdcc7"
+        },
+        {
+          "path": "src/web/workload_exchange.rs",
+          "symbol": "WorkloadVerifier::fingerprints",
+          "sha256": "38a803d405eb6a98b005ee88b2ab5ca81d4bf0fc8b7f9285b0d4829b2f86ceeb"
+        }
+      ],
+      "mutants": [
+        "secret-fp-relationship-not-in-message",
+        "secret-fp-digest-not-truncated",
+        "posture-push-fingerprint-while-not-pushing",
+        "posture-unusable-approver-key-reported",
+        "posture-averin-key-reported-while-seal-client-off",
+        "posture-workload-assertion-not-reported",
+        "posture-workload-reports-only-first-secret",
+        "posture-averin-api-key-configured-not-reported",
+        "posture-averin-api-key-configured-hardcoded-false"
+      ],
+      "does_not_establish": "That two planes hold the same value: this is the report one plane makes, and the comparison is feir-os's verifier. The report reads the loaded configuration, so a value changed afterwards or read by another code path is not reflected; a vultrino whose outbox pushes somewhere other than govder still reports the push relationship, which the verifier then compares with govder's GOVDER_SIGNATURE_SECRET. The fingerprint is only as private as the secret is strong: someone who holds it can test guesses for a low-entropy secret offline, and the report is protected only by a global admin key. The route's key gate is covered by the posture-report claims, not here. The cross-plane check that real binaries emit what the verifier reads is govder's armed four-plane e2e (TestFourPlanePostureE2E, TestFourPlaneSecretMismatchE2E). The averin-api-key fingerprint says which key vultrino sends; that averin accepts it is checked by feir-os's verifier against averin's own report, and no four-plane run has a keyed averin. The workload-assertion fingerprints say which verifier secrets vultrino accepts; that feir-runtime-edge holds one of them is the feir-os verifier's comparison, and no run here starts a real feir-runtime-edge against a real vultrino and feeds both reports to evaluate.jq (the integration test signs with the listed secrets itself).",
+      "evidence_run": "38694664010"
     },
     {
       "id": "egress-no-ambient-proxy",
-      "statement": "Every secret-bearing outbound HTTP client in the product source ignores the ambient HTTP_PROXY, HTTPS_PROXY and ALL_PROXY variables: the guarded client built by build_guarded_client (with all three pointing at a recording server, a request to a reachable target goes directly and the proxy sees none), and the averin, govder, outbox, internal_http, approval-notifier and request-CLI clients, each of which calls no_proxy (a scan of the non-test source fails on any client builder without it). The only proxy is the explicit VULTRINO_UPSTREAM_PROXY opt-in (an http:// or https:// URL whose host is an IP literal, a host name stopping client construction; any other value stops client construction instead of falling back to a direct connection). With it set, an https:// target is routed through it and an http:// target is never handed to it. VULTRINO_UPSTREAM_PROXY_CA_FILE adds a private CA for the proxy's certificates and stops client construction when it is set without the proxy, unreadable or not PEM. HttpPlugin::validate_url_ssrf refuses a plain http:// target in every mode (no proxy, a remote proxy, a loopback proxy), after its host checks, so an injected credential never crosses a public network in clear text. GET /api/v1/posture reports whether the opt-in is set, never its URL. While it is set, HttpPlugin::validate_url_ssrf and HmacPlugin::validate_url_ssrf refuse a target host whose local lookup fails or returns no address (proxy_needs_resolution); with no proxy set the same host is admitted and fails at connect time. The other secret-bearing clients take an operator-configured URL and refuse a plain http:// endpoint that is not a loopback or private address, in every mode: AverinClient::new and GovderClient::new at construction, the outbox url and the approval webhook url at config load, and the request CLI for VULTRINO_API_URL (plain_http::check: https is admitted, http only for a loopback or private IP literal or a name that does not resolve to a public address); for an http:// URL the client also gets a connect-time resolver that returns only loopback or private addresses, so a name that later resolves to a public address fails the connection. A scan fails on any product client builder that does not go through plain_http::guard. GET /api/v1/posture also reports egress.upstream_proxy_ca_configured.",
+      "statement": "Every secret-bearing outbound HTTP client in the product source ignores the ambient HTTP_PROXY, HTTPS_PROXY and ALL_PROXY variables: the guarded client built by build_guarded_client (with all three pointing at a recording server, a request to a reachable target goes directly and the proxy sees none), and the averin, govder, outbox, internal_http, approval-notifier, Telegram callback poll and request-CLI clients, each of which calls no_proxy (a scan of the non-test source fails on any client builder without it). The only proxy is the explicit VULTRINO_UPSTREAM_PROXY opt-in (an http:// or https:// URL whose host is an IP literal, a host name stopping client construction; any other value stops client construction instead of falling back to a direct connection). With it set, an https:// target is routed through it and an http:// target is never handed to it. VULTRINO_UPSTREAM_PROXY_CA_FILE adds a private CA for the proxy's certificates and stops client construction when it is set without the proxy, unreadable or not PEM. HttpPlugin::validate_url_ssrf refuses a plain http:// target in every mode (no proxy, a remote proxy, a loopback proxy), after its host checks, so an injected credential never crosses a public network in clear text. GET /api/v1/posture reports whether the opt-in is set, never its URL. While it is set, HttpPlugin::validate_url_ssrf and HmacPlugin::validate_url_ssrf refuse a target host whose local lookup fails or returns no address (proxy_needs_resolution); with no proxy set the same host is admitted and fails at connect time. The other secret-bearing clients take an operator-configured URL and refuse a plain http:// endpoint that is not a loopback or private address, in every mode: AverinClient::new and GovderClient::new at construction, the outbox url and the approval webhook url at config load, and the request CLI for VULTRINO_API_URL (plain_http::check: https is admitted, http only for a loopback or private IP literal or a name that does not resolve to a public address); for an http:// URL the client also gets a connect-time resolver that returns only loopback or private addresses, so a name that later resolves to a public address fails the connection. A scan fails on any product client builder that does not go through plain_http::guard. GET /api/v1/posture also reports egress.upstream_proxy_ca_configured.",
       "method": "test",
       "artifacts": [
         "src/plugins/http.rs",
@@ -3264,7 +3504,7 @@
         {
           "path": "src/averin/mod.rs",
           "symbol": "AverinClient::new",
-          "sha256": "53e5e6246ee4d292ba0c95ac1c47d34ef458a13fb32222ade81451170a8986cd"
+          "sha256": "246df8cebbfaa08092c994829b69a41254befcfefe9c438e771457cbd2279a5d"
         },
         {
           "path": "src/plain_http.rs",
@@ -3289,7 +3529,12 @@
         {
           "path": "src/config/types.rs",
           "symbol": "ApprovalConfig::try_from",
-          "sha256": "f681ba90e4aeed2df6e0bdd2d5c0038b7548cadbbc3d2264b4a8dfcddbe17c8c"
+          "sha256": "e71b438662c6839970b675b439ba017a5be0618a92bc90a3de605c2e1d084ccd"
+        },
+        {
+          "path": "src/approval/telegram_callbacks.rs",
+          "symbol": "run_callback_loop",
+          "sha256": "c333de97fe939b53474251566e61a9e643193abc6fd58404195661c881473be4"
         }
       ],
       "mutants": [
@@ -3302,7 +3547,9 @@
         "egress-hmac-dns-failure-admitted",
         "egress-plain-http-public-literal-admitted",
         "egress-plain-http-averin-unchecked",
-        "egress-webhook-url-unchecked"
+        "egress-webhook-url-unchecked",
+        "egress-telegram-callback-client-honours-ambient-proxy",
+        "egress-telegram-callback-client-unguarded"
       ],
       "does_not_establish": "That a proxy chosen with VULTRINO_UPSTREAM_PROXY behaves: it resolves the target host itself, so the connect-time resolver guard does not cover that hop (the admission-time URL check still runs) and the operator trusts the proxy, and a CA named with VULTRINO_UPSTREAM_PROXY_CA_FILE is trusted for every https target of the guarded client while the proxy is set. The https route through a real CONNECT tunnel is not exercised by this detector, only that the client hands https targets to the proxy and that the CA settings fail closed; the four-plane credential-canary e2e drives real tunnels with a test CA. The plain http:// refusal for agent-chosen URLs is on HttpPlugin::validate_url_ssrf (the http plugin, which the LLM proxy and capabilities use); for the operator-configured endpoints it is plain_http::check at build or config load plus the connect-time private-only resolver. A private or loopback http:// endpoint is still allowed and carries its secret in clear text on that network (a compose network or loopback), and a name that resolves to a private address and an https certificate are not otherwise validated. The scan of client builders is textual, like the no_proxy scan, and the request CLI is checked by a source assertion, not by running it. The no_proxy scan is a textual scan of the non-test source for a client builder, so a client built some other way (a helper that constructs the builder elsewhere, a WASM plugin's egress) is not covered, and it shows the call is present, not that each client is exercised with an ambient proxy set. The wiring of the guarded client is shown on the shared builder, not on each plugin that calls it. The window between vultrino's lookup and the proxy's own lookup is not closed: a name that resolves here can resolve to an internal address at the proxy. The OAuth token-URL check shares the helper but is not shown by this detector.",
       "evidence_run": "38834394415"
@@ -3585,6 +3832,65 @@
       "evidence_run": "38834394415"
     },
     {
+      "id": "anthropic-workspace-id-operator-owned",
+      "statement": "The Anthropic workspace on an outgoing request is the operator's, never the caller's, on every path that reaches a plugin: /llm, POST /api/v1/execute, the MCP http_request tool and approval replay. The workspace id is stored on the credential (metadata key anthropic_workspace_id). Before dispatch, any caller-supplied anthropic-workspace-id header (any case) is removed from the request, and the credential's value, if it has one, is written; a credential with none sends none, so the caller cannot choose a workspace with the same bearer on any of these paths. The http plugin repeats the same removal and write on its own parameters. The id must be wrkspc_ plus 8 to 64 ASCII letters or digits: the CLI metadata set command and credential creation refuse anything else, and a stored value that fails the check at use time is refused (the request fails before any upstream call, shown by no meter event, and before the use token is consumed, shown by its use count staying 0) instead of being written into a header. The refusal is a credential configuration error, not an upstream failure: /llm answers 500 with a message naming the misconfigured credential metadata, and an approval-gated request refuses at approval open (no approval is stored) rather than opening an approval that could only fail on resume.",
+      "method": "test",
+      "artifacts": [
+        "src/plugins/mod.rs",
+        "src/plugins/http.rs",
+        "src/server/mod.rs",
+        "src/lib.rs",
+        "tests/llm_proxy_integration.rs",
+        "tests/approval_token_integration.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "set -e; cargo test --locked --no-default-features --test llm_proxy_integration anthropic_workspace_id; cargo test --locked --no-default-features --test approval_token_integration workspace; cargo test --locked --no-default-features --lib -- plugins::http::tests::plugin_drops_agent_workspace_header",
+      "detector_kind": "cargo",
+      "covers": [
+        {
+          "path": "src/plugins/mod.rs",
+          "symbol": "apply_workspace_scope",
+          "sha256": "fa35061fe506c3b5b8a3c3ad4a5b7590b664ac52a33ffa6b06b65deeee51b632"
+        },
+        {
+          "path": "src/plugins/mod.rs",
+          "symbol": "apply_workspace_scope_to_params",
+          "sha256": "b4b2ff2c408d390c8569f2d8f4d91eff32180041bf73a41c6308c7bbcfbd5430"
+        },
+        {
+          "path": "src/plugins/http.rs",
+          "symbol": "HttpPlugin::scoped_params",
+          "sha256": "7825547c7a1618d027179dfdc2ae4cb6e566af51822162c77902512622929c7c"
+        },
+        {
+          "path": "src/lib.rs",
+          "symbol": "is_valid_anthropic_workspace_id",
+          "sha256": "b03ae8bb15c0bdb6e60ec58d8470b3026fc4757f0c9308c05714ddf2698c3694"
+        },
+        {
+          "path": "src/lib.rs",
+          "symbol": "validate_credential_metadata_entry",
+          "sha256": "03d29f336aa209d2625c5e2ae85a34903bd67ccfaf3c6ed776f1a2902af384ee"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::run_action",
+          "sha256": "5d86b259fec4ecb97f70b3da7e85c9bb7b0289e6a302dbfbb7e3a1e86732727b"
+        }
+      ],
+      "mutants": [
+        "workspace-scope-server-strip-removed",
+        "workspace-scope-plugin-strip-removed",
+        "workspace-scope-not-injected",
+        "workspace-scope-use-time-recheck-removed",
+        "workspace-scope-applied-after-consume",
+        "workspace-id-format-check-removed"
+      ],
+      "does_not_establish": "That Anthropic accepts the configured workspace id, that the id belongs to the key's organization, or that the real upstream sees the header: the integration tests drive a stub plugin standing in for the http plugin and read the params handed to it, and the http plugin's own removal is tested on its parameter step, not on a live request. A credential holding an org-level key and no workspace id sends no workspace header, so Anthropic decides what that does. The buffered and the streaming dispatch in the server call the same helper, but only the buffered one is driven by a test for dispatch (the streaming path is driven only for the invalid-stored-value refusal). Other plugins (internal_http, WASM) get the server-side removal but have no workspace-id injection of their own. The header name is matched exactly (case-insensitively); other provider headers, and the pre-existing gap that /api/v1/execute does not apply a capability's model allowlist or token ceiling, are not covered here. The format check is an operator-facing sanity check, not Anthropic's own validation."
+    },
+    {
       "id": "vault-backup-restore-consistent",
       "statement": "vultrino vault backup copies the vault snapshot, its .wal, the outbox and the averin stores while holding the exclusive vault lock (released before the password open check, which runs the KDF on the copy), into a new empty directory, with a manifest of SHA-256 sums and sizes; it refuses a vault that has no .wal (a partial backup), a destination that is not empty, and checks the copy by re-reading it against the manifest and by opening it under the password. vultrino vault restore checks the manifest, every checksum and size, and that nothing is in the directory that the manifest does not list, requires the snapshot and the .wal in the manifest, and opens the copy, all before it touches the target; it refuses to replace an existing vault without --force (then moves the old files aside, never deletes them), stages every file before renaming any (the averin queue as a whole sibling directory, renamed into place after the old one is moved aside, so a target that already has a queue restores cleanly), accepts only manifest names a backup can contain (never an arbitrary name written into the vault directory), and while it runs leaves <vault>.restore-pending, which makes FileStorage refuse to open until the restore is re-run. A restored vault holds the kill that was in its .wal. vault backup also refuses while <vault>.restore-pending exists, so a half-applied restore is never copied into a 'verified' backup.",
       "method": "test",
@@ -3744,7 +4050,7 @@
         {
           "path": "src/config/types.rs",
           "symbol": "TryFrom<RawAverinConfig> for crate::averin::AverinConfig::try_from",
-          "sha256": "33910a5cd143f25b29e9a6f13a50d4b6041d4d3514fee1cdebf480c4eae26238"
+          "sha256": "1c5f660536711549e99b29901628016d8ac932216fcf2ca8db307978208af2ed"
         },
         {
           "path": "src/averin/mod.rs",
@@ -3768,65 +4074,6 @@
       ],
       "does_not_establish": "Only an action the trusted catalog declares Reversible or partially-reversible may degrade, and in the default mode only when it is not money; whether an operator declared the real side effect truthfully, or named a money action under money.*, is not checked, and a reversible catalog entry named money.* requested under another label is not recognised as money. Unavailable means a request error (connect or timeout), a 5xx or a 429; a live Averin that misbehaves in some other way refuses, which is the safe side. In the default mode a degraded partially-reversible write has no before-act record. The approved-resume path (including every partially-reversible case) is driven through the buffered tail in approval_token_integration and the direct path through both tails in d8_degraded_guard; the D8 evidence refusal of a declared non-reversible action on the streaming tail is not driven by any test; a fake Averin stands in for the real one, and the four-plane evidence-gate end-to-end is a separate run. The routine action's one-phase seal can still be lost: the plan 085 reconciliation detects the gap, it cannot recover it. An approval opened under an older build for a partially-reversible action is refused on resume. Any CI run other than the recorded one.",
       "evidence_run": "38676181898"
-    },
-    {
-      "id": "anthropic-workspace-id-operator-owned",
-      "statement": "The Anthropic workspace on an outgoing request is the operator's, never the caller's, on every path that reaches a plugin: /llm, POST /api/v1/execute, the MCP http_request tool and approval replay. The workspace id is stored on the credential (metadata key anthropic_workspace_id). Before dispatch, any caller-supplied anthropic-workspace-id header (any case) is removed from the request, and the credential's value, if it has one, is written; a credential with none sends none, so the caller cannot choose a workspace with the same bearer on any of these paths. The http plugin repeats the same removal and write on its own parameters. The id must be wrkspc_ plus 8 to 64 ASCII letters or digits: the CLI metadata set command and credential creation refuse anything else, and a stored value that fails the check at use time is refused (the request fails before any upstream call, shown by no meter event, and before the use token is consumed, shown by its use count staying 0) instead of being written into a header. The refusal is a credential configuration error, not an upstream failure: /llm answers 500 with a message naming the misconfigured credential metadata, and an approval-gated request refuses at approval open (no approval is stored) rather than opening an approval that could only fail on resume.",
-      "method": "test",
-      "artifacts": [
-        "src/plugins/mod.rs",
-        "src/plugins/http.rs",
-        "src/server/mod.rs",
-        "src/lib.rs",
-        "tests/llm_proxy_integration.rs",
-        "tests/approval_token_integration.rs"
-      ],
-      "gates": [
-        "rust"
-      ],
-      "detector": "set -e; cargo test --locked --no-default-features --test llm_proxy_integration anthropic_workspace_id; cargo test --locked --no-default-features --test approval_token_integration workspace; cargo test --locked --no-default-features --lib -- plugins::http::tests::plugin_drops_agent_workspace_header",
-      "detector_kind": "cargo",
-      "covers": [
-        {
-          "path": "src/plugins/mod.rs",
-          "symbol": "apply_workspace_scope",
-          "sha256": "fa35061fe506c3b5b8a3c3ad4a5b7590b664ac52a33ffa6b06b65deeee51b632"
-        },
-        {
-          "path": "src/plugins/mod.rs",
-          "symbol": "apply_workspace_scope_to_params",
-          "sha256": "b4b2ff2c408d390c8569f2d8f4d91eff32180041bf73a41c6308c7bbcfbd5430"
-        },
-        {
-          "path": "src/plugins/http.rs",
-          "symbol": "HttpPlugin::scoped_params",
-          "sha256": "7825547c7a1618d027179dfdc2ae4cb6e566af51822162c77902512622929c7c"
-        },
-        {
-          "path": "src/lib.rs",
-          "symbol": "is_valid_anthropic_workspace_id",
-          "sha256": "b03ae8bb15c0bdb6e60ec58d8470b3026fc4757f0c9308c05714ddf2698c3694"
-        },
-        {
-          "path": "src/lib.rs",
-          "symbol": "validate_credential_metadata_entry",
-          "sha256": "03d29f336aa209d2625c5e2ae85a34903bd67ccfaf3c6ed776f1a2902af384ee"
-        },
-        {
-          "path": "src/server/mod.rs",
-          "symbol": "VultrinoServer::run_action",
-          "sha256": "5d86b259fec4ecb97f70b3da7e85c9bb7b0289e6a302dbfbb7e3a1e86732727b"
-        }
-      ],
-      "mutants": [
-        "workspace-scope-server-strip-removed",
-        "workspace-scope-plugin-strip-removed",
-        "workspace-scope-not-injected",
-        "workspace-scope-use-time-recheck-removed",
-        "workspace-scope-applied-after-consume",
-        "workspace-id-format-check-removed"
-      ],
-      "does_not_establish": "That Anthropic accepts the configured workspace id, that the id belongs to the key's organization, or that the real upstream sees the header: the integration tests drive a stub plugin standing in for the http plugin and read the params handed to it, and the http plugin's own removal is tested on its parameter step, not on a live request. A credential holding an org-level key and no workspace id sends no workspace header, so Anthropic decides what that does. The buffered and the streaming dispatch in the server call the same helper, but only the buffered one is driven by a test for dispatch (the streaming path is driven only for the invalid-stored-value refusal). Other plugins (internal_http, WASM) get the server-side removal but have no workspace-id injection of their own. The header name is matched exactly (case-insensitively); other provider headers, and the pre-existing gap that /api/v1/execute does not apply a capability's model allowlist or token ceiling, are not covered here. The format check is an operator-facing sanity check, not Anthropic's own validation."
     }
   ]
 }

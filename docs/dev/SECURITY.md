@@ -124,7 +124,14 @@ upstream.
   — it is a hashed bearer capability, *not* an HMAC. A link prefetch only renders
   a confirmation page — the decision requires a POST. The verdict is attributed
   to the configured `oob_approver_identity` (required when a notifier is set,
-  else config load fails).
+  else config load fails). A link cannot tell the people sharing a channel apart: a link verdict is
+  one approver of unknown identity. Two link clicks never complete a two-person action (the second
+  click is the same approver and is refused), but one link click plus one sign-off under any other
+  identity does, and those two may be the same human. Telegram callback decisions
+  (`callback_decisions = true`) attribute each button press to the Telegram user Telegram reports,
+  post no bearer link into the chat, and let two different Telegram users be two approvers; they
+  are deduplicated against the Approvals screen only when the mapped identity equals the person's
+  IdP subject; see CONFIGURATION.md.
 - **Inbound workload identity (V10/R6):** optional SPIFFE/OIDC resolution of a
   header the deployment has *already verified* at the edge. It **refines** the
   principal (adds a `workload_id` policy match dimension and binds the owner for

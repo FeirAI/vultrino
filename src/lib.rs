@@ -24,6 +24,7 @@ pub mod plugins;
 pub mod policy;
 pub mod revocation;
 pub mod router;
+pub mod secret_fp;
 pub mod server;
 pub mod session;
 pub mod storage;

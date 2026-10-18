@@ -1,0 +1,18 @@
+diff --git a/src/averin/mod.rs b/src/averin/mod.rs
+index 8f70357..cc41c61 100644
+--- a/src/averin/mod.rs
++++ b/src/averin/mod.rs
+@@ -1089,13 +1089,6 @@ impl AverinClient {
+                 }
+                 Err(e) => {
+                     this.metrics.record_failed();
+-                    this.record_receipt_gap(
+-                        &token_id,
+-                        Some(&request_id),
+-                        Some(use_sequence_number),
+-                        "seal_failed",
+-                        &e.to_string(),
+-                    );
+                     guard.complete();
+                     // ALARM: token/project context only — params are never logged.
+                     tracing::warn!(
