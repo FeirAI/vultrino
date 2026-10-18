@@ -1,0 +1,13 @@
+diff --git a/src/plugins/mod.rs b/src/plugins/mod.rs
+index bd54019..d614326 100644
+--- a/src/plugins/mod.rs
++++ b/src/plugins/mod.rs
+@@ -162,7 +162,7 @@ pub fn apply_workspace_scope(
+     headers.retain(|k, _| !is_gateway_owned_header(k));
+     for scope in GATEWAY_OWNED_SCOPES {
+         if let Some(value) = metadata.get(scope.meta) {
+-            if !(scope.valid)(value) {
++            if scope.header == ANTHROPIC_WORKSPACE_HEADER && !(scope.valid)(value) {
+                 return Err(PluginError::CredentialConfig(format!(
+                     "credential metadata {} is not a valid value",
+                     scope.meta

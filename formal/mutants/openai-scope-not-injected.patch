@@ -1,0 +1,15 @@
+diff --git a/src/plugins/mod.rs b/src/plugins/mod.rs
+index bd54019..0193788 100644
+--- a/src/plugins/mod.rs
++++ b/src/plugins/mod.rs
+@@ -168,7 +168,9 @@ pub fn apply_workspace_scope(
+                     scope.meta
+                 )));
+             }
+-            headers.insert(scope.header.to_string(), value.clone());
++            if scope.header == ANTHROPIC_WORKSPACE_HEADER {
++                headers.insert(scope.header.to_string(), value.clone());
++            }
+         }
+     }
+     Ok(())

@@ -737,6 +737,26 @@
       "tier": "fast",
       "claim": "anthropic-workspace-id-operator-owned"
     },
+    "openai-scope-server-strip-removed": {
+      "tier": "fast",
+      "claim": "openai-org-project-operator-owned"
+    },
+    "openai-scope-plugin-strip-removed": {
+      "tier": "full",
+      "claim": "openai-org-project-operator-owned"
+    },
+    "openai-scope-not-injected": {
+      "tier": "full",
+      "claim": "openai-org-project-operator-owned"
+    },
+    "openai-scope-use-time-recheck-removed": {
+      "tier": "full",
+      "claim": "openai-org-project-operator-owned"
+    },
+    "openai-id-format-check-removed": {
+      "tier": "full",
+      "claim": "openai-org-project-operator-owned"
+    },
     "unpriced-gate-default-off": {
       "tier": "full",
       "claim": "unpriced-model-refused"
@@ -4081,12 +4101,12 @@
         {
           "path": "src/plugins/mod.rs",
           "symbol": "apply_workspace_scope",
-          "sha256": "fa35061fe506c3b5b8a3c3ad4a5b7590b664ac52a33ffa6b06b65deeee51b632"
+          "sha256": "c357be3aec6382a69f9fbdfab517887790c216654db7fc1cd46611e1a522a447"
         },
         {
           "path": "src/plugins/mod.rs",
           "symbol": "apply_workspace_scope_to_params",
-          "sha256": "b4b2ff2c408d390c8569f2d8f4d91eff32180041bf73a41c6308c7bbcfbd5430"
+          "sha256": "1be917ffa39916729faea9a57a70d3636569186ce3427a68a34c8e0ba5c7786a"
         },
         {
           "path": "src/plugins/http.rs",
@@ -4101,7 +4121,7 @@
         {
           "path": "src/lib.rs",
           "symbol": "validate_credential_metadata_entry",
-          "sha256": "03d29f336aa209d2625c5e2ae85a34903bd67ccfaf3c6ed776f1a2902af384ee"
+          "sha256": "16653a14e87f523154f1914e92a38dad2486a5f6b4aebf3aacd02710fb4c0425"
         },
         {
           "path": "src/server/mod.rs",
@@ -4118,6 +4138,74 @@
         "workspace-id-format-check-removed"
       ],
       "does_not_establish": "That Anthropic accepts the configured workspace id, that the id belongs to the key's organization, or that the real upstream sees the header: the integration tests drive a stub plugin standing in for the http plugin and read the params handed to it, and the http plugin's own removal is tested on its parameter step, not on a live request. A credential holding an org-level key and no workspace id sends no workspace header, so Anthropic decides what that does. The buffered and the streaming dispatch in the server call the same helper, but only the buffered one is driven by a test for dispatch (the streaming path is driven only for the invalid-stored-value refusal). Other plugins (internal_http, WASM) get the server-side removal but have no workspace-id injection of their own. The header name is matched exactly (case-insensitively); other provider headers, and the gap that /api/v1/execute does not apply a capability's model allowlist or token ceiling to a credential no LLM channel references, are not covered here (a credential an LLM channel references is refused there, see llm-credential-channel-only). The format check is an operator-facing sanity check, not Anthropic's own validation."
+    },
+    {
+      "id": "openai-org-project-operator-owned",
+      "statement": "The OpenAI organization and project on an outgoing request are the operator's, never the caller's, on every path that reaches a plugin: /llm (openai-chat and openai-responses, buffered and streamed), POST /api/v1/execute, the MCP http_request tool and approval replay. They are stored on the credential (metadata keys openai_organization_id and openai_project_id). Before dispatch, any caller-supplied openai-organization or openai-project header (any case) is removed from the request, and the credential's value for each, if it has one, is written; a credential with none sends none, so the caller cannot choose which organization or project is billed with the same bearer on any of these paths. The /llm forwarded-header allowlist no longer includes either header. The http plugin repeats the same removal and write on its own parameters. The organization id must be org- and the project id proj_, each followed by 8 to 64 ASCII letters or digits: the CLI metadata set command and credential creation refuse anything else, and a stored value that fails the check at use time is refused (the request fails before any upstream call, shown by no plugin run and no meter event) instead of being written into a header. The refusal is a credential configuration error: /llm answers 500 with a message naming the misconfigured metadata key, never the stored value.",
+      "method": "test",
+      "artifacts": [
+        "src/plugins/mod.rs",
+        "src/plugins/http.rs",
+        "src/server/mod.rs",
+        "src/lib.rs",
+        "src/web/llm_proxy.rs",
+        "tests/llm_proxy_integration.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "set -e; cargo test --locked --no-default-features --test llm_proxy_integration openai_org_project; cargo test --locked --no-default-features --lib -- plugins::http::tests::plugin_drops_agent_openai_scope",
+      "detector_kind": "cargo",
+      "covers": [
+        {
+          "path": "src/plugins/mod.rs",
+          "symbol": "apply_workspace_scope",
+          "sha256": "c357be3aec6382a69f9fbdfab517887790c216654db7fc1cd46611e1a522a447"
+        },
+        {
+          "path": "src/plugins/mod.rs",
+          "symbol": "apply_workspace_scope_to_params",
+          "sha256": "1be917ffa39916729faea9a57a70d3636569186ce3427a68a34c8e0ba5c7786a"
+        },
+        {
+          "path": "src/plugins/http.rs",
+          "symbol": "HttpPlugin::scoped_params",
+          "sha256": "7825547c7a1618d027179dfdc2ae4cb6e566af51822162c77902512622929c7c"
+        },
+        {
+          "path": "src/lib.rs",
+          "symbol": "is_prefixed_alnum_id",
+          "sha256": "25fb1aafed06ea09fc3b0db7f07f85f9daebc30a9adaab5c94aee1ef6a5cbd69"
+        },
+        {
+          "path": "src/lib.rs",
+          "symbol": "is_valid_openai_organization_id",
+          "sha256": "8713197aa81372237f898fd6207accc55c6007b886129ab06787ba1e4afafade"
+        },
+        {
+          "path": "src/lib.rs",
+          "symbol": "is_valid_openai_project_id",
+          "sha256": "29d63468d16887938351beecc52bf3e602455cf615818f44bed6bbedf8b84ade"
+        },
+        {
+          "path": "src/lib.rs",
+          "symbol": "validate_credential_metadata_entry",
+          "sha256": "16653a14e87f523154f1914e92a38dad2486a5f6b4aebf3aacd02710fb4c0425"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::run_action",
+          "sha256": "96be35cc9c4181ee34b6e0b4cf422ffe71b994f4afbd01d01ab1bf811bfd3f15"
+        }
+      ],
+      "mutants": [
+        "openai-scope-server-strip-removed",
+        "openai-scope-plugin-strip-removed",
+        "openai-scope-not-injected",
+        "openai-scope-use-time-recheck-removed",
+        "openai-id-format-check-removed"
+      ],
+      "does_not_establish": "That OpenAI accepts the configured organization or project id, that the id belongs to the key, or that the real upstream sees the header: the integration tests drive a stub plugin standing in for the http plugin and read the params handed to it, and the http plugin's own removal is tested on its parameter step, not on a live request. A credential with a multi-organization key and no setting sends no header, so OpenAI decides what that does. The streaming path is driven for injection and removal on /llm; approval replay and the approval-open refusal reuse the Anthropic workspace claim's helper calls and are covered by its approval test, not by an OpenAI-specific one. The header removal applies to every credential and route, so it also removes the two headers on an Azure OpenAI route, where nothing sets them. Other plugins (internal_http, WASM) get the server-side removal but have no injection of their own. Only the three headers named in the gateway-owned table are owned; any other provider header (for example x-goog-user-project) is still forwarded from the client on /llm. The format check is an operator-facing sanity check, not OpenAI's own validation, and the ceiling of 64 characters is this gateway's choice."
     },
     {
       "id": "unpriced-model-refused",
@@ -4139,7 +4227,7 @@
         {
           "path": "src/web/llm_proxy.rs",
           "symbol": "llm_proxy_impl",
-          "sha256": "0f298edb53dd55826b69c2313907fea3dd807d370b3939cc61e800fd2e9bd97d"
+          "sha256": "0a5222c37af837151b0eef9777b2955bddc1e3b26940bfa2ccf113bde7c19093"
         },
         {
           "path": "src/ratecard.rs",
@@ -4939,7 +5027,7 @@
         {
           "path": "src/web/llm_proxy.rs",
           "symbol": "llm_proxy_impl",
-          "sha256": "0f298edb53dd55826b69c2313907fea3dd807d370b3939cc61e800fd2e9bd97d"
+          "sha256": "0a5222c37af837151b0eef9777b2955bddc1e3b26940bfa2ccf113bde7c19093"
         }
       ],
       "mutants": [

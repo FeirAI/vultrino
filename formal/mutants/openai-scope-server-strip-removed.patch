@@ -1,0 +1,13 @@
+diff --git a/src/plugins/mod.rs b/src/plugins/mod.rs
+index bd54019..2d72203 100644
+--- a/src/plugins/mod.rs
++++ b/src/plugins/mod.rs
+@@ -185,7 +185,7 @@ pub fn apply_workspace_scope_to_params(
+         return Ok(());
+     };
+     if let Some(serde_json::Value::Object(h)) = obj.get_mut("headers") {
+-        h.retain(|k, _| !is_gateway_owned_header(k));
++        h.retain(|k, _| !k.eq_ignore_ascii_case(ANTHROPIC_WORKSPACE_HEADER));
+     }
+     let mut ours = std::collections::HashMap::new();
+     apply_workspace_scope(&mut ours, metadata)?;
