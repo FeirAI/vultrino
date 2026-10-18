@@ -819,6 +819,28 @@ mod tests {
     }
 
     #[test]
+    fn a_window_tail_merged_into_the_summary_keeps_its_exact_count() {
+        // One token: the first refusal takes it. The other 5 of the window are a tail, which at the
+        // window's close finds the bucket empty and merges into the summary as ONE entry of 5.
+        let (r, t0) = recorder(1, 1);
+        let c = ctx("ep_a", "x.y");
+        for _ in 0..6 {
+            r.note_at(&c, RefusalClass::PolicyDeny, t0, Utc::now());
+        }
+        let (first, _) = r.take_due_at(10, t0 + Duration::from_secs(11));
+        assert_eq!(first.len(), 1, "only the first refusal had a token");
+        assert_eq!(first[0].attempts, 1);
+        let (later, _) = r.take_due_at(10, t0 + Duration::from_secs(3700));
+        let summary = later
+            .iter()
+            .find(|o| o.by_class.is_some())
+            .expect("a summary");
+        assert_eq!(summary.attempts, 5, "the tail's count survives the merge");
+        assert_eq!(summary.by_class.as_ref().unwrap()["policy_deny"], 5);
+        assert_eq!(first[0].attempts + summary.attempts, 6, "nothing is lost");
+    }
+
+    #[test]
     fn a_summary_over_two_agents_is_vultrino_multiple() {
         // One token in the bucket: the first refusal takes it, the next two merge.
         let (r, t0) = recorder(1, 3600);
