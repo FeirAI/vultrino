@@ -1,0 +1,13 @@
+diff --git a/src/server/mod.rs b/src/server/mod.rs
+index a6b7ef8..667d961 100644
+--- a/src/server/mod.rs
++++ b/src/server/mod.rs
+@@ -4603,7 +4603,7 @@ impl VultrinoServer {
+                 break;
+             }
+             match self.resolver.resolve(c).await {
+-                Ok(referenced) if referenced.id == credential.id => {
++                Ok(referenced) if false && referenced.id == credential.id => {
+                     is_llm = true;
+                     break;
+                 }
