@@ -1,0 +1,13 @@
+diff --git a/src/web/llm_proxy.rs b/src/web/llm_proxy.rs
+index 45d02b2..5c56b5b 100644
+--- a/src/web/llm_proxy.rs
++++ b/src/web/llm_proxy.rs
+@@ -747,7 +747,7 @@ fn is_priced_mime(v: Option<&serde_json::Value>) -> bool {
+ /// [`is_priced_mime`] for a string already taken out of its value.
+ fn is_priced_mime_str(m: &str) -> bool {
+     let m = m.to_ascii_lowercase();
+-    PRICED_MEDIA_TYPES.contains(&m.as_str()) || m.starts_with("text/")
++    PRICED_MEDIA_TYPES.contains(&m.as_str()) || m.starts_with("text/") || m.starts_with("audio/")
+ }
+ 
+ /// Whether an OpenAI image URL may be forwarded. A `data:` URL (any casing, leading

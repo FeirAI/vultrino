@@ -22,6 +22,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -56,6 +57,34 @@ pub struct OutboxStore {
     /// (mtime,len) of the file as of this process's last decrypt — lets `reload` skip a redundant
     /// decrypt when the file is byte-unchanged (the broker polls frequently). Mirrors FileStorage.
     last_loaded: Mutex<Option<(SystemTime, u64)>>,
+    /// Failed appends not yet announced by a gap marker (VUL-02).
+    loss: Mutex<LossState>,
+    lost_total: AtomicU64,
+    markers_emitted: AtomicU64,
+}
+
+/// Failed appends waiting for the next successful append to carry a `meter.lost` marker.
+#[derive(Default, Clone)]
+struct LossState {
+    count: u64,
+    first: Option<chrono::DateTime<Utc>>,
+    last: Option<chrono::DateTime<Utc>>,
+    types: std::collections::BTreeSet<String>,
+}
+
+impl LossState {
+    fn absorb(&mut self, other: LossState) {
+        self.count += other.count;
+        self.first = match (self.first, other.first) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        self.last = match (self.last, other.last) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (a, b) => a.or(b),
+        };
+        self.types.extend(other.types);
+    }
 }
 
 impl OutboxStore {
@@ -67,6 +96,69 @@ impl OutboxStore {
             master_key,
             cache: RwLock::new(OutboxCache::default()),
             last_loaded: Mutex::new(None),
+            loss: Mutex::new(LossState::default()),
+            lost_total: AtomicU64::new(0),
+            markers_emitted: AtomicU64::new(0),
+        }
+    }
+
+    /// Count one failed append (VUL-02). Called for every `Err` from an event append, so a
+    /// full disk is a number on `/api/v1/health` and `/api/v1/posture`, not a log line.
+    fn record_loss(&self, event_type: &str) {
+        let now = Utc::now();
+        self.lost_total.fetch_add(1, Ordering::Relaxed);
+        let mut loss = self.loss.lock();
+        loss.count += 1;
+        loss.first.get_or_insert(now);
+        loss.last = Some(now);
+        if loss.types.len() < crate::outbox::METER_LOST_MAX_TYPES {
+            loss.types.insert(event_type.to_string());
+        }
+    }
+
+    /// After a successful append, announce any unannounced failures with one `meter.lost`
+    /// event. If the marker append itself fails the counts are put back (and are not
+    /// counted a second time), so the next success retries it.
+    async fn flush_loss_marker(&self) {
+        let taken = {
+            let mut loss = self.loss.lock();
+            if loss.count == 0 {
+                return;
+            }
+            std::mem::take(&mut *loss)
+        };
+        let (Some(first), Some(last)) = (taken.first, taken.last) else {
+            return;
+        };
+        let types: Vec<String> = taken.types.iter().cloned().collect();
+        let payload = crate::outbox::meter_lost_payload(taken.count, first, last, &types);
+        let result = self
+            .locked_mutate(move |c| {
+                Ok((
+                    push_event(c, "meter", crate::outbox::EVENT_METER_LOST, payload, None),
+                    true,
+                ))
+            })
+            .await;
+        match result {
+            Ok(_) => {
+                self.markers_emitted.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to append meter.lost gap marker; will retry on the next successful append");
+                self.loss.lock().absorb(taken);
+            }
+        }
+    }
+
+    /// Point-in-time append-loss counters.
+    pub fn loss_snapshot(&self) -> crate::outbox::MeterLossSnapshot {
+        let loss = self.loss.lock();
+        crate::outbox::MeterLossSnapshot {
+            lost_total: self.lost_total.load(Ordering::Relaxed),
+            gap_pending: loss.count,
+            markers_emitted: self.markers_emitted.load(Ordering::Relaxed),
+            last_lost_at: loss.last,
         }
     }
 
@@ -81,9 +173,16 @@ impl OutboxStore {
     ) -> Result<u64, StorageError> {
         let subject = subject.to_string();
         let event_type = event_type.to_string();
+        let ty = event_type.clone();
         // A fresh append always mutates.
-        self.locked_mutate(move |c| Ok((push_event(c, &subject, &event_type, payload, None), true)))
-            .await
+        let result = self
+            .locked_mutate(move |c| Ok((push_event(c, &subject, &event_type, payload, None), true)))
+            .await;
+        match &result {
+            Ok(_) => self.flush_loss_marker().await,
+            Err(_) => self.record_loss(&ty),
+        }
+        result
     }
 
     /// Append an event drained from the vault's intent staging (D1), IDEMPOTENTLY: if an event with

@@ -1,0 +1,13 @@
+diff --git a/src/web/llm_proxy.rs b/src/web/llm_proxy.rs
+index 6d4fcab..c1a01a5 100644
+--- a/src/web/llm_proxy.rs
++++ b/src/web/llm_proxy.rs
+@@ -791,7 +791,7 @@ fn gemini_map_marker(
+                         .iter()
+                         .filter_map(|k| media.get(*k))
+                         .collect();
+-                    !types.is_empty() && types.into_iter().all(|t| is_priced_mime(Some(t)))
++                    types.into_iter().all(|t| is_priced_mime(Some(t)))
+                 });
+                 if !priced {
+                     return Some(format!(

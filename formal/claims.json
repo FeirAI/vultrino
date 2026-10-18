@@ -529,6 +529,50 @@
     "vault-file-gone-compact-rename-unchecked": {
       "tier": "fast"
     },
+    "layered-limit-first-match": {
+      "tier": "fast",
+      "claim": "layered-rate-limits-conjunctive"
+    },
+    "layered-limit-refusal-still-charges": {
+      "tier": "full",
+      "claim": "layered-rate-limits-conjunctive"
+    },
+    "layered-limit-duplicate-charged-twice": {
+      "tier": "full",
+      "claim": "layered-rate-limits-conjunctive"
+    },
+    "meter-loss-not-counted": {
+      "tier": "fast",
+      "claim": "meter-append-loss-announced"
+    },
+    "meter-lost-marker-not-appended": {
+      "tier": "full",
+      "claim": "meter-append-loss-announced"
+    },
+    "meter-health-gap-hidden": {
+      "tier": "full",
+      "claim": "meter-append-loss-announced"
+    },
+    "stream-disconnect-drain-skipped": {
+      "tier": "fast",
+      "claim": "stream-usage-charged-without-trailer"
+    },
+    "stream-provisional-usage-final": {
+      "tier": "full",
+      "claim": "stream-usage-charged-without-trailer"
+    },
+    "stream-estimate-unmarked": {
+      "tier": "full",
+      "claim": "stream-usage-charged-without-trailer"
+    },
+    "stream-no-trailer-no-estimate": {
+      "tier": "full",
+      "claim": "stream-usage-charged-without-trailer"
+    },
+    "stream-drain-idle-cap-removed": {
+      "tier": "full",
+      "claim": "stream-usage-charged-without-trailer"
+    },
     "url-exact-prompt-refused-in-default-deny": {
       "tier": "full",
       "claim": "policy-write-refuses-warned-deny-prompt-patterns"
@@ -669,6 +713,190 @@
       "tier": "fast",
       "claim": "egress-no-ambient-proxy"
     },
+    "workspace-scope-server-strip-removed": {
+      "tier": "fast",
+      "claim": "anthropic-workspace-id-operator-owned"
+    },
+    "workspace-scope-plugin-strip-removed": {
+      "tier": "fast",
+      "claim": "anthropic-workspace-id-operator-owned"
+    },
+    "workspace-scope-not-injected": {
+      "tier": "fast",
+      "claim": "anthropic-workspace-id-operator-owned"
+    },
+    "workspace-scope-use-time-recheck-removed": {
+      "tier": "fast",
+      "claim": "anthropic-workspace-id-operator-owned"
+    },
+    "workspace-scope-applied-after-consume": {
+      "tier": "fast",
+      "claim": "anthropic-workspace-id-operator-owned"
+    },
+    "workspace-id-format-check-removed": {
+      "tier": "fast",
+      "claim": "anthropic-workspace-id-operator-owned"
+    },
+    "unpriced-gate-default-off": {
+      "tier": "full",
+      "claim": "unpriced-model-refused"
+    },
+    "unpriced-gate-removed": {
+      "tier": "full",
+      "claim": "unpriced-model-refused"
+    },
+    "unpriced-gate-missing-model-passes": {
+      "tier": "full",
+      "claim": "unpriced-model-refused"
+    },
+    "rate-card-prefix-boundary-dropped": {
+      "tier": "full",
+      "claim": "unpriced-model-refused"
+    },
+    "rate-card-fingerprint-not-reported": {
+      "tier": "full",
+      "claim": "unpriced-model-refused"
+    },
+    "anthropic-cache-tokens-ignored": {
+      "tier": "full",
+      "claim": "llm-token-event-complete-and-priced"
+    },
+    "meter-model-pick-ignores-card": {
+      "tier": "full",
+      "claim": "llm-token-event-complete-and-priced"
+    },
+    "meter-emit-stops-after-first-failure": {
+      "tier": "full",
+      "claim": "meter-append-loss-announced"
+    },
+    "route-model-mismatch-allowed": {
+      "tier": "full",
+      "claim": "unpriced-model-refused"
+    },
+    "route-body-model-gates": {
+      "tier": "full",
+      "claim": "unpriced-model-refused"
+    },
+    "route-bedrock-path-model-not-read": {
+      "tier": "full",
+      "claim": "unpriced-model-refused"
+    },
+    "route-azure-unmapped-deployment-priced-by-name": {
+      "tier": "full",
+      "claim": "unpriced-model-refused"
+    },
+    "route-allowlist-ignores-url-model": {
+      "tier": "full",
+      "claim": "unpriced-model-refused"
+    },
+    "modifier-gate-not-applied": {
+      "tier": "full",
+      "claim": "unpriced-model-refused"
+    },
+    "meter-model-pick-books-requested-for-any-served": {
+      "tier": "full",
+      "claim": "llm-token-event-complete-and-priced"
+    },
+    "anthropic-cache-write-single-weight": {
+      "tier": "full",
+      "claim": "llm-token-event-complete-and-priced"
+    },
+    "gemini-thoughts-not-counted": {
+      "tier": "full",
+      "claim": "llm-token-event-complete-and-priced"
+    },
+    "gemini-tool-use-prompt-not-counted": {
+      "tier": "full",
+      "claim": "llm-token-event-complete-and-priced"
+    },
+    "gemini-blocked-prompt-not-booked": {
+      "tier": "full",
+      "claim": "llm-token-event-complete-and-priced"
+    },
+    "rate-card-reload-widens": {
+      "tier": "full",
+      "claim": "rate-card-reload-only-narrows"
+    },
+    "rate-card-unknown-field-accepted": {
+      "tier": "full",
+      "claim": "rate-card-reload-only-narrows"
+    },
+    "rate-card-version-optional": {
+      "tier": "full",
+      "claim": "rate-card-reload-only-narrows"
+    },
+    "rate-card-one-sided-price-accepted": {
+      "tier": "full",
+      "claim": "rate-card-reload-only-narrows"
+    },
+    "rate-card-unknown-card-field-accepted": {
+      "tier": "full",
+      "claim": "rate-card-reload-only-narrows"
+    },
+    "modifier-unknown-tool-type-allowed": {
+      "tier": "full",
+      "claim": "unpriced-model-refused"
+    },
+    "modifier-bedrock-tool-config-unchecked": {
+      "tier": "full",
+      "claim": "unpriced-model-refused"
+    },
+    "route-allowlist-checks-body-model-first": {
+      "tier": "full",
+      "claim": "unpriced-model-refused"
+    },
+    "modifier-allowlist-default-allow": {
+      "tier": "fast",
+      "claim": "unpriced-model-refused"
+    },
+    "modifier-beta-header-unchecked": {
+      "tier": "full",
+      "claim": "unpriced-model-refused"
+    },
+    "modifier-beta-body-unchecked": {
+      "tier": "full",
+      "claim": "unpriced-model-refused"
+    },
+    "modifier-tool-foreign-key-allowed": {
+      "tier": "full",
+      "claim": "unpriced-model-refused"
+    },
+    "modifier-tool-type-by-prefix": {
+      "tier": "full",
+      "claim": "unpriced-model-refused"
+    },
+    "modifier-gemini-service-tier-listed": {
+      "tier": "full",
+      "claim": "unpriced-model-refused"
+    },
+    "modifier-non-object-body-passes": {
+      "tier": "full",
+      "claim": "unpriced-model-refused"
+    },
+    "iterations-not-counted": {
+      "tier": "full",
+      "claim": "llm-token-event-complete-and-priced"
+    },
+    "iterations-not-counted-streamed": {
+      "tier": "full",
+      "claim": "llm-token-event-complete-and-priced"
+    },
+    "modality-check-removed": {
+      "tier": "fast",
+      "claim": "unpriced-model-refused"
+    },
+    "modality-response-modalities-unchecked": {
+      "tier": "full",
+      "claim": "unpriced-model-refused"
+    },
+    "modality-input-audio-unchecked": {
+      "tier": "full",
+      "claim": "unpriced-model-refused"
+    },
+    "modality-gemini-av-mime-unchecked": {
+      "tier": "full",
+      "claim": "unpriced-model-refused"
+    },
     "vault-fence-reader-skips-writer-gate": {
       "tier": "full"
     },
@@ -708,50 +936,29 @@
     "vault-backup-ignores-restore-pending": {
       "tier": "full"
     },
-    "workspace-scope-server-strip-removed": {
+    "modality-allowlist-removed": {
       "tier": "fast",
-      "claim": "anthropic-workspace-id-operator-owned"
+      "claim": "unpriced-model-refused"
     },
-    "workspace-scope-plugin-strip-removed": {
-      "tier": "fast",
-      "claim": "anthropic-workspace-id-operator-owned"
+    "modality-walk-arrays-only": {
+      "tier": "full",
+      "claim": "unpriced-model-refused"
     },
-    "workspace-scope-not-injected": {
-      "tier": "fast",
-      "claim": "anthropic-workspace-id-operator-owned"
+    "modality-missing-mime-admitted": {
+      "tier": "full",
+      "claim": "unpriced-model-refused"
     },
-    "workspace-scope-use-time-recheck-removed": {
-      "tier": "fast",
-      "claim": "anthropic-workspace-id-operator-owned"
+    "modality-empty-modalities-admitted": {
+      "tier": "full",
+      "claim": "unpriced-model-refused"
     },
-    "workspace-scope-applied-after-consume": {
-      "tier": "fast",
-      "claim": "anthropic-workspace-id-operator-owned"
+    "modality-depth-cap-removed": {
+      "tier": "full",
+      "claim": "unpriced-model-refused"
     },
-    "workspace-id-format-check-removed": {
-      "tier": "fast",
-      "claim": "anthropic-workspace-id-operator-owned"
-    },
-    "llm-credential-refusal-removed": {
-      "tier": "fast"
-    },
-    "llm-refusal-status-not-403": {
-      "tier": "full"
-    },
-    "llm-proxy-uses-generic-entry": {
-      "tier": "full"
-    },
-    "llm-proxy-stream-uses-generic-entry": {
-      "tier": "full"
-    },
-    "llm-refusal-spelling-only": {
-      "tier": "full"
-    },
-    "llm-refusal-before-tenant-gate": {
-      "tier": "full"
-    },
-    "llm-resume-refusal-removed": {
-      "tier": "full"
+    "modality-data-url-type-unchecked": {
+      "tier": "full",
+      "claim": "unpriced-model-refused"
     },
     "receipt-gap-async-seal-failure-not-recorded": {
       "tier": "fast"
@@ -797,6 +1004,27 @@
       "tier": "full"
     },
     "posture-averin-api-key-configured-hardcoded-false": {
+      "tier": "full"
+    },
+    "llm-credential-refusal-removed": {
+      "tier": "fast"
+    },
+    "llm-refusal-status-not-403": {
+      "tier": "full"
+    },
+    "llm-proxy-uses-generic-entry": {
+      "tier": "full"
+    },
+    "llm-proxy-stream-uses-generic-entry": {
+      "tier": "full"
+    },
+    "llm-refusal-spelling-only": {
+      "tier": "full"
+    },
+    "llm-refusal-before-tenant-gate": {
+      "tier": "full"
+    },
+    "llm-resume-refusal-removed": {
       "tier": "full"
     }
   },
@@ -1971,7 +2199,7 @@
         {
           "path": "src/policy/mod.rs",
           "symbol": "PolicyEngine::evaluate_inner",
-          "sha256": "4c03cb88af661dcc304dcc962d6af6ce2879d6c2139e9ec7dbe34d164f162d87"
+          "sha256": "172a6dce9f9239fb35a561b98c9607646cb13aff8ba4e91c592ccd0fd79479e9"
         },
         {
           "path": "src/policy/precedence.rs",
@@ -1992,8 +2220,8 @@
         "policy-precedence-lazy-kill-precheck-dropped",
         "policy-precedence-engine-kill-flag-ignored"
       ],
-      "does_not_establish": "Only the precedence step. Whether a rule matches (URL, method, time window, rate limit, spend cap, action label) is outside it, and the domain is bounded at 4 outcomes and 3 policy defaults for the pure and lazy functions and at two policies of 48 shapes for the engine test. The engine test uses only always-matching rules and a fixed credential, so it does not cover rate-limit charging order beyond the lazy-scan check that no weaker tier is asked, and the first matching rule within a tier is chosen by storage order. The oracles are test code. The engine hands the lazy function at most one outcome per call by design; the multi-outcome equivalence is shown for membership of tiers, which is all the scan can observe. Layered Allow-RateLimit rules are still first-match, not conjunctive. The engine default applies only when no policy matches, and is not applied on top of a matching policy's default. The tail is shown to deny by the mapping test, not shown unreachable from the engine (it is unreachable only because any matching policy has a default action). The engine runs an unparseable-URL pre-check before the kill tier: a halted principal whose request URL cannot be canonicalised, under a policy with a URL deny or prompt rule, gets the unparseable reason instead of the halt reason. The outcome is still Deny and the pre-check is outside this claim.",
-      "evidence_run": "38762181897"
+      "does_not_establish": "Only the precedence step. Whether a rule matches (URL, method, time window, rate limit, spend cap, action label) is outside it, and the domain is bounded at 4 outcomes and 3 policy defaults for the pure and lazy functions and at two policies of 48 shapes for the engine test. The engine test uses only always-matching rules and a fixed credential, so it does not cover rate-limit charging order beyond the lazy-scan check that no weaker tier is asked, and which matching rule's reason is reported within a tier follows storage order. The oracles are test code. The engine hands the lazy function at most one outcome per call by design; the multi-outcome equivalence is shown for membership of tiers, which is all the scan can observe. Layered Allow-RateLimit rules are conjunctive, which is the separate claim layered-rate-limits-conjunctive and not part of this one. The engine default applies only when no policy matches, and is not applied on top of a matching policy's default. The tail is shown to deny by the mapping test, not shown unreachable from the engine (it is unreachable only because any matching policy has a default action). The engine runs an unparseable-URL pre-check before the kill tier: a halted principal whose request URL cannot be canonicalised, under a policy with a URL deny or prompt rule, gets the unparseable reason instead of the halt reason. The outcome is still Deny and the pre-check is outside this claim.",
+      "evidence_run": "38622465060"
     },
     {
       "id": "kani-policy-precedence",
@@ -2033,7 +2261,7 @@
     },
     {
       "id": "rate-limit-default-deny-validation",
-      "statement": "Policy::validate refuses a policy that contains a RateLimit condition at any depth (top level, inside and, or, not) unless its default action is deny, and accepts the deny-default shape. An exhausted Allow-RateLimit rule stops matching; when no other rule matches, the request falls through to the policy default in the engine (deny under deny, prompt under prompt, allow under allow), which is why the validation exists. A policy that fails Policy::validate when it enters the engine through add_policy, load_policies or load_policies_if_newer (for example a RateLimit policy stored with a non-deny default) is logged as a warning, once per policy and error, in the named unit test.",
+      "statement": "Policy::validate refuses a policy that contains a RateLimit condition at any depth (top level, inside and, or, not) unless its default action is deny, and accepts the deny-default shape. An exhausted Allow-RateLimit rule makes the engine's Allow tier stop matching; the request then falls through to the policy default in the engine (deny under deny, prompt under prompt, allow under allow), which is why the validation exists. A policy that fails Policy::validate when it enters the engine through add_policy, load_policies or load_policies_if_newer (for example a RateLimit policy stored with a non-deny default) is logged as a warning, once per policy and error, in the named unit test.",
       "method": "test",
       "artifacts": [
         "src/policy/types.rs",
@@ -2079,7 +2307,8 @@
         "rate-limit-default-deny-validation-removed",
         "policy-invalid-warning-dropped-on-refresh"
       ],
-      "does_not_establish": "Validation refuses only at config load and on the admin API. The engine's own load paths (add_policy, load_policies, load_policies_if_newer) only log a failing policy, once per policy id, name and error in each process; the refusal of a stored RateLimit policy with a non-deny default happens one layer up, where the server loads from the vault, and is the claim stored-rate-limit-refused-on-load. The engine itself does not validate, so a policy added through PolicyEngine::add_policy without validation is not refused. Example tests over a few condition shapes. Layered rate limits remain first-match. Default deny makes an over-limit request a denial only when no other rule matches it: the exhausted rule falls through to the other deny, prompt and allow rules of every matching policy first, so another allow rule (in this or another matching policy) still allows the request, and a rule whose only condition is a RateLimit allows every request on the credential until it is spent."
+      "does_not_establish": "Validation refuses only at config load and on the admin API. The engine's own load paths (add_policy, load_policies, load_policies_if_newer) only log a failing policy, once per policy id, name and error in each process; the refusal of a stored RateLimit policy with a non-deny default happens one layer up, where the server loads from the vault, and is the claim stored-rate-limit-refused-on-load. The engine itself does not validate, so a policy added through PolicyEngine::add_policy without validation is not refused. Example tests over a few condition shapes. Layered rate limits are covered by layered-rate-limits-conjunctive. Default deny makes an over-limit request a denial because the whole Allow tier stops matching (every matching Allow rule's limits are enforced together, so another Allow rule in this or another matching policy cannot admit it; see layered-rate-limits-conjunctive). A Deny or Prompt rule that matches is an earlier tier and still decides first, and a rule whose only condition is a RateLimit allows every request on the credential until it is spent.",
+      "evidence_run": "38622465060"
     },
     {
       "id": "url-match-canonical",
@@ -2117,7 +2346,7 @@
         {
           "path": "src/policy/mod.rs",
           "symbol": "PolicyEngine::evaluate_inner",
-          "sha256": "4c03cb88af661dcc304dcc962d6af6ce2879d6c2139e9ec7dbe34d164f162d87"
+          "sha256": "172a6dce9f9239fb35a561b98c9607646cb13aff8ba4e91c592ccd0fd79479e9"
         },
         {
           "path": "src/plugins/http.rs",
@@ -2225,7 +2454,7 @@
         "url-canon-warning-overclaims-refusal"
       ],
       "does_not_establish": "Property tests sample 512 generated spellings per run, they are not exhaustive and the oracle is the plain spelling under the same engine. It does not show the url crate parser agrees with what an upstream server does with the bytes (a server that treats %2F or path case differently is not modelled). How a glob is matched part by part (scheme, host, port, rest) is the url-glob-part-wise claim, with its own limits; a glob * in the path or query still matches / and ?. Warned patterns only log a warning at load; the refusal of warned patterns on Deny and Prompt rules (admin API, config file, stored load) is the claims policy-write-refuses-warned-deny-prompt-patterns and url-pattern-footguns-refused, and Allow rules are not refused (except under an odd number of not). A glob whose host holds ? is not canonicalised. The http, hmac and internal_http plugins send the canonical URL (internal_http: claim internal-http-sends-the-judged-string); the wasm plugin egress, ssh and postgres plugins do not use params url. The hmac plugin adds timestamp, recvWindow and signature after evaluation, and AWS SigV4 re-sorts query pairs for signing; those additions are not judged. For UrlToken requests the sent bytes equal the evaluated string apart from the secret on the tested URLs only, and the refusal of other placeholder spellings is shown on the listed spellings only. A secret holding /, ?, #, a backslash, %, whitespace or a control character is refused at store and at use (claim url-token-secret-structure-refused); other secrets are inserted as is and the substitution is checked for scheme and host only; a {credential} in a query-map value stays literal. The query map is merged only when it is a JSON object (a value that is not a string is judged as its JSON text; the http and hmac plugins refuse such a map). A prefix that ends in * inside a host (https://api.*, https://10.0.0*) is matched as the one host the parser reads from it, so a deny rule of that shape denies less than before (warned; refused on Deny and Prompt rules at admin-API write, config load and stored load, see url-pattern-footguns-refused). A pattern without a trailing * must match the query too, so a deny rule on an exact URL does not match the same URL with a query (such a Deny, and a Prompt in a policy whose default is not deny, is now refused). The meaning-change warning compares against a loose normal form and is shown on examples only; it can miss a change. The pattern is canonicalised at match time, not rewritten in storage, so list_policies still shows the operator's text. Evaluation of the URL stored in an approval at resume uses the same function but is not separately tested. The load-time warning is a log line and is not a refusal. The server call sites that build the judged URL (policy_url at request time and at approval resume) are not covered by the detector.",
-      "evidence_run": "38762181897"
+      "evidence_run": "38591586258"
     },
     {
       "id": "url-glob-part-wise",
@@ -2579,12 +2808,12 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::run_action_streaming",
-          "sha256": "6af082064dcf672d5b4c3c52d83f6256b1d5f5e461644511c7bc6d79c721a28c"
+          "sha256": "851408807309d2dd4ed58b49cf7e8dde00b9f4c8826b7f029092158e633219e0"
         },
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::run_action",
-          "sha256": "5d86b259fec4ecb97f70b3da7e85c9bb7b0289e6a302dbfbb7e3a1e86732727b"
+          "sha256": "96be35cc9c4181ee34b6e0b4cf422ffe71b994f4afbd01d01ab1bf811bfd3f15"
         },
         {
           "path": "src/server/mod.rs",
@@ -2623,8 +2852,7 @@
         "kill-fence-dispatch-never-refuses",
         "kill-fence-ack-live-without-readback"
       ],
-      "does_not_establish": "Rollout safety of the one-way vault format: the vault format (now 10, see vault-v9-migration) makes an older binary refuse the vault on open, but an older process already running keeps its loaded engine and is refused only where it takes the vault lock, so a vk_ API-key or LLM-proxy call on it can still dispatch after Contained; every process sharing the vault must be stopped (and the vault backed up) before the fence build starts. Kill marks are keyed by policy id (a re-stored id with a narrower pattern overwrites its mark). Dispatch lock contention is not measured (the fence read now takes the lock shared, see vault-fence-shared-lock-delta-read). Also: Several hosts (the vault is one file under one cross-process lock; a network storage backend answers the default fail-closed 'unsupported'), a dispatch whose fence vault read preceded the kill policy's vault write (the fence is the last check before the dispatch call, not a recall, so work already past that read runs), MCP, /execute and /llm entry points individually (they reach the shared execute_gated, execute_gated_streaming and resume_approved paths the tests drive; a new path that bypasses them is not covered), a halt that writes no kill policy, a kill epoch snapshot older than the durable value (conservatively refuses), or any CI run. Example-based tests over in-process servers and a counting plugin, not a proof; the model is govder formal/tla/KillFence.tla. Kill-mark garbage collection is a separate claim (vault-kill-mark-gc), with its own bounds.",
-      "evidence_run": "38048104085"
+      "does_not_establish": "Rollout safety of the one-way vault format: the vault format (now 10, see vault-v9-migration) makes an older binary refuse the vault on open, but an older process already running keeps its loaded engine and is refused only where it takes the vault lock, so a vk_ API-key or LLM-proxy call on it can still dispatch after Contained; every process sharing the vault must be stopped (and the vault backed up) before the fence build starts. Kill marks are keyed by policy id (a re-stored id with a narrower pattern overwrites its mark). Dispatch lock contention is not measured (the fence read now takes the lock shared, see vault-fence-shared-lock-delta-read). Also: Several hosts (the vault is one file under one cross-process lock; a network storage backend answers the default fail-closed 'unsupported'), a dispatch whose fence vault read preceded the kill policy's vault write (the fence is the last check before the dispatch call, not a recall, so work already past that read runs), MCP, /execute and /llm entry points individually (they reach the shared execute_gated, execute_gated_streaming and resume_approved paths the tests drive; a new path that bypasses them is not covered), a halt that writes no kill policy, a kill epoch snapshot older than the durable value (conservatively refuses), or any CI run. Example-based tests over in-process servers and a counting plugin, not a proof; the model is govder formal/tla/KillFence.tla. Kill-mark garbage collection is a separate claim (vault-kill-mark-gc), with its own bounds."
     },
     {
       "id": "policy-refresh-interval-parse",
@@ -3236,12 +3464,12 @@
         {
           "path": "src/web/posture.rs",
           "symbol": "build_posture",
-          "sha256": "7494e006c6b111bc88fad30597516b7b7ea8b18612ec434d89a29b42deafdcc7"
+          "sha256": "e274d5f93972e8d0fb83724a04e34fcbf86120fadb26db246f7ed96369d75338"
         },
         {
           "path": "src/web/api.rs",
           "symbol": "api_posture",
-          "sha256": "4a678ddb19951c265eb234fcf3a21598dea30340a538bcf970da29813236259d"
+          "sha256": "91d8b763c8d02940f8ad082e10d0d0161e52380f3c9ef5e0041683ece1f7e94c"
         },
         {
           "path": "src/policy/types.rs",
@@ -3267,8 +3495,182 @@
         "posture-sod-hardcoded-true",
         "rate-limit-predicate-inverted"
       ],
-      "does_not_establish": "That the process enforces what it reports beyond the code paths those fields are read from: the report reads the engine and config objects the request handlers use, it does not re-run a policy decision. It does not prove the approver key is strong, rotated or known only to the broker, that the vault file on disk is at the reported format version (the field is the version this binary writes, a vault is migrated when opened), that no second vultrino process shares the vault (a process cannot see its peers), or that a deployment actually calls the endpoint: that is the feir-os posture verifier. The git commit is the one the build script saw; a build from an archive reports unknown. The detector runs the endpoint against an in-memory test router, not a deployed binary. The egress and identity fields report configuration, not what any request did.",
-      "evidence_run": "38667982636"
+      "does_not_establish": "That the process enforces what it reports beyond the code paths those fields are read from: the report reads the engine and config objects the request handlers use, it does not re-run a policy decision. It does not prove the approver key is strong, rotated or known only to the broker, that the vault file on disk is at the reported format version (the field is the version this binary writes, a vault is migrated when opened), that no second vultrino process shares the vault (a process cannot see its peers), or that a deployment actually calls the endpoint: that is the feir-os posture verifier. The git commit is the one the build script saw; a build from an archive reports unknown. The detector runs the endpoint against an in-memory test router, not a deployed binary. The egress and identity fields report configuration, not what any request did."
+    },
+    {
+      "id": "layered-rate-limits-conjunctive",
+      "statement": "In the engine's Allow tier every matching Allow rule's top-level RateLimit (a bare rule, or inside and at any and depth) joins one guard set per request, de-duplicated by (max, window_secs). The request is admitted only if every guard in the set has room, and then all are charged under one lock; a refused request charges none. Tested on the real engine: a 2 per minute and a 100 per day rule deny the third call whichever rule is stored first; the same with the tight cap on the long window; two matching policies with one limit each; a refused request leaves the long counter at the admitted count; identical dimensions are charged once; a rule whose action does not match is not charged; an unlimited Allow rule that also matches, in the same policy or in another matching policy, does not switch a matching limit off; the post-approval resume checks and charges nothing; a zero-sized limit in the set refuses without charging its valid sibling.",
+      "method": "test",
+      "artifacts": [
+        "src/policy/mod.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- --exact policy::tests::layered_allow_rate_limits_are_all_enforced_in_either_rule_order policy::tests::a_refused_layered_request_charges_nothing policy::tests::layered_limits_across_two_matching_policies_are_all_enforced policy::tests::duplicate_limit_dimensions_are_charged_once policy::tests::layered_limits_only_charge_the_rules_that_match_the_request policy::tests::an_unlimited_allow_rule_does_not_bypass_a_matching_limit policy::tests::an_allow_all_policy_does_not_bypass_another_policys_limit policy::tests::layered_limits_are_not_charged_or_checked_on_resume policy::tests::an_invalid_layered_limit_refuses_without_charging_the_valid_one policy::tests::test_two_and_clamped_rate_limits_are_independent_counters",
+      "covers": [
+        {
+          "path": "src/policy/mod.rs",
+          "symbol": "PolicyEngine::allow_tier_matches",
+          "sha256": "d36fc9b31dc98c4bc53575a48a7d75cd0b368ccc64f09622b9be151a4296c1bc"
+        },
+        {
+          "path": "src/policy/mod.rs",
+          "symbol": "PolicyEngine::charge_rate_limits",
+          "sha256": "2c6f8513557ad594fa67e5d3a108b160e5936e7d02dcac46fa5f3cde001a7f05"
+        },
+        {
+          "path": "src/policy/mod.rs",
+          "symbol": "split_rate_limits",
+          "sha256": "58186fbd398e23fc10d9fe083806915294cb3ec5f2c01639733fa8e88f19a9fb"
+        },
+        {
+          "path": "src/policy/mod.rs",
+          "symbol": "PolicyEngine::evaluate_inner",
+          "sha256": "172a6dce9f9239fb35a561b98c9607646cb13aff8ba4e91c592ccd0fd79479e9"
+        }
+      ],
+      "mutants": [
+        "layered-limit-first-match",
+        "layered-limit-refusal-still-charges",
+        "layered-limit-duplicate-charged-twice"
+      ],
+      "does_not_establish": "Example tests over the listed rule shapes, not an exhaustive check, and the Kani precedence harnesses do not model the Allow tier's guard set. A RateLimit written inside or or not is not part of the guard set and keeps its inline evaluation. Counters are per process and in memory, so two vultrino processes enforce their own caps (the cross-process shared limit is a separate item). The fixed-window transition is covered by the rate-limiter trace vectors, not here. Which matching rule's reason is reported when several match follows storage order. The tests run the engine directly; that the server calls it on every admission path is covered by the permit-kernel claims. The Allow tier evaluates every Allow rule's non-guard conditions, so a RateLimit written inside or or not is charged on every request even when another rule matched or when the guard set then refuses it: that over-charges (the fail-closed direction) and is not tested for exactness.",
+      "evidence_run": "38622465060"
+    },
+    {
+      "id": "meter-append-loss-announced",
+      "statement": "A failed outbox append is counted and later announced. In the unit tests of the real file storage, with every outbox write forced to fail by a directory sitting on the writer's temp path: each failed append returns an error and increments the lost counter and the pending-gap counter; no marker can be written while writes fail; after the writer recovers the next successful append is followed by exactly one meter.lost event carrying lost_count, the first and last failure times and the distinct lost event types, with the sequence still gap-free; the pending gap returns to zero while the lifetime counter stays; no second marker appears for the same loss; a second outage gets its own marker. GET /api/v1/health reports meter_lost_total and meter_gap_pending (and stays status ok), GET /api/v1/ready reports meter_gap_pending, and the posture report carries the same counters under meter. GET /api/v1/events carries meter_gap_pending on its envelope: 0 when healthy, the pending count while appends fail (with no events and no marker yet), and 0 again once the marker has been written. End to end, with the outbox writes failing while a real metered LLM call runs through the proxy: the call is still admitted (200), both of its meter events (api-calls and the priced token event) are counted as lost, GET /api/v1/events and GET /api/v1/health report meter_gap_pending 2 while no event exists, and after the writer recovers the next call's first append is followed by one meter.lost marker with lost_count 2 and event_types [meter.observed], after which meter_gap_pending is 0.",
+      "method": "test",
+      "artifacts": [
+        "src/storage/outbox_store.rs",
+        "src/storage/file.rs",
+        "src/storage/vault_tests.rs",
+        "src/web/api.rs",
+        "src/web/posture.rs",
+        "tests/web_smoke.rs",
+        "src/server/mod.rs",
+        "tests/llm_proxy_integration.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- --exact storage::file::vault_tests::a_failed_append_is_counted_then_announced_by_a_meter_lost_marker storage::file::vault_tests::a_second_outage_gets_its_own_marker web::posture::tests::report_carries_the_meter_append_loss_counters && cargo test --locked --no-default-features --test web_smoke -- --exact test_health_and_ready_report_a_failed_outbox_append test_event_feed_reports_pending_meter_gap_while_appends_fail && cargo test --locked --no-default-features --test llm_proxy_integration -- --exact v2_a_metered_call_during_an_outbox_outage_is_counted_announced_and_marked",
+      "covers": [
+        {
+          "path": "src/storage/outbox_store.rs",
+          "symbol": "OutboxStore::record_loss",
+          "sha256": "6e85518eb6b769a163016571b0583911f33e49a33c6eb7305a9eee6ef13fce5e"
+        },
+        {
+          "path": "src/storage/outbox_store.rs",
+          "symbol": "OutboxStore::flush_loss_marker",
+          "sha256": "13f6a31c48dfdb13e53bcb020c2d0c6f20bf27e3dad8ded415f4c4d73bcf7eb7"
+        },
+        {
+          "path": "src/storage/outbox_store.rs",
+          "symbol": "OutboxStore::append",
+          "sha256": "bdaa89c5aa6bcea5240123d75c46efe738aadc2db8df02ffe35aca8f0077f54b"
+        },
+        {
+          "path": "src/storage/outbox_store.rs",
+          "symbol": "OutboxStore::loss_snapshot",
+          "sha256": "90b256380d9fa90414fb6d8964abbdb28622134d8aa0cd246fe43ff837914fc9"
+        },
+        {
+          "path": "src/web/api.rs",
+          "symbol": "api_health",
+          "sha256": "5e74b5f618700a213a959cbf898fe267e627e7af33e63f83323d0f58296842af"
+        },
+        {
+          "path": "src/web/posture.rs",
+          "symbol": "build_posture",
+          "sha256": "e274d5f93972e8d0fb83724a04e34fcbf86120fadb26db246f7ed96369d75338"
+        },
+        {
+          "path": "src/web/api.rs",
+          "symbol": "api_list_events",
+          "sha256": "a51947db235844cd779f5dddf1afe187ced1dc421b3c0bd87c022add2aa039be"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "emit_meter",
+          "sha256": "f390965b01f0fed07eecfbdabf4f5094f58e3ab520fb3446df1d33bc0efa4293"
+        }
+      ],
+      "mutants": [
+        "meter-loss-not-counted",
+        "meter-lost-marker-not-appended",
+        "meter-health-gap-hidden",
+        "meter-feed-gap-pending-hidden",
+        "meter-emit-stops-after-first-failure"
+      ],
+      "does_not_establish": "The counters and the pending marker are held in memory: if the process exits before an append succeeds again the marker is never written, and a consumer's stale watermark is the only remaining signal. Failures are produced by one injected fault (an unwritable temp path), not by a real full disk or a failing fsync. Only the direct append path is counted; events staged in the vault and drained later are retried by the reconciler instead. That a consumer acts on the marker is the leria claim for its poller, not this one. Says nothing about events lost while the process is down or about the outbox being tampered with. Failed appends do not fail the metered call: vultrino keeps admitting calls during an outage, and the pending count is the only in-band signal until the marker (so the fail-open choice stands and the consumer's watermark is the control). The count is in the unsigned envelope. That the consumer acts on it is the leria claim meter-lost-marker-holds-as-of."
+    },
+    {
+      "id": "stream-usage-charged-without-trailer",
+      "statement": "A streamed LLM call is charged tokens even when the provider's usage trailer does not reach the client. With a gated test upstream: when the client hangs up before the trailer, the producer keeps draining the upstream and the token event carries the provider's exact counts (OpenAI-style trailer 11 and 22; Anthropic message_delta output 77 rather than message_start's provisional 1) with no estimated marker; when the stream ends without any trailer the token event carries an estimate (3000 generated bytes give 1000 output tokens, input from the request size) and dims.estimated is true; when the drain's idle cap fires first the call is charged an estimate and the drain stops at the cap; a halted stream and a stream with no trailer on the buffered fallback are charged estimates. In unit tests: an Anthropic message_start usage is not final, an OpenAI trailer, a Responses response.completed and an Anthropic message_delta are, a null usage is not; the estimate counts generated delta text and not framing, prefers the provider's real counts, is capped by the request's own output limit and is never zero; the estimated payload carries dims.estimated and the exact one does not. A halt that lands after the client has already hung up, while the producer is draining, closes the upstream within one chunk (the upstream is dropped, not drained to its idle cap) and the call is charged an estimate.",
+      "method": "test",
+      "artifacts": [
+        "src/outbox.rs",
+        "src/server/mod.rs",
+        "tests/llm_proxy_integration.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- --exact outbox::tests::anthropic_message_start_usage_is_provisional_until_the_final_delta outbox::tests::openai_trailer_and_responses_completed_are_complete_but_a_null_usage_is_not outbox::tests::estimate_counts_generated_text_not_framing_and_prefers_real_counts outbox::tests::estimate_falls_back_to_raw_bytes_when_a_giant_line_stopped_parsing outbox::tests::request_output_limit_is_read_from_every_provider_shape outbox::tests::estimated_token_payload_carries_the_marker_and_the_normal_one_does_not && cargo test --locked --no-default-features --test llm_proxy_integration -- --exact vul01_disconnect_before_the_trailer_still_charges_the_providers_exact_count vul01_a_provisional_anthropic_output_count_is_not_charged_as_final vul01_a_stream_that_ends_without_any_trailer_is_charged_an_estimate vul01_the_drain_is_bounded_by_the_idle_cap_and_then_estimates llm_streamed_without_a_usage_trailer_is_charged_an_estimate llm_streamed_halt_cancels_midstream vul01_a_halt_after_the_hangup_closes_the_draining_upstream_at_once",
+      "covers": [
+        {
+          "path": "src/outbox.rs",
+          "symbol": "UsageAccumulator::absorb",
+          "sha256": "49782486e06f1a4e70864e64ef018a06bfc045fc5783b48e752c37e057f6be46"
+        },
+        {
+          "path": "src/outbox.rs",
+          "symbol": "UsageAccumulator::is_complete",
+          "sha256": "87e8d9e691efbf213c97d32d9c90e54ccb851373996bbb3664d42aaf49352a03"
+        },
+        {
+          "path": "src/outbox.rs",
+          "symbol": "estimate_stream_usage",
+          "sha256": "7906a3ac5bcce7929a35ca54afe8d5fb077c7347c5aaae052841f6d3200c0538"
+        },
+        {
+          "path": "src/outbox.rs",
+          "symbol": "delta_string_bytes",
+          "sha256": "9789392ffd4ab203a2ea7e92757d45a5e95a108c8a411aae7c382ac6ff2a1852"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "drain_upstream_for_usage",
+          "sha256": "acc7abf19ccf0114a54f3710f69a1503018055d0b81f143f911da75ef9d16081"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "StreamEstimateContext::state",
+          "sha256": "ab79eb6fe06fcbb34add1d5778be9e326ed548fae3dbef1900a6ee34dc531fcd"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "emit_stream_meter",
+          "sha256": "3aaa98a53152612dc0f5cab0df420a8e38f532f5afb146fd402074a83406ad7a"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::run_action_streaming",
+          "sha256": "851408807309d2dd4ed58b49cf7e8dde00b9f4c8826b7f029092158e633219e0"
+        }
+      ],
+      "mutants": [
+        "stream-disconnect-drain-skipped",
+        "stream-provisional-usage-final",
+        "stream-estimate-unmarked",
+        "stream-no-trailer-no-estimate",
+        "stream-drain-idle-cap-removed",
+        "stream-drain-ignores-halt"
+      ],
+      "does_not_establish": "The estimate is a rough one (about one token per three generated bytes, rounded up on purpose), not the provider's count: it over-charges typical text and can still under-charge text that tokenises very densely. It needs a model from the request or the stream to be priced; a stream with neither meters the api-calls event only. The upstream is a test double with the OpenAI and Anthropic shapes, not a live provider; Gemini and the Responses API shapes are covered by the accumulator unit tests only. The drain is bounded by the same idle, total and byte caps as a live stream, not by a new cap, and a hostile client can hold an upstream stream open for that long. A halt closes the upstream (stopping generation) and is charged an estimate rather than drained, both while forwarding and while draining after a hang-up. The estimate counts text under delta keys only, so a provider that streams text elsewhere (Gemini candidates parts) estimates low, hidden reasoning tokens are not counted, and a provider that reports cumulative usage on every chunk would be read as complete on the first one; today only stream:true requests take this path and the OpenAI and Anthropic shapes are the tested ones. Says nothing about leria pricing or deduplicating the event, which is leria's claim."
     },
     {
       "id": "egress-no-ambient-proxy",
@@ -3470,7 +3872,7 @@
         {
           "path": "src/config/mod.rs",
           "symbol": "Config::from_raw",
-          "sha256": "0e5e492386909274d9227c7721882e253ec44e7d30d28918450b26d179515791"
+          "sha256": "f018a75514a6e6c75acfd9b624e80f49f2a83c02afebc5be513a9c3c709f2225"
         }
       ],
       "mutants": [
@@ -3636,7 +4038,7 @@
         {
           "path": "src/policy/mod.rs",
           "symbol": "PolicyEngine::evaluate_inner",
-          "sha256": "4c03cb88af661dcc304dcc962d6af6ce2879d6c2139e9ec7dbe34d164f162d87"
+          "sha256": "172a6dce9f9239fb35a561b98c9607646cb13aff8ba4e91c592ccd0fd79479e9"
         },
         {
           "path": "src/policy/url_canon.rs",
@@ -3657,6 +4059,455 @@
       ],
       "does_not_establish": "Only the listed patterns, URLs and shapes, not every pattern; a property of the engine decision, not a proof. A pattern holding a ? is refused on Deny and Prompt rules, not matched; an Allow rule with a ? is accepted and only narrows. Trailing slashes, ;name=value path parameters, repeated / and %2F are tried; any other rewrite a particular backend applies (case folding of the path, unicode normalisation, backslashes) is not, so a Deny pattern can still be slipped past by those spellings. A server that treats the trailing-slash path as a different resource is over-denied, not under-denied. The Prompt widening can upgrade an Allow to a Prompt, so a request an Allow rule alone would have let through can reach an approver. A Prompt rule's exact reading charges its rate limit once and its wide reading does not charge, so under the wide reading a rate limit counts as within its limit (wider, fail-closed); a widened Prompt match that turns an Allow into a Prompt has already charged the Allow rule's rate limit. Other policies and rule kinds (rate limits, principal or time conditions) are not in the grid. Which deployed vaults hold a policy relying on the old narrower matching is not checked.",
       "evidence_run": "38834394415"
+    },
+    {
+      "id": "anthropic-workspace-id-operator-owned",
+      "statement": "The Anthropic workspace on an outgoing request is the operator's, never the caller's, on every path that reaches a plugin: /llm, POST /api/v1/execute, the MCP http_request tool and approval replay. The workspace id is stored on the credential (metadata key anthropic_workspace_id). Before dispatch, any caller-supplied anthropic-workspace-id header (any case) is removed from the request, and the credential's value, if it has one, is written; a credential with none sends none, so the caller cannot choose a workspace with the same bearer on any of these paths. The http plugin repeats the same removal and write on its own parameters. The id must be wrkspc_ plus 8 to 64 ASCII letters or digits: the CLI metadata set command and credential creation refuse anything else, and a stored value that fails the check at use time is refused (the request fails before any upstream call, shown by no meter event, and before the use token is consumed, shown by its use count staying 0) instead of being written into a header. The refusal is a credential configuration error, not an upstream failure: /llm answers 500 with a message naming the misconfigured credential metadata, and an approval-gated request refuses at approval open (no approval is stored) rather than opening an approval that could only fail on resume.",
+      "method": "test",
+      "artifacts": [
+        "src/plugins/mod.rs",
+        "src/plugins/http.rs",
+        "src/server/mod.rs",
+        "src/lib.rs",
+        "tests/llm_proxy_integration.rs",
+        "tests/approval_token_integration.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "set -e; cargo test --locked --no-default-features --test llm_proxy_integration anthropic_workspace_id; cargo test --locked --no-default-features --test approval_token_integration workspace; cargo test --locked --no-default-features --lib -- plugins::http::tests::plugin_drops_agent_workspace_header",
+      "detector_kind": "cargo",
+      "covers": [
+        {
+          "path": "src/plugins/mod.rs",
+          "symbol": "apply_workspace_scope",
+          "sha256": "fa35061fe506c3b5b8a3c3ad4a5b7590b664ac52a33ffa6b06b65deeee51b632"
+        },
+        {
+          "path": "src/plugins/mod.rs",
+          "symbol": "apply_workspace_scope_to_params",
+          "sha256": "b4b2ff2c408d390c8569f2d8f4d91eff32180041bf73a41c6308c7bbcfbd5430"
+        },
+        {
+          "path": "src/plugins/http.rs",
+          "symbol": "HttpPlugin::scoped_params",
+          "sha256": "7825547c7a1618d027179dfdc2ae4cb6e566af51822162c77902512622929c7c"
+        },
+        {
+          "path": "src/lib.rs",
+          "symbol": "is_valid_anthropic_workspace_id",
+          "sha256": "b03ae8bb15c0bdb6e60ec58d8470b3026fc4757f0c9308c05714ddf2698c3694"
+        },
+        {
+          "path": "src/lib.rs",
+          "symbol": "validate_credential_metadata_entry",
+          "sha256": "03d29f336aa209d2625c5e2ae85a34903bd67ccfaf3c6ed776f1a2902af384ee"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::run_action",
+          "sha256": "96be35cc9c4181ee34b6e0b4cf422ffe71b994f4afbd01d01ab1bf811bfd3f15"
+        }
+      ],
+      "mutants": [
+        "workspace-scope-server-strip-removed",
+        "workspace-scope-plugin-strip-removed",
+        "workspace-scope-not-injected",
+        "workspace-scope-use-time-recheck-removed",
+        "workspace-scope-applied-after-consume",
+        "workspace-id-format-check-removed"
+      ],
+      "does_not_establish": "That Anthropic accepts the configured workspace id, that the id belongs to the key's organization, or that the real upstream sees the header: the integration tests drive a stub plugin standing in for the http plugin and read the params handed to it, and the http plugin's own removal is tested on its parameter step, not on a live request. A credential holding an org-level key and no workspace id sends no workspace header, so Anthropic decides what that does. The buffered and the streaming dispatch in the server call the same helper, but only the buffered one is driven by a test for dispatch (the streaming path is driven only for the invalid-stored-value refusal). Other plugins (internal_http, WASM) get the server-side removal but have no workspace-id injection of their own. The header name is matched exactly (case-insensitively); other provider headers, and the gap that /api/v1/execute does not apply a capability's model allowlist or token ceiling to a credential no LLM channel references, are not covered here (a credential an LLM channel references is refused there, see llm-credential-channel-only). The format check is an operator-facing sanity check, not Anthropic's own validation."
+    },
+    {
+      "id": "unpriced-model-refused",
+      "statement": "An LLM-proxy request whose model the rate card does not price is refused with 403 model_unpriced before any upstream call, because leria rejects an unpriced token event and the call would book $0 so a budget cap would never trip. With the shipped default [llm_proxy] require_priced_model = true and a rate card read from rate_card_path (the file leria reads): a model the card lacks is refused for a buffered and a streamed request and the test upstream sees no request and no meter event is written; a request with a body that names no model is refused; with no card configured every model-bearing call is refused; a priced model passes and is metered; a dated id passes only through an explicit model_ref_prefix entry, the prefix followed by - or @ and more text (claude-haiku-4-5-20251001 and claude-haiku-4-5@20251001 pass, claude-haiku-4-50, the bare prefix and an id with no prefix entry do not); an entry of another asset than tokens, a zero or negative token price, an empty or malformed file and a card with no token entry are refused when the file is read; the operator opt-out require_priced_model = false lets an unpriced model through; an unreadable file is a startup error. The model that is gated, checked against the allowlist and booked is the one the resolved upstream URL selects where the URL picks it, not the body's: Gemini and Vertex AI take models/<id> (a model baked into provider_base counts; two model segments, or none outside the OpenAI-compatible endpoint, are refused), Bedrock takes the percent-decoded model/<id> (a Bedrock call with no body model passes when the path model is priced; no model segment is refused), Azure OpenAI takes deployments/<name> (or the body model as the deployment name on the v1 API) through the operator's [llm_proxy.azure_deployments] map and an unmapped deployment is refused even when its name is a priced model's id; a body model that differs from the URL's model is refused; with the URL naming an unpriced model and the body a priced one the request is refused and the upstream is not called; the capability allowlist is applied to the URL's model where the URL selects it (a Gemini, Vertex or Bedrock call whose body names no model passes an allowlist that lists the path model and is refused when it does not; an Azure call passes when the allowlist lists the mapped model or the deployment name) and to the body's model where the body picks it. A request that the proxy cannot show to bill tokens alone is refused with 403 modifier_unpriced before any upstream call, by an ALLOWLIST (default-deny), per provider protocol (anthropic-messages, openai-chat and nvidia, openai-responses, azure-openai, gemini and vertex-ai including the OpenAI-compatible and Anthropic-on-Vertex bodies, bedrock-converse, bedrock-invoke; any other protocol admits no field): (1) every top-level request field must be on the protocol's table of fields that cannot change the price per token (model, messages, system, max_tokens, sampling parameters, stop sequences, stream, metadata, tools, tool_choice and the like); any other field, including compaction, context_management, fallbacks, speed, inference_geo, web_search_options, guardrailConfig and a service tier in any casing (service_tier, serviceTier, ServiceTier), is refused, and a body that is not a JSON object is refused; the card format has no entry for a priced variant, so only a code change widens a table; (2) the anthropic-beta header (every line, comma separated) and a body anthropic_beta (Bedrock InvokeModel, Vertex Anthropic) may name only betas on a priced list, any other value is refused; (3) a tool must be exactly a plain client tool of the protocol (Anthropic: an untyped or custom object with name, input_schema and no key beyond description, cache_control and strict, or an exact versioned client type bash, text_editor, memory or computer; OpenAI chat and responses: function or custom with the documented keys only; Gemini: functionDeclarations entries; Bedrock Converse: toolSpec or cachePoint with the documented keys only, in toolConfig.tools); server tools, advisor, web search and fetch, tool search, code execution, file search, grounding, urlContext, a typed tool not on the list and a tool with a foreign key are refused.; (4) inside admitted fields, the media and modality markers are an ALLOWLIST checked over the whole body, buffered and streamed, with no upstream call: for a Gemini or Vertex AI body the proxy walks every array element and every object value at any depth (a single object is read like an array, as Google's parser does, so contents, parts, systemInstruction and functionResponse parts are all reached), and an object under inlineData, inline_data, fileData or file_data is admitted only if it is an object whose mimeType or mime_type (every one present, at least one present) is a string that is image/png, image/jpeg, image/webp, image/heic, image/heif, image/gif, application/pdf or a text/* type; a missing, non-string or any other media type (audio and video, application/octet-stream, the YouTube file_uri form with no media type) is refused; a responseModalities or response_modalities at any depth must be a non-empty array of exactly TEXT entries (an empty array, a non-array and any other entry are refused; an absent field and a JSON null are admitted); a JSON null under inlineData, inline_data, fileData or file_data is read like an absent key; a body nested deeper than 64 levels is refused; for an OpenAI chat, responses or Azure body each messages or input entry (an array or a single object) and each content part (an array or a single object) must be of type text, image_url, input_text, input_image, output_text or refusal (an entry may also be a plain string, or of a conversation item type message, function_call, function_call_output, custom_tool_call, custom_tool_call_output, reasoning or item_reference; an entry with no type is admitted and only its content parts are checked), a message carrying an audio object is refused (an audio of null is read like an absent key), and an image_url part (a string or an object with url) or an input_image part whose URL starts with data: (any casing) is admitted only when the media type between data: and the first ; or , (trimmed, lowercased) is one of the priced types above, so a data:audio/wav, data:video/mp4 or typeless data: URL is refused on every OpenAI dialect, including the Gemini and Vertex AI OpenAI-compatible chat route, while an https URL is admitted (input_audio, file and input_file parts, a PDF included, a part with no type and any other type are refused, so a PDF part passes only on Gemini; an audio output request, the modalities and audio fields, is refused by the top-level table); a plain text request, image parts, a Gemini PDF part, TEXT-only modalities and a request with no modalities field pass. Other nested options are not inspected. A plain priced request passes. GET /api/v1/posture reports rate_card.require_priced_model, configured, entries, last_error, sha256 (of the card read at start, the digest leria reports for the same file), file_sha256 (the file as last read) and never the path.",
+      "method": "test",
+      "artifacts": [
+        "src/ratecard.rs",
+        "src/web/llm_proxy.rs",
+        "src/config/mod.rs",
+        "src/config/types.rs",
+        "src/web/posture.rs",
+        "tests/llm_proxy_integration.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- ratecard::tests config::types::tests::llm_proxy_requires_a_priced_model_by_default_and_with_no_card config::types::tests::llm_proxy_reads_the_opt_out_and_the_card_path config::types::tests::an_unreadable_or_invalid_rate_card_is_a_startup_error web::posture::tests::report_carries_the_rate_card_fingerprint_and_the_priced_model_gate web::llm_proxy::tests::gemini_and_vertex_take_the_model_from_the_url web::llm_proxy::tests::bedrock_takes_the_percent_decoded_model web::llm_proxy::tests::azure_names_a_deployment web::llm_proxy::tests::body_routed_protocols_use_the_body_model web::llm_proxy::tests::an_unlisted_top_level_field web::llm_proxy::tests::a_plain_priced_request_passes web::llm_proxy::tests::only_plain_client_tools web::llm_proxy::tests::an_anthropic_beta_in_the_body web::llm_proxy::tests::the_anthropic_beta_header && cargo test --locked --no-default-features --test llm_proxy_integration -- v2b_an_unpriced v2b_a_request_naming_no_model v2b_a_priced_model_passes v2b_a_dated_id v2b_with_no_card v2b_the_operator_opt_out v2b_a_gemini_model v2b_the_model_in_the_path v2b_a_body_model_that_differs v2b_a_priced_path_model v2b_a_model_baked v2b_bedrock v2b_azure v2b_the_allowlist_applies v2b_a_request_that_sets_a_price v2b_an_advisor v2b_an_unknown_future v2b_gemini_camel v2b_round4 v2b_an_allowlist_matches v2b_gemini_audio v2b_openai_input_audio v2b_gemini_media_allowlist v2b_openai_content_parts v2b_openai_compat_data_url v2b_null_is_read",
+      "covers": [
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "llm_proxy_impl",
+          "sha256": "0f298edb53dd55826b69c2313907fea3dd807d370b3939cc61e800fd2e9bd97d"
+        },
+        {
+          "path": "src/ratecard.rs",
+          "symbol": "RateCard::covers",
+          "sha256": "5da8cc49436361fe4afb028b748c1719b0467facd7dd8671f6d47b74050e5a64"
+        },
+        {
+          "path": "src/ratecard.rs",
+          "symbol": "RateCard::add",
+          "sha256": "0f51586d4d9c6354b6d18ee122ddeb165f60fda2aebeaaf0bc648305042c2037"
+        },
+        {
+          "path": "src/ratecard.rs",
+          "symbol": "dated_under",
+          "sha256": "2d67f7f74b87193f848b9a9ae4c78497f8568eac66ba25d1e5d06b7645983833"
+        },
+        {
+          "path": "src/ratecard.rs",
+          "symbol": "RateCardHandle::current",
+          "sha256": "49202687ae72a5e0119c9338e6fed413e651eaef63c5b41d561435558f6b9571"
+        },
+        {
+          "path": "src/config/mod.rs",
+          "symbol": "LlmProxyConfig::default",
+          "sha256": "a172d6ed9e54dccdd47b9f9172f6bcf1de8c789f84accb1ad8d39b4bd8899b90"
+        },
+        {
+          "path": "src/web/posture.rs",
+          "symbol": "build_posture",
+          "sha256": "e274d5f93972e8d0fb83724a04e34fcbf86120fadb26db246f7ed96369d75338"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "url_model",
+          "sha256": "67dc86901456f84b75ebb1360ef3f02c17f6d7e12f2d2e3d01b4ecc82c163be4"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "id_after_segment",
+          "sha256": "52d268088bcfa7d0a69781ab33230cf4f139c70523df47889a17c4d69acde59f"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "unpriced_modifier",
+          "sha256": "a70a2ebb5db2af49c7e5f77874d86b73ddbdaa04dbe151246972ee714cfdc4c7"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "tool_is_plain",
+          "sha256": "a3e2a1c4aeff9e5ee56364204dc714d1286e0ad6526510612932a4a580ab9fb3"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "field_is_priced",
+          "sha256": "c664bf3347630f025649e60ff471e2286290e7e456870112465c9037b868ba45"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "request_tables",
+          "sha256": "8b6ad1fa1e89886cdd5d40f212bb5b2b459bd22f5aa4beb715366857d70806e2"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "unpriced_beta_header",
+          "sha256": "65c7c6bbab7fadcf45b6dd3dd80a9d9a5f06551361ab60df5866469e03438b44"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "only_keys",
+          "sha256": "7eb68bb8d804cfde877a140add242cbbb548284327e5426a924ae075bf5a6daa"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "openai_chat_tool",
+          "sha256": "c9fc281102c46f5e1f300111cb287ed7224f4a746d469039749f757920fd4414"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "openai_responses_tool",
+          "sha256": "c2990a86a4bd5d6551f358756516feddcd794c6a37bc8d215bd2fd7a997e45f4"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "betas_priced",
+          "sha256": "cc573c141abd47f6abbdab00cf20342981e87c68fce6852d7c7a6fb783f042b3"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "ANTHROPIC_FIELDS",
+          "sha256": "19d49e91828e209e6f14c150b288e493babd1de719d83b0b773d9951fcb4bda6"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "ANTHROPIC_HOSTED_EXTRA",
+          "sha256": "4a627f83b193e19c78ccaf7377af3103778a028ee35ef8716483f8c7467ab09d"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "OPENAI_CHAT_FIELDS",
+          "sha256": "58ad381d6dcb02697e643050febe88627497495187982dc07923201fc1d9ada8"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "NVIDIA_EXTRA",
+          "sha256": "60061b3d272133e8311fc25c51b0eaa63909020aad08398e001324408f4e0d92"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "OPENAI_RESPONSES_FIELDS",
+          "sha256": "4a12c861cad46e2257a8c467a04535f7358d4ffe87a2b386de9179d186544576"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "GEMINI_FIELDS",
+          "sha256": "996d604ecf2358c4ab16898a8b579481e56c0cedf7e46b3c428009d34b891beb"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "CONVERSE_FIELDS",
+          "sha256": "d0711caf422e9b36cee050dac9cfec490fd6bce9981031f7e9372058ebf54f39"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "PRICED_BETAS",
+          "sha256": "a224abe3296a62f7f50960d7fd25de93885fce395e1021c7ab4566ab6bbb3c6f"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "ANTHROPIC_CLIENT_TOOL_TYPES",
+          "sha256": "da0b11e4fb45e98d7309247b82d3475f85fe0f1973d878502367cb02f4f6540b"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "modality_marker",
+          "sha256": "bffe825bfe021ad03896e82191137d6d5b0e0386093da60742732e8df0e13ef2"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "PRICED_MEDIA_TYPES",
+          "sha256": "8300c52367632959b6ebe73f1b2be63cfe59762d7ce810e0f9071db104bc4f49"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "is_priced_mime",
+          "sha256": "58761c2bc17210a434cc8f6fcf4562e97d06ccf320315c562c66389517ae5083"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "is_priced_mime_str",
+          "sha256": "1a200be07c1c9400b267c99fff25c4539a65b8866870a5b53a1fd69168210764"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "image_url_priced",
+          "sha256": "b7a7d196d994c2a28be1379a873ccb562b1e70a3dfb1a2240d472a9f1c249af6"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "image_part_marker",
+          "sha256": "e1db4f32126f8caf0d9c00e4d56e0cb72b68647fabd956ac3247fadc4f7cd8c4"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "MODALITY_WALK_MAX_DEPTH",
+          "sha256": "ee1af51a284a188ac3da333292792b08ff4ffe6a58f12050de5b05c698c1f6c1"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "gemini_media_marker",
+          "sha256": "b8cd53312791530db2b79078ed2b1f71986ffc38babae7f679fd73dd9f1bc44c"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "gemini_map_marker",
+          "sha256": "a1f0a160671597e999ffacd2aa682388322cea5e48a17c9e5f48cf57cea09ba4"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "OPENAI_PRICED_PART_TYPES",
+          "sha256": "d845272831c8881da2d4e86117c0f2872b36787e1552206275bace1f19ad2a1d"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "OPENAI_PRICED_ITEM_TYPES",
+          "sha256": "ce270896681e263bcc2717b91b79a7feaa89d6eb8f5af6845908ebd57ff6f3c3"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "openai_items",
+          "sha256": "1fa828eeaa4457613ba315e18cfe6e5cabf921ac536a82f3544b5e9e2aa210bb"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "openai_content_marker",
+          "sha256": "8a263f1bc922ca7e901dc590f4f67671a4007745a1bdcec54792b2c7e412e998"
+        }
+      ],
+      "mutants": [
+        "unpriced-gate-default-off",
+        "unpriced-gate-removed",
+        "unpriced-gate-missing-model-passes",
+        "rate-card-prefix-boundary-dropped",
+        "rate-card-fingerprint-not-reported",
+        "route-model-mismatch-allowed",
+        "route-body-model-gates",
+        "route-bedrock-path-model-not-read",
+        "route-azure-unmapped-deployment-priced-by-name",
+        "route-allowlist-ignores-url-model",
+        "modifier-gate-not-applied",
+        "modifier-unknown-tool-type-allowed",
+        "modifier-bedrock-tool-config-unchecked",
+        "route-allowlist-checks-body-model-first",
+        "modifier-allowlist-default-allow",
+        "modifier-beta-header-unchecked",
+        "modifier-beta-body-unchecked",
+        "modifier-tool-foreign-key-allowed",
+        "modifier-tool-type-by-prefix",
+        "modifier-gemini-service-tier-listed",
+        "modifier-non-object-body-passes",
+        "modality-check-removed",
+        "modality-response-modalities-unchecked",
+        "modality-input-audio-unchecked",
+        "modality-gemini-av-mime-unchecked",
+        "modality-allowlist-removed",
+        "modality-walk-arrays-only",
+        "modality-missing-mime-admitted",
+        "modality-empty-modalities-admitted",
+        "modality-depth-cap-removed",
+        "modality-data-url-type-unchecked"
+      ],
+      "does_not_establish": "Only the /llm proxy is gated: a model call through POST /api/v1/execute, an MCP http.request or a named tool is not refused here (leria still rejects its unpriced token event and books $0). The model is the one the upstream URL or the body names; it does not show which model the provider bills if it serves a different one (the token event then carries the served id, see llm-token-event-complete-and-priced). Azure deployment names are mapped to models by the operator, and a wrong map entry prices the wrong model. The allowlist is checked on top-level field names and on tool and beta values; the contents of an allowed field (for example generationConfig, thinking, response_format, inferenceConfig, metadata) are not inspected, except the media and modality markers named in the statement (any other nested option is not inspected). The media allowlist assumes that image, PDF and text input bill at the model's token rate, because the rate card holds one input and one output price per model: a provider that prices image or document input differently is booked at the base price (an under-count) until that type is removed from the list. A request with no responseModalities is admitted, and the default output modality of a model is priced only through that model's card entry. The proxy checks the DECLARED media type (the mimeType or mime_type of a Gemini part, or the type written in a data: URL): the inline bytes are not inspected, and a URL the provider fetches (http or https, gs://, a Files API reference, a YouTube fileUri) is not inspected, so a media type that disagrees with the bytes or a fetched file of an unpriced type is not caught. The output arrays of function_call_output and custom_tool_call_output items are not scanned for content parts. The walk reads keys by name anywhere in a Gemini body, so a tool argument that happens to use one of those key names is refused too (fail closed); the OpenAI check reads only the messages and input entries and their content parts, and an OpenAI item type outside the list (a server tool call replayed as input, for example) is refused until priced, so a provider that prices a nested option is booked at the base price (an under-count) until its table entry is reviewed; a field on a table is a human pricing judgment, not a proof. The OpenAI-Beta header and the other forwarded provider headers are not on a beta allowlist. The regional-endpoint premium of a Vertex or Bedrock deployment reached through provider_base and a price the provider changes without a request field are booked at the base price. The card is read for coverage only: prices are not checked beyond being positive, the file is not compared with the copy leria loaded (the posture fingerprint is what a deploy check compares), a change is noticed by size and modified time, and a file edited back to the same size within the filesystem's timestamp granularity is not re-read. Staleness of a card is not enforced. What happens when the file changes after start is rate-card-reload-only-narrows. The upstream is a test double, not a live provider."
+    },
+    {
+      "id": "llm-token-event-complete-and-priced",
+      "statement": "A metered LLM call is charged for all billed input and output that the top-level usage block reports, and under a model the rate card prices. Every entry of usage.iterations (one per sampling step, including server-side compaction and advisor steps that the top-level counts leave out) is counted: per direction the booked count is the larger of the top-level figure and the sum over the iterations (each entry's cache tokens included, cache writes at twice), so no step is counted twice and none is left out, for a buffered response and for a stream (the largest cumulative list wins; an estimate keeps it as a floor). A request that runs features the card does not price is refused before the upstream (unpriced-model-refused). Anthropic cache_creation_input_tokens (Bedrock cacheWriteInputTokens) are added to the input count at TWICE the input price, an upper bound for both cache lifetimes (the provider bills 1.25x and 2x), and cache_read_input_tokens (cacheReadInputTokens) at the full input price: for a buffered response with usage input 10, cache creation 100, cache read 1000 the token event carries input_tokens 1210; the same for an Anthropic stream, where the cache counts of message_start are added once (a cumulative repeat in message_delta is not summed again) and an estimate keeps the cache tokens it saw; OpenAI prompt_tokens, which already includes cached tokens, is not changed, and a huge cache count saturates instead of wrapping. Gemini usageMetadata books promptTokenCount plus toolUsePromptTokenCount as input and candidatesTokenCount plus thoughtsTokenCount as output (streamed: the largest cumulative value of each, never summed twice, and the thinking tokens are a floor of an estimate), and a block with a prompt count and no candidates (a blocked response) still books its prompt. With a rate card configured the token event's dims.model_ref is the model the provider served when the card prices it; the requested model (the one the gate checked, which for Gemini, Vertex, Bedrock and Azure is the one the URL selects) is used only when the served id is a dated form of it (the requested id followed by - or @ and more text) and the card prices the requested one; any other served model, priced or not, is booked under its own id, so a served Opus is never booked at a requested Haiku's price. This holds for buffered and streamed calls. With no card, or with neither covered, it is the served model, then the requested one.",
+      "method": "test",
+      "artifacts": [
+        "src/outbox.rs",
+        "src/ratecard.rs",
+        "src/server/mod.rs",
+        "tests/llm_proxy_integration.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- outbox::tests::anthropic_cache_tokens_are_added_to_the_input_count outbox::tests::streamed_anthropic_cache_tokens_are_added_to_the_input_count outbox::tests::a_later_cumulative_cache_count_is_not_summed_with_the_first outbox::tests::an_estimate_keeps_the_cache_tokens_it_saw outbox::tests::cache_writes_are_counted_at_twice outbox::tests::every_usage_iteration outbox::tests::gemini_thinking_and_tool_use outbox::tests::a_gemini_block_without_candidates outbox::tests::a_gemini_stream_counts ratecard::tests::pick_prefers_a_priced_served_model_then_a_priced_requested_one ratecard::tests::a_different_served_model server::routed_model_tests && cargo test --locked --no-default-features --test llm_proxy_integration -- v2b_buffered_anthropic_cache v2b_streamed_anthropic_cache v2b_the_token_event_names v2b_a_streamed_token_event_names v2b_a_served_model_that_is_not_a_dated_form v2b_a_priced_path_model",
+      "covers": [
+        {
+          "path": "src/outbox.rs",
+          "symbol": "cache_input_tokens",
+          "sha256": "f4e267e3c84fee659be85d059f888fb6dc0b9e40426ff95b2f1b536683d2bed8"
+        },
+        {
+          "path": "src/outbox.rs",
+          "symbol": "parse_token_usage",
+          "sha256": "6a852f53dfd6537d786372d4151b40cf8217cb67096b6dc0d8b98080ec9c82c0"
+        },
+        {
+          "path": "src/outbox.rs",
+          "symbol": "UsageAccumulator::input_total",
+          "sha256": "dd6685b36955a386e73241722d800f7748c5b8d44c7e7f227948f040b823f3c3"
+        },
+        {
+          "path": "src/ratecard.rs",
+          "symbol": "pick_meter_model",
+          "sha256": "76937580c2190323336863d4cb7aeaa3586ac8dc4753ae54a0763c036dc71abe"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "StreamEstimateContext::state",
+          "sha256": "ab79eb6fe06fcbb34add1d5778be9e326ed548fae3dbef1900a6ee34dc531fcd"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "request_model_of",
+          "sha256": "6ae6362e725eceac5d739964bd86a89b7adf9fe8dc0e7f14e87059707b47baa2"
+        },
+        {
+          "path": "src/outbox.rs",
+          "symbol": "CACHE_WRITE_WEIGHT",
+          "sha256": "6588de8a430c9fe7dce0fa47210f490a878f2de7e5d0b9f6f7f49f1a72a4a28d"
+        },
+        {
+          "path": "src/outbox.rs",
+          "symbol": "UsageAccumulator::output_total",
+          "sha256": "6b59d59fe5c70720b753ac1c90ed46ee28157b26fa1906bd2117d25b1d10b6ea"
+        },
+        {
+          "path": "src/outbox.rs",
+          "symbol": "UsageAccumulator::absorb",
+          "sha256": "49782486e06f1a4e70864e64ef018a06bfc045fc5783b48e752c37e057f6be46"
+        },
+        {
+          "path": "src/outbox.rs",
+          "symbol": "iterations_total",
+          "sha256": "87cf2d47f864659b22bf2f4bb67436e2c21e420bc12fb68728b5fb28062494b5"
+        }
+      ],
+      "mutants": [
+        "anthropic-cache-tokens-ignored",
+        "meter-model-pick-ignores-card",
+        "meter-model-pick-books-requested-for-any-served",
+        "anthropic-cache-write-single-weight",
+        "gemini-thoughts-not-counted",
+        "gemini-tool-use-prompt-not-counted",
+        "gemini-blocked-prompt-not-booked",
+        "iterations-not-counted",
+        "iterations-not-counted-streamed"
+      ],
+      "does_not_establish": "The cache tokens are booked as input tokens because the card has one input price per model: a cache read is OVER-counted (the provider bills about 0.1x) and a cache write is never under-counted but is over-counted for the 5-minute cache (1.25x billed, 2x booked); it does not model provider cache pricing and does not read cache_creation.ephemeral_* to split the lifetimes. Only the Anthropic, Bedrock and Gemini spellings are read, and a provider that reports cache tokens or reasoning tokens elsewhere (OpenAI reasoning inside completion_tokens is already counted by the provider) is not counted beyond what its usage block reports. Server-tool fees and price modifiers are not metered (the proxy refuses every request field, beta and tool off its allowlist, see unpriced-model-refused). usage.iterations entries are charged at the request model's input and output price whatever model an entry names (an advisor step on a dearer model is under-priced, which is why the advisor tool stays refused); only the Anthropic and Bedrock spellings of the list are read. A served model the card does not price is booked under its own id and leria then rejects the event as unpriced and holds its watermark; the gate is what prevents that on /llm for the model the request names, not for a provider that substitutes a different one. The upstream is a test double, not a live provider. Says nothing about leria pricing the event."
+    },
+    {
+      "id": "rate-card-reload-only-narrows",
+      "statement": "The rate card read at start bounds what vultrino covers for the life of the process, and the file parses as strictly as leria's. After start a changed card file is re-read, and the covered set is the intersection of the start card and the latest good file: a model added to the file stays refused (leria loaded the start card and could not price it), a model removed is refused at once, the start coverage returns when the file returns to the start content, and a change that cannot be parsed keeps the previous card and is reported as last_error. The posture sha256 stays the start card's fingerprint and file_sha256 reports the file as last read. The parser refuses what leria's refuses: an unknown field on a card or an entry (a typo such as output_price_micros_per_unti), a missing, empty or repeated rate_card_version, an input or output price given on one side only, an entry with no price in a symmetric card, a non-token entry in a card that uses the input/output form or a prefix, a duplicate entry and a created_at that is not RFC3339; the optional provider, created_at and stale_after_s fields are accepted.",
+      "method": "test",
+      "artifacts": [
+        "src/ratecard.rs",
+        "src/web/posture.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- ratecard::tests web::posture::tests::report_carries_the_rate_card_fingerprint_and_the_priced_model_gate",
+      "covers": [
+        {
+          "path": "src/ratecard.rs",
+          "symbol": "RateCard::parse",
+          "sha256": "ef91fe20b0892eb1ddb402e92fe0b374b85700b2b43db4e4cf7c3666ea156698"
+        },
+        {
+          "path": "src/ratecard.rs",
+          "symbol": "RateCard::add",
+          "sha256": "0f51586d4d9c6354b6d18ee122ddeb165f60fda2aebeaaf0bc648305042c2037"
+        },
+        {
+          "path": "src/ratecard.rs",
+          "symbol": "RateCard::narrowed_by",
+          "sha256": "c85c3f4758ca0a6b2c99079f4592dea58c4676a2f41adcf7fd6d4a3673cf3457"
+        },
+        {
+          "path": "src/ratecard.rs",
+          "symbol": "RateCard::covers",
+          "sha256": "5da8cc49436361fe4afb028b748c1719b0467facd7dd8671f6d47b74050e5a64"
+        },
+        {
+          "path": "src/ratecard.rs",
+          "symbol": "RateCardHandle::current",
+          "sha256": "49202687ae72a5e0119c9338e6fed413e651eaef63c5b41d561435558f6b9571"
+        },
+        {
+          "path": "src/ratecard.rs",
+          "symbol": "RateCardHandle::status",
+          "sha256": "ab8a86867009fe80611b42441a327cc3768341fd21d46a4df40cafa573eca783"
+        },
+        {
+          "path": "src/ratecard.rs",
+          "symbol": "refuse_unknown_fields",
+          "sha256": "e7ceb1c75b05ed87c15b6ab7296d6772d75dbf882edc580f01cc5e203b3a7e94"
+        }
+      ],
+      "mutants": [
+        "rate-card-reload-widens",
+        "rate-card-unknown-field-accepted",
+        "rate-card-version-optional",
+        "rate-card-one-sided-price-accepted",
+        "rate-card-unknown-card-field-accepted"
+      ],
+      "does_not_establish": "That the two planes read the same bytes at start: the deploy mounts one file and verify-posture compares the sha256 values, vultrino does not compare them itself. A leria restart onto a newer file is matched here only by a vultrino restart. Rust parsing is stricter than leria's in places (field names are case-sensitive here, a duplicate entry is refused in every card form), so a file leria accepts may be refused here; the reverse is what the claim is about. Prices are not read beyond being positive. A change is noticed by size and modified time. The test files are temporary files in one process, not a mounted ConfigMap."
     },
     {
       "id": "vault-backup-restore-consistent",
@@ -3768,12 +4619,12 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::run_action",
-          "sha256": "5d86b259fec4ecb97f70b3da7e85c9bb7b0289e6a302dbfbb7e3a1e86732727b"
+          "sha256": "96be35cc9c4181ee34b6e0b4cf422ffe71b994f4afbd01d01ab1bf811bfd3f15"
         },
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::run_action_streaming",
-          "sha256": "6af082064dcf672d5b4c3c52d83f6256b1d5f5e461644511c7bc6d79c721a28c"
+          "sha256": "851408807309d2dd4ed58b49cf7e8dde00b9f4c8826b7f029092158e633219e0"
         },
         {
           "path": "src/server/mod.rs",
@@ -3842,130 +4693,6 @@
       ],
       "does_not_establish": "Only an action the trusted catalog declares Reversible or partially-reversible may degrade, and in the default mode only when it is not money; whether an operator declared the real side effect truthfully, or named a money action under money.*, is not checked, and a reversible catalog entry named money.* requested under another label is not recognised as money. Unavailable means a request error (connect or timeout), a 5xx or a 429; a live Averin that misbehaves in some other way refuses, which is the safe side. In the default mode a degraded partially-reversible write has no before-act record. The approved-resume path (including every partially-reversible case) is driven through the buffered tail in approval_token_integration and the direct path through both tails in d8_degraded_guard; the D8 evidence refusal of a declared non-reversible action on the streaming tail is not driven by any test; a fake Averin stands in for the real one, and the four-plane evidence-gate end-to-end is a separate run. The routine action's one-phase seal can still be lost: the plan 085 reconciliation detects the gap, it cannot recover it. An approval opened under an older build for a partially-reversible action is refused on resume. Any CI run other than the recorded one.",
       "evidence_run": "38676181898"
-    },
-    {
-      "id": "anthropic-workspace-id-operator-owned",
-      "statement": "The Anthropic workspace on an outgoing request is the operator's, never the caller's, on every path that reaches a plugin: /llm, POST /api/v1/execute, the MCP http_request tool and approval replay. The workspace id is stored on the credential (metadata key anthropic_workspace_id). Before dispatch, any caller-supplied anthropic-workspace-id header (any case) is removed from the request, and the credential's value, if it has one, is written; a credential with none sends none, so the caller cannot choose a workspace with the same bearer on any of these paths. The http plugin repeats the same removal and write on its own parameters. The id must be wrkspc_ plus 8 to 64 ASCII letters or digits: the CLI metadata set command and credential creation refuse anything else, and a stored value that fails the check at use time is refused (the request fails before any upstream call, shown by no meter event, and before the use token is consumed, shown by its use count staying 0) instead of being written into a header. The refusal is a credential configuration error, not an upstream failure: /llm answers 500 with a message naming the misconfigured credential metadata, and an approval-gated request refuses at approval open (no approval is stored) rather than opening an approval that could only fail on resume.",
-      "method": "test",
-      "artifacts": [
-        "src/plugins/mod.rs",
-        "src/plugins/http.rs",
-        "src/server/mod.rs",
-        "src/lib.rs",
-        "tests/llm_proxy_integration.rs",
-        "tests/approval_token_integration.rs"
-      ],
-      "gates": [
-        "rust"
-      ],
-      "detector": "set -e; cargo test --locked --no-default-features --test llm_proxy_integration anthropic_workspace_id; cargo test --locked --no-default-features --test approval_token_integration workspace; cargo test --locked --no-default-features --lib -- plugins::http::tests::plugin_drops_agent_workspace_header",
-      "detector_kind": "cargo",
-      "covers": [
-        {
-          "path": "src/plugins/mod.rs",
-          "symbol": "apply_workspace_scope",
-          "sha256": "fa35061fe506c3b5b8a3c3ad4a5b7590b664ac52a33ffa6b06b65deeee51b632"
-        },
-        {
-          "path": "src/plugins/mod.rs",
-          "symbol": "apply_workspace_scope_to_params",
-          "sha256": "b4b2ff2c408d390c8569f2d8f4d91eff32180041bf73a41c6308c7bbcfbd5430"
-        },
-        {
-          "path": "src/plugins/http.rs",
-          "symbol": "HttpPlugin::scoped_params",
-          "sha256": "7825547c7a1618d027179dfdc2ae4cb6e566af51822162c77902512622929c7c"
-        },
-        {
-          "path": "src/lib.rs",
-          "symbol": "is_valid_anthropic_workspace_id",
-          "sha256": "b03ae8bb15c0bdb6e60ec58d8470b3026fc4757f0c9308c05714ddf2698c3694"
-        },
-        {
-          "path": "src/lib.rs",
-          "symbol": "validate_credential_metadata_entry",
-          "sha256": "03d29f336aa209d2625c5e2ae85a34903bd67ccfaf3c6ed776f1a2902af384ee"
-        },
-        {
-          "path": "src/server/mod.rs",
-          "symbol": "VultrinoServer::run_action",
-          "sha256": "5d86b259fec4ecb97f70b3da7e85c9bb7b0289e6a302dbfbb7e3a1e86732727b"
-        }
-      ],
-      "mutants": [
-        "workspace-scope-server-strip-removed",
-        "workspace-scope-plugin-strip-removed",
-        "workspace-scope-not-injected",
-        "workspace-scope-use-time-recheck-removed",
-        "workspace-scope-applied-after-consume",
-        "workspace-id-format-check-removed"
-      ],
-      "does_not_establish": "That Anthropic accepts the configured workspace id, that the id belongs to the key's organization, or that the real upstream sees the header: the integration tests drive a stub plugin standing in for the http plugin and read the params handed to it, and the http plugin's own removal is tested on its parameter step, not on a live request. A credential holding an org-level key and no workspace id sends no workspace header, so Anthropic decides what that does. The buffered and the streaming dispatch in the server call the same helper, but only the buffered one is driven by a test for dispatch (the streaming path is driven only for the invalid-stored-value refusal). Other plugins (internal_http, WASM) get the server-side removal but have no workspace-id injection of their own. The header name is matched exactly (case-insensitively); other provider headers, and the gap that /api/v1/execute does not apply a capability's model allowlist or token ceiling to a credential no LLM channel references, are not covered here (a credential an LLM channel references is refused there, see llm-credential-channel-only). The format check is an operator-facing sanity check, not Anthropic's own validation."
-    },
-    {
-      "id": "llm-credential-channel-only",
-      "statement": "A credential referenced by an LLM-proxy capability (llm configured on a stored capability) is usable only through the /llm proxy. The match is on credential identity: each such capability's credential_ref is resolved through the same resolver execution uses and compared by credential id with the credential being used, so a capability that names the credential by its vault id and a request that names it by alias (or the reverse) are both refused; the spelling comparison is kept as well. POST /api/v1/execute answers 403 llm_credential_channel_only and the MCP http_request tool returns the same refusal as a tool error, in both cases after the use-token scope and tenant-isolation checks (a cross-tenant or out-of-scope attempt keeps its own error and detect event) and before policy evaluation, approval, use-token consumption, evidence or any upstream call: the upstream plugin is never invoked, no meter event is emitted and a one-use token keeps its use count of 0. A credential no LLM-proxy capability references still works through execute and http_request, and the /llm proxy (buffered and streaming) still works, because it alone calls the crate-private channel entries. A capability catalog that cannot be read, or a credential_ref lookup that fails for a reason other than the credential not existing, refuses the request instead of admitting it. An approval on an LLM credential is never resumed: resume refuses it terminally, because the approval record does not say which channel opened it.",
-      "method": "test",
-      "artifacts": [
-        "src/server/mod.rs",
-        "src/web/llm_proxy.rs",
-        "src/web/api.rs",
-        "src/lib.rs",
-        "tests/llm_proxy_integration.rs",
-        "tests/approval_token_integration.rs"
-      ],
-      "gates": [
-        "rust"
-      ],
-      "detector": "set -e; cargo test --locked --no-default-features --test llm_proxy_integration llm_credential; cargo test --locked --no-default-features --test llm_proxy_integration non_llm_credential; cargo test --locked --no-default-features --test approval_token_integration llm_credential",
-      "detector_kind": "cargo",
-      "covers": [
-        {
-          "path": "src/server/mod.rs",
-          "symbol": "VultrinoServer::refuse_llm_credential_off_channel",
-          "sha256": "cb2fe7b6d038f2cde1d9438829802a1bee62a49f54511f9d04b6a6209bae7b0b"
-        },
-        {
-          "path": "src/server/mod.rs",
-          "symbol": "VultrinoServer::execute_gated_llm_channel",
-          "sha256": "3fef435047e1b44894dec6896ff23cba502ed772f8da93e23ec20e484c8db260"
-        },
-        {
-          "path": "src/server/mod.rs",
-          "symbol": "VultrinoServer::execute_gated_streaming_llm_channel",
-          "sha256": "83c0c5fd1b14d59580bbe15b362c6eac60f1eb38fb34f668ff754fb5216e16f1"
-        },
-        {
-          "path": "src/server/mod.rs",
-          "symbol": "VultrinoServer::prepare_execution",
-          "sha256": "750e753bebd2bf173c8e4357e728ac091d40714f0b9729e82f12283f73be3129"
-        },
-        {
-          "path": "src/server/mod.rs",
-          "symbol": "VultrinoServer::resume_approved",
-          "sha256": "5413c2aec031e35771fd684576b53126f3f35bb9faa12d16014b1177cefe12b6"
-        },
-        {
-          "path": "src/web/api.rs",
-          "symbol": "api_execute",
-          "sha256": "36dc28413c1c1ea90f1f6d45a43532d7216c5c1ef418e838da83e47906a48d1e"
-        },
-        {
-          "path": "src/web/llm_proxy.rs",
-          "symbol": "llm_proxy_impl",
-          "sha256": "f941ef904b9805ce694243377e230784877e5ddda6262a92bd2e84e509216444"
-        }
-      ],
-      "mutants": [
-        "llm-credential-refusal-removed",
-        "llm-refusal-status-not-403",
-        "llm-proxy-uses-generic-entry",
-        "llm-proxy-stream-uses-generic-entry",
-        "llm-refusal-spelling-only",
-        "llm-refusal-before-tenant-gate",
-        "llm-resume-refusal-removed"
-      ],
-      "does_not_establish": "That the unreadable-catalog refusal is exercised (no test injects a storage failure; the branch is a plain early return). That a provider key stored a second time as a credential that no LLM-proxy capability references is refused: it is an ordinary credential governed only by its policies. That the MCP named-tool path is driven by its own test for this refusal: named tools reach the same prepare_execution check, but only execute and http_request are driven here. Resume is driven only for an approval opened before the credential backed an LLM channel; a /llm-opened approval is refused by the same unconditional check but is not separately driven. A capability whose credential_ref names no existing credential is matched by spelling only. The resolver is read once per LLM capability per generic dispatch; a credential created or renamed after the catalog read is judged by the state at that read. One extra catalog read per generic dispatch is the cost. Model, price and token limits on /llm itself are covered by their own tests, not this claim."
     },
     {
       "id": "observe-receipt-gap-recorded",
@@ -4139,7 +4866,7 @@
         {
           "path": "src/web/posture.rs",
           "symbol": "build_posture",
-          "sha256": "7494e006c6b111bc88fad30597516b7b7ea8b18612ec434d89a29b42deafdcc7"
+          "sha256": "e274d5f93972e8d0fb83724a04e34fcbf86120fadb26db246f7ed96369d75338"
         },
         {
           "path": "src/web/workload_exchange.rs",
@@ -4160,6 +4887,71 @@
       ],
       "does_not_establish": "That two planes hold the same value: this is the report one plane makes, and the comparison is feir-os's verifier. The report reads the loaded configuration, so a value changed afterwards or read by another code path is not reflected; a vultrino whose outbox pushes somewhere other than govder still reports the push relationship, which the verifier then compares with govder's GOVDER_SIGNATURE_SECRET. The fingerprint is only as private as the secret is strong: someone who holds it can test guesses for a low-entropy secret offline, and the report is protected only by a global admin key. The route's key gate is covered by the posture-report claims, not here. The cross-plane check that real binaries emit what the verifier reads is govder's armed four-plane e2e (TestFourPlanePostureE2E, TestFourPlaneSecretMismatchE2E). The averin-api-key fingerprint says which key vultrino sends; that averin accepts it is checked by feir-os's verifier against averin's own report, and no four-plane run has a keyed averin. The workload-assertion fingerprints say which verifier secrets vultrino accepts; that feir-runtime-edge holds one of them is the feir-os verifier's comparison, and no run here starts a real feir-runtime-edge against a real vultrino and feeds both reports to evaluate.jq (the integration test signs with the listed secrets itself).",
       "evidence_run": "38694664010"
+    },
+    {
+      "id": "llm-credential-channel-only",
+      "statement": "A credential referenced by an LLM-proxy capability (llm configured on a stored capability) is usable only through the /llm proxy. The match is on credential identity: each such capability's credential_ref is resolved through the same resolver execution uses and compared by credential id with the credential being used, so a capability that names the credential by its vault id and a request that names it by alias (or the reverse) are both refused; the spelling comparison is kept as well. POST /api/v1/execute answers 403 llm_credential_channel_only and the MCP http_request tool returns the same refusal as a tool error, in both cases after the use-token scope and tenant-isolation checks (a cross-tenant or out-of-scope attempt keeps its own error and detect event) and before policy evaluation, approval, use-token consumption, evidence or any upstream call: the upstream plugin is never invoked, no meter event is emitted and a one-use token keeps its use count of 0. A credential no LLM-proxy capability references still works through execute and http_request, and the /llm proxy (buffered and streaming) still works, because it alone calls the crate-private channel entries. A capability catalog that cannot be read, or a credential_ref lookup that fails for a reason other than the credential not existing, refuses the request instead of admitting it. An approval on an LLM credential is never resumed: resume refuses it terminally, because the approval record does not say which channel opened it.",
+      "method": "test",
+      "artifacts": [
+        "src/server/mod.rs",
+        "src/web/llm_proxy.rs",
+        "src/web/api.rs",
+        "src/lib.rs",
+        "tests/llm_proxy_integration.rs",
+        "tests/approval_token_integration.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "set -e; cargo test --locked --no-default-features --test llm_proxy_integration llm_credential; cargo test --locked --no-default-features --test llm_proxy_integration non_llm_credential; cargo test --locked --no-default-features --test approval_token_integration llm_credential",
+      "detector_kind": "cargo",
+      "covers": [
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::refuse_llm_credential_off_channel",
+          "sha256": "cb2fe7b6d038f2cde1d9438829802a1bee62a49f54511f9d04b6a6209bae7b0b"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::execute_gated_llm_channel",
+          "sha256": "3fef435047e1b44894dec6896ff23cba502ed772f8da93e23ec20e484c8db260"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::execute_gated_streaming_llm_channel",
+          "sha256": "83c0c5fd1b14d59580bbe15b362c6eac60f1eb38fb34f668ff754fb5216e16f1"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::prepare_execution",
+          "sha256": "750e753bebd2bf173c8e4357e728ac091d40714f0b9729e82f12283f73be3129"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::resume_approved",
+          "sha256": "5413c2aec031e35771fd684576b53126f3f35bb9faa12d16014b1177cefe12b6"
+        },
+        {
+          "path": "src/web/api.rs",
+          "symbol": "api_execute",
+          "sha256": "36dc28413c1c1ea90f1f6d45a43532d7216c5c1ef418e838da83e47906a48d1e"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "llm_proxy_impl",
+          "sha256": "0f298edb53dd55826b69c2313907fea3dd807d370b3939cc61e800fd2e9bd97d"
+        }
+      ],
+      "mutants": [
+        "llm-credential-refusal-removed",
+        "llm-refusal-status-not-403",
+        "llm-proxy-uses-generic-entry",
+        "llm-proxy-stream-uses-generic-entry",
+        "llm-refusal-spelling-only",
+        "llm-refusal-before-tenant-gate",
+        "llm-resume-refusal-removed"
+      ],
+      "does_not_establish": "That the unreadable-catalog refusal is exercised (no test injects a storage failure; the branch is a plain early return). That a provider key stored a second time as a credential that no LLM-proxy capability references is refused: it is an ordinary credential governed only by its policies. That the MCP named-tool path is driven by its own test for this refusal: named tools reach the same prepare_execution check, but only execute and http_request are driven here. Resume is driven only for an approval opened before the credential backed an LLM channel; a /llm-opened approval is refused by the same unconditional check but is not separately driven. A capability whose credential_ref names no existing credential is matched by spelling only. The resolver is read once per LLM capability per generic dispatch; a credential created or renamed after the catalog read is judged by the state at that read. One extra catalog read per generic dispatch is the cost. Model, price and token limits on /llm itself are covered by their own tests, not this claim."
     }
   ]
 }

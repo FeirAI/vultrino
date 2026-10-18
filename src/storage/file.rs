@@ -3489,6 +3489,10 @@ impl StorageBackend for FileStorage {
         self.outbox.append(subject, event_type, payload).await
     }
 
+    fn meter_loss(&self) -> crate::outbox::MeterLossSnapshot {
+        self.outbox.loss_snapshot()
+    }
+
     async fn list_events_after(
         &self,
         after: u64,

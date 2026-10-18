@@ -1,0 +1,14 @@
+diff --git a/src/web/llm_proxy.rs b/src/web/llm_proxy.rs
+index 751d1c0..a5b65fd 100644
+--- a/src/web/llm_proxy.rs
++++ b/src/web/llm_proxy.rs
+@@ -921,7 +921,8 @@ async fn llm_proxy_impl(
+     // Azure: the operator may list the deployment name (what the caller sends) or the model it
+     // maps to.
+     if let UrlModel::Names { model, body_ok } = &route {
+-        if !capability.llm_model_allowed(Some(model))
++        if false
++            && !capability.llm_model_allowed(Some(model))
+             && !body_ok
+                 .as_deref()
+                 .is_some_and(|d| capability.llm_model_allowed(Some(d)))

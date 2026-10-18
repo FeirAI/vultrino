@@ -1,0 +1,13 @@
+diff --git a/src/web/llm_proxy.rs b/src/web/llm_proxy.rs
+index 14620ec..31b1701 100644
+--- a/src/web/llm_proxy.rs
++++ b/src/web/llm_proxy.rs
+@@ -869,7 +869,7 @@ async fn llm_proxy_impl(
+         let priced = route_refusal.is_none()
+             && gated_model
+                 .as_deref()
+-                .is_some_and(|m| state.config.llm_proxy.rate_card.covers(m));
++                .map_or(true, |m| state.config.llm_proxy.rate_card.covers(m));
+         if !priced {
+             tracing::warn!(
+                 model = gated_model.as_deref().unwrap_or("(unspecified)"),

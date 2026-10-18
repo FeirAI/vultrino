@@ -1,0 +1,13 @@
+diff --git a/src/server/mod.rs b/src/server/mod.rs
+index 552feb4..cbfafba 100644
+--- a/src/server/mod.rs
++++ b/src/server/mod.rs
+@@ -3550,7 +3550,7 @@ impl VultrinoServer {
+             // A clean EOF that was fully forwarded is the only successful outcome.
+             // Every timeout, scrub failure, halt, full/non-consuming downstream, and
+             // receiver drop completes both accounting paths as error exactly once.
+-            if drain {
++            if false && drain {
+                 drain_upstream_for_usage(
+                     &mut upstream,
+                     &mut usage_acc,

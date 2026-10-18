@@ -187,6 +187,858 @@ fn normalize_nvidia_tool_stream_options(provider: &str, body: &mut serde_json::V
     true
 }
 
+/// How the resolved upstream URL picks the model, which for some providers is not the
+/// body's `model` (the upstream ignores that field): Gemini and Vertex AI name it in a
+/// `models/<id>[:<method>]` segment, Amazon Bedrock in `model/<id>/...`, Azure OpenAI by
+/// `deployments/<name>`. The gate, the allowlist and the meter all use the model this
+/// returns, never one the agent can choose in the body.
+#[derive(Debug, PartialEq, Eq)]
+enum UrlModel {
+    /// The body's `model` is what the upstream serves (OpenAI, Anthropic, NVIDIA, and the
+    /// OpenAI-compatible endpoints of Gemini and Vertex).
+    BodyPicks,
+    /// The URL selects `model`. A body `model` is accepted only if it equals `model` or
+    /// `body_ok` (an Azure deployment name).
+    Names {
+        model: String,
+        body_ok: Option<String>,
+    },
+    /// The URL does not name exactly one model (or names one the operator has not
+    /// mapped): the request cannot be shown to be priced.
+    Unresolvable(String),
+}
+
+/// The percent-decoded id following the single path segment equal to `key`. `Ok(None)` when
+/// the path has no such segment, `Err` when it has several or an empty id (ambiguous: the
+/// upstream's choice cannot be known here).
+fn id_after_segment(upstream: &str, key: &str) -> Result<Option<String>, ()> {
+    let Ok(url) = url::Url::parse(upstream) else {
+        return Err(());
+    };
+    let segments: Vec<&str> = url.path_segments().map(|s| s.collect()).unwrap_or_default();
+    let mut found: Option<String> = None;
+    for (i, seg) in segments.iter().enumerate() {
+        if *seg != key {
+            continue;
+        }
+        let Some(id) = segments.get(i + 1) else {
+            return Err(());
+        };
+        let id = urlencoding::decode(id).map_err(|_| ())?.into_owned();
+        if id.is_empty() || found.is_some() {
+            return Err(());
+        }
+        found = Some(id);
+    }
+    Ok(found)
+}
+
+fn url_model(
+    protocol: &str,
+    upstream: &str,
+    body_model: Option<&str>,
+    azure_deployments: &HashMap<String, String>,
+) -> UrlModel {
+    let unresolvable = |why: &str| UrlModel::Unresolvable(why.to_string());
+    match protocol {
+        "gemini" | "vertex-ai" => match id_after_segment(upstream, "models") {
+            Ok(Some(id)) => UrlModel::Names {
+                model: id.split(':').next().unwrap_or(&id).to_string(),
+                body_ok: None,
+            },
+            // The OpenAI-compatible endpoint takes the model from the body.
+            Ok(None) if is_openai_chat_endpoint(upstream) => UrlModel::BodyPicks,
+            Ok(None) => unresolvable("the upstream URL names no models/<id> segment"),
+            Err(()) => unresolvable("the upstream URL names more than one model, or none cleanly"),
+        },
+        "bedrock-converse" | "bedrock-invoke" => match id_after_segment(upstream, "model") {
+            Ok(Some(id)) => UrlModel::Names {
+                model: id,
+                body_ok: None,
+            },
+            Ok(None) => unresolvable("the upstream URL names no model/<id> segment"),
+            Err(()) => unresolvable("the upstream URL names more than one model, or none cleanly"),
+        },
+        "azure-openai" => {
+            let name = match id_after_segment(upstream, "deployments") {
+                Ok(Some(name)) => name,
+                Ok(None) => match body_model {
+                    Some(m) => m.to_string(),
+                    None => {
+                        return unresolvable("no deployment in the URL and no model in the body")
+                    }
+                },
+                Err(()) => {
+                    return unresolvable(
+                        "the upstream URL names more than one deployment, or none cleanly",
+                    )
+                }
+            };
+            match azure_deployments.get(&name) {
+                Some(model) => UrlModel::Names {
+                    model: model.clone(),
+                    body_ok: Some(name),
+                },
+                None => UrlModel::Unresolvable(format!(
+                    "deployment '{name}' is not mapped to a priced model in [llm_proxy.azure_deployments]"
+                )),
+            }
+        }
+        _ => UrlModel::BodyPicks,
+    }
+}
+
+/// How a request field is checked once its name is on the table.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// Bills tokens alone whatever it holds (a sampling parameter, the messages, a stop list).
+    Plain,
+    /// `tools`: an array of entries of the dialect's plain client-tool shape.
+    Tools,
+    /// OpenAI's legacy `functions`: an array of plain function definitions.
+    LegacyFunctions,
+    /// Bedrock Converse `toolConfig`: `tools` of plain tool specs and a `toolChoice`.
+    ConverseToolConfig,
+    /// Gemini `toolConfig`: function-calling settings only.
+    GeminiToolConfig,
+    /// A list (or comma string) of `anthropic-beta` values, each on [`PRICED_BETAS`].
+    Betas,
+}
+
+/// The tool-entry dialect of a protocol.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Dialect {
+    Anthropic,
+    OpenAiChat,
+    OpenAiResponses,
+    /// Azure serves both OpenAI shapes; an entry may be either.
+    Azure,
+    Gemini,
+    Converse,
+}
+
+use Kind::{Betas, ConverseToolConfig, GeminiToolConfig, LegacyFunctions, Plain, Tools};
+
+// ---------------------------------------------------------------------------------------
+// THE ALLOWLIST. Every top-level request field the proxy admits, per protocol, and nothing
+// else. A field on one of these tables is one whose top-level presence cannot change what a
+// token costs (the rate card holds one input and one output price per model), with one
+// bounded exception: the gate also inspects the nested media and modality markers in
+// `modality_marker` (a Gemini media part admitted only for image, PDF and text types, found
+// at any depth; `responseModalities` exactly TEXT; an OpenAI content part only text or
+// image), because audio and video bill above the token rate inside an admitted field.
+// Other nested options are NOT inspected (bounded). ADDING A FIELD TO A
+// TABLE IS A PRICING DECISION: do it only after reading the provider's price list for what
+// the field switches on, and add a test that fails without it. A field not listed here
+// (compaction, context_management, fallbacks, speed, inference_geo, any service tier in any
+// casing, a search option, a guardrail, a field the provider adds next year) is refused with
+// `403 modifier_unpriced` before the upstream call. The rate-card format has no entry for a
+// priced variant of a field, so no card can widen this; an operator widens it by a code
+// change. Matching is exact and case-sensitive: `ServiceTier` is not `serviceTier`, and is
+// refused because it is on no table.
+// ---------------------------------------------------------------------------------------
+
+const ANTHROPIC_FIELDS: &[(&str, Kind)] = &[
+    ("model", Plain),
+    ("messages", Plain),
+    ("system", Plain),
+    ("max_tokens", Plain),
+    ("temperature", Plain),
+    ("top_p", Plain),
+    ("top_k", Plain),
+    ("stop_sequences", Plain),
+    ("stream", Plain),
+    ("metadata", Plain),
+    // Thinking tokens bill as output tokens, which the usage block carries.
+    ("thinking", Plain),
+    ("cache_control", Plain),
+    ("tool_choice", Plain),
+    ("tools", Tools),
+];
+
+/// Anthropic models behind Bedrock InvokeModel and Vertex rawPredict: the same body, with the
+/// version and beta list in the body.
+const ANTHROPIC_HOSTED_EXTRA: &[(&str, Kind)] =
+    &[("anthropic_version", Plain), ("anthropic_beta", Betas)];
+
+const BEDROCK_INVOKE_OTHER: &[(&str, Kind)] = &[
+    ("prompt", Plain),
+    ("max_gen_len", Plain),
+    ("inputText", Plain),
+    ("textGenerationConfig", Plain),
+];
+
+const OPENAI_CHAT_FIELDS: &[(&str, Kind)] = &[
+    ("model", Plain),
+    ("messages", Plain),
+    ("max_tokens", Plain),
+    ("max_completion_tokens", Plain),
+    ("temperature", Plain),
+    ("top_p", Plain),
+    ("n", Plain),
+    ("stop", Plain),
+    ("stream", Plain),
+    ("stream_options", Plain),
+    ("frequency_penalty", Plain),
+    ("presence_penalty", Plain),
+    ("logit_bias", Plain),
+    ("logprobs", Plain),
+    ("top_logprobs", Plain),
+    ("seed", Plain),
+    ("response_format", Plain),
+    ("tool_choice", Plain),
+    ("parallel_tool_calls", Plain),
+    ("function_call", Plain),
+    ("user", Plain),
+    ("reasoning_effort", Plain),
+    ("verbosity", Plain),
+    ("store", Plain),
+    ("metadata", Plain),
+    ("prediction", Plain),
+    ("prompt_cache_key", Plain),
+    ("safety_identifier", Plain),
+    ("tools", Tools),
+    ("functions", LegacyFunctions),
+];
+
+const NVIDIA_EXTRA: &[(&str, Kind)] = &[
+    ("top_k", Plain),
+    ("min_p", Plain),
+    ("repetition_penalty", Plain),
+    ("chat_template_kwargs", Plain),
+];
+
+const OPENAI_RESPONSES_FIELDS: &[(&str, Kind)] = &[
+    ("model", Plain),
+    ("input", Plain),
+    ("instructions", Plain),
+    ("max_output_tokens", Plain),
+    ("max_tool_calls", Plain),
+    ("temperature", Plain),
+    ("top_p", Plain),
+    ("stream", Plain),
+    ("stream_options", Plain),
+    ("tool_choice", Plain),
+    ("parallel_tool_calls", Plain),
+    ("reasoning", Plain),
+    ("text", Plain),
+    ("metadata", Plain),
+    ("store", Plain),
+    ("previous_response_id", Plain),
+    ("truncation", Plain),
+    ("include", Plain),
+    ("user", Plain),
+    ("prompt_cache_key", Plain),
+    ("safety_identifier", Plain),
+    ("tools", Tools),
+];
+
+const GEMINI_FIELDS: &[(&str, Kind)] = &[
+    ("model", Plain),
+    ("contents", Plain),
+    ("systemInstruction", Plain),
+    ("system_instruction", Plain),
+    ("generationConfig", Plain),
+    ("generation_config", Plain),
+    ("safetySettings", Plain),
+    ("safety_settings", Plain),
+    ("cachedContent", Plain),
+    ("cached_content", Plain),
+    ("labels", Plain),
+    ("toolConfig", GeminiToolConfig),
+    ("tool_config", GeminiToolConfig),
+    ("tools", Tools),
+];
+
+const CONVERSE_FIELDS: &[(&str, Kind)] = &[
+    ("model", Plain),
+    ("messages", Plain),
+    ("system", Plain),
+    ("inferenceConfig", Plain),
+    ("requestMetadata", Plain),
+    ("toolConfig", ConverseToolConfig),
+];
+
+/// `anthropic-beta` values that do not change the price of a token. Anything else (the 1M
+/// context window bills long prompts at a higher rate, fast mode, compaction, context
+/// management, code execution and the like) is refused. Adding a value is a pricing decision.
+const PRICED_BETAS: &[&str] = &[
+    "prompt-caching-2024-07-31",
+    "extended-cache-ttl-2025-04-11",
+    "interleaved-thinking-2025-05-14",
+    "fine-grained-tool-streaming-2025-05-14",
+    "token-efficient-tools-2025-02-19",
+    "output-128k-2025-02-19",
+    "structured-outputs-2025-11-13",
+    "effort-2025-11-24",
+    "computer-use-2024-10-22",
+    "computer-use-2025-01-24",
+    "computer-use-2025-11-24",
+    "pdf-2024-09-25",
+    "claude-code-20250219",
+];
+
+/// Anthropic client-executed tools, by exact versioned type. Matching by prefix would admit
+/// the server-run `bash_code_execution_*` and `text_editor_code_execution_*`.
+const ANTHROPIC_CLIENT_TOOL_TYPES: &[&str] = &[
+    "bash_20241022",
+    "bash_20250124",
+    "text_editor_20241022",
+    "text_editor_20250124",
+    "text_editor_20250429",
+    "text_editor_20250728",
+    "memory_20250818",
+    "computer_20241022",
+    "computer_20250124",
+    "computer_20251124",
+];
+
+/// The tables and tool dialect a request is checked against: the protocol, and for the
+/// protocols that serve more than one body shape, the upstream URL that says which.
+fn request_tables(
+    protocol: &str,
+    upstream: &str,
+) -> (Vec<&'static [(&'static str, Kind)]>, Dialect) {
+    match protocol {
+        "anthropic-messages" => (vec![ANTHROPIC_FIELDS], Dialect::Anthropic),
+        "openai-chat" => (vec![OPENAI_CHAT_FIELDS], Dialect::OpenAiChat),
+        "nvidia" => (vec![OPENAI_CHAT_FIELDS, NVIDIA_EXTRA], Dialect::OpenAiChat),
+        "openai-responses" => (vec![OPENAI_RESPONSES_FIELDS], Dialect::OpenAiResponses),
+        "azure-openai" => (
+            vec![OPENAI_CHAT_FIELDS, OPENAI_RESPONSES_FIELDS],
+            Dialect::Azure,
+        ),
+        "gemini" | "vertex-ai" if upstream.contains("/publishers/anthropic/") => (
+            vec![ANTHROPIC_FIELDS, ANTHROPIC_HOSTED_EXTRA],
+            Dialect::Anthropic,
+        ),
+        "gemini" | "vertex-ai" if is_openai_chat_endpoint(upstream) => {
+            (vec![OPENAI_CHAT_FIELDS], Dialect::OpenAiChat)
+        }
+        "gemini" | "vertex-ai" => (vec![GEMINI_FIELDS], Dialect::Gemini),
+        "bedrock-converse" => (vec![CONVERSE_FIELDS], Dialect::Converse),
+        "bedrock-invoke" => (
+            vec![
+                ANTHROPIC_FIELDS,
+                ANTHROPIC_HOSTED_EXTRA,
+                BEDROCK_INVOKE_OTHER,
+            ],
+            Dialect::Anthropic,
+        ),
+        // Fail closed: a protocol with no table admits no field.
+        _ => (Vec::new(), Dialect::Anthropic),
+    }
+}
+
+/// Whether `obj` has no key outside `allowed`.
+fn only_keys(obj: &serde_json::Map<String, serde_json::Value>, allowed: &[&str]) -> bool {
+    obj.keys().all(|k| allowed.contains(&k.as_str()))
+}
+
+fn has_name(obj: &serde_json::Map<String, serde_json::Value>) -> bool {
+    obj.get("name").is_some_and(serde_json::Value::is_string)
+}
+
+fn sub_object<'a>(
+    obj: &'a serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Option<&'a serde_json::Map<String, serde_json::Value>> {
+    obj.get(key).and_then(serde_json::Value::as_object)
+}
+
+/// Whether one tool entry is exactly a plain client-side tool of `dialect`: its cost is the
+/// model's tokens, no server runs anything. The shapes are the ones each protocol defines
+/// for a function (or custom) tool; an entry with a key beyond them, an untyped object that
+/// is not the plain function shape, and every server tool are refused.
+fn tool_is_plain(dialect: Dialect, tool: &serde_json::Value) -> bool {
+    let Some(obj) = tool.as_object() else {
+        return false;
+    };
+    let kind = obj.get("type").map(serde_json::Value::as_str);
+    match dialect {
+        Dialect::Anthropic => match kind {
+            None | Some(Some("custom")) => {
+                only_keys(
+                    obj,
+                    &[
+                        "type",
+                        "name",
+                        "description",
+                        "input_schema",
+                        "cache_control",
+                        "strict",
+                    ],
+                ) && has_name(obj)
+                    && obj
+                        .get("input_schema")
+                        .is_some_and(serde_json::Value::is_object)
+            }
+            Some(Some(t)) if ANTHROPIC_CLIENT_TOOL_TYPES.contains(&t) => {
+                only_keys(
+                    obj,
+                    &[
+                        "type",
+                        "name",
+                        "cache_control",
+                        "display_width_px",
+                        "display_height_px",
+                        "display_number",
+                        "max_characters",
+                        "enable_zoom",
+                    ],
+                ) && has_name(obj)
+            }
+            _ => false,
+        },
+        Dialect::OpenAiChat => openai_chat_tool(obj, kind),
+        Dialect::OpenAiResponses => openai_responses_tool(obj, kind),
+        Dialect::Azure => openai_chat_tool(obj, kind) || openai_responses_tool(obj, kind),
+        Dialect::Gemini => {
+            !obj.is_empty()
+                && only_keys(obj, &["functionDeclarations", "function_declarations"])
+                && obj.values().all(|decls| {
+                    decls.as_array().is_some_and(|list| {
+                        list.iter().all(|d| {
+                            d.as_object().is_some_and(|d| {
+                                has_name(d)
+                                    && only_keys(
+                                        d,
+                                        &[
+                                            "name",
+                                            "description",
+                                            "parameters",
+                                            "parametersJsonSchema",
+                                            "parameters_json_schema",
+                                            "response",
+                                            "responseJsonSchema",
+                                            "response_json_schema",
+                                            "behavior",
+                                        ],
+                                    )
+                            })
+                        })
+                    })
+                })
+        }
+        Dialect::Converse => {
+            if obj.len() != 1 {
+                return false;
+            }
+            if let Some(spec) = sub_object(obj, "toolSpec") {
+                return has_name(spec)
+                    && only_keys(spec, &["name", "description", "inputSchema", "strict"]);
+            }
+            sub_object(obj, "cachePoint").is_some_and(|c| only_keys(c, &["type"]))
+        }
+    }
+}
+
+fn openai_chat_tool(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    kind: Option<Option<&str>>,
+) -> bool {
+    match kind {
+        Some(Some("function")) => {
+            obj.len() == 2
+                && sub_object(obj, "function").is_some_and(|f| {
+                    has_name(f) && only_keys(f, &["name", "description", "parameters", "strict"])
+                })
+        }
+        Some(Some("custom")) => {
+            obj.len() == 2
+                && sub_object(obj, "custom").is_some_and(|c| {
+                    has_name(c) && only_keys(c, &["name", "description", "format"])
+                })
+        }
+        _ => false,
+    }
+}
+
+fn openai_responses_tool(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    kind: Option<Option<&str>>,
+) -> bool {
+    match kind {
+        Some(Some("function")) => {
+            has_name(obj)
+                && only_keys(
+                    obj,
+                    &["type", "name", "description", "parameters", "strict"],
+                )
+        }
+        Some(Some("custom")) => {
+            has_name(obj) && only_keys(obj, &["type", "name", "description", "format"])
+        }
+        _ => false,
+    }
+}
+
+/// Whether one beta value, or a comma-separated list of them, is entirely on [`PRICED_BETAS`].
+fn betas_priced(list: &str) -> bool {
+    list.split(',')
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+        .all(|b| PRICED_BETAS.contains(&b))
+}
+
+fn field_is_priced(kind: Kind, dialect: Dialect, value: &serde_json::Value) -> bool {
+    match kind {
+        Plain => true,
+        Tools => value
+            .as_array()
+            .is_some_and(|list| list.iter().all(|t| tool_is_plain(dialect, t))),
+        LegacyFunctions => value.as_array().is_some_and(|list| {
+            list.iter().all(|f| {
+                f.as_object().is_some_and(|f| {
+                    has_name(f) && only_keys(f, &["name", "description", "parameters"])
+                })
+            })
+        }),
+        ConverseToolConfig => value.as_object().is_some_and(|c| {
+            only_keys(c, &["tools", "toolChoice"])
+                && c.get("tools").is_none_or(|t| {
+                    t.as_array()
+                        .is_some_and(|l| l.iter().all(|t| tool_is_plain(Dialect::Converse, t)))
+                })
+        }),
+        GeminiToolConfig => value.as_object().is_some_and(|c| {
+            only_keys(
+                c,
+                &[
+                    "functionCallingConfig",
+                    "function_calling_config",
+                    "retrievalConfig",
+                    "retrieval_config",
+                ],
+            )
+        }),
+        Betas => match value {
+            serde_json::Value::String(s) => betas_priced(s),
+            serde_json::Value::Array(list) => {
+                list.iter().all(|b| b.as_str().is_some_and(betas_priced))
+            }
+            _ => false,
+        },
+    }
+}
+
+/// Media types a Gemini `inlineData` or `fileData` part may carry: those that bill at the
+/// model's token rate (images, PDF, text). Anything else, including audio, video and a type
+/// the provider adds next year, is refused until the card prices it. Matching is exact on the
+/// lowercased string (no trimming, no parameters), so a spelling the proxy does not recognise
+/// is refused rather than forwarded.
+const PRICED_MEDIA_TYPES: &[&str] = &[
+    "image/png",
+    "image/jpeg",
+    "image/webp",
+    "image/heic",
+    "image/heif",
+    "image/gif",
+    "application/pdf",
+];
+
+/// Whether a media type value is a string on [`PRICED_MEDIA_TYPES`] or a `text/*` type. A
+/// missing, non-string or any other value is not priced.
+fn is_priced_mime(v: Option<&serde_json::Value>) -> bool {
+    v.and_then(serde_json::Value::as_str)
+        .is_some_and(is_priced_mime_str)
+}
+
+/// [`is_priced_mime`] for a string already taken out of its value.
+fn is_priced_mime_str(m: &str) -> bool {
+    let m = m.to_ascii_lowercase();
+    PRICED_MEDIA_TYPES.contains(&m.as_str()) || m.starts_with("text/")
+}
+
+/// Whether an OpenAI image URL may be forwarded. A `data:` URL (any casing, leading
+/// whitespace ignored) declares its media type between `data:` and the first `;` or `,`
+/// (trimmed): it is admitted only when that type is priced, so a `data:audio/wav` or
+/// `data:video/mp4` URL, or one with no media type, is refused (fail closed). Any other URL
+/// (https and the like) is fetched by the provider and is not inspected.
+fn image_url_priced(url: &str) -> bool {
+    let url = url.trim_start();
+    let Some(head) = url.get(..5) else {
+        return true;
+    };
+    if !head.eq_ignore_ascii_case("data:") {
+        return true;
+    }
+    let rest = &url[5..];
+    let end = rest.find([';', ',']).unwrap_or(rest.len());
+    is_priced_mime_str(rest[..end].trim())
+}
+
+/// A marker for an `image_url` part (chat: a string or an object with `url`) or an
+/// `input_image` part (a string) whose data URL carries an unpriced media type.
+fn image_part_marker(part: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    use serde_json::Value;
+    let url = match part.get("image_url") {
+        Some(Value::String(u)) => Some(u.as_str()),
+        Some(Value::Object(o)) => o.get("url").and_then(Value::as_str),
+        _ => None,
+    }?;
+    (!image_url_priced(url)).then(|| {
+        "an image part whose data URL declares a media type that is not an image, PDF or text type (audio, video or none) bills above the token rate or cannot be priced"
+            .to_string()
+    })
+}
+
+/// How deep the Gemini body walk goes before it refuses (fail closed): a body nested deeper
+/// than this cannot exhaust the stack and cannot hide a part below the walk.
+const MODALITY_WALK_MAX_DEPTH: usize = 64;
+
+/// Walk a Gemini request value at any depth, treating a single object and an array the same
+/// (Google's parser accepts one object for a repeated field, and the proxy forwards the value
+/// as parsed). An object under `inlineData`, `inline_data`, `fileData` or `file_data` must be
+/// an object whose `mimeType` / `mime_type` is on the priced list, and a `responseModalities`
+/// or `response_modalities` must be a non-empty array of exactly `TEXT`; anything else is a
+/// marker. Returns what was found.
+fn gemini_media_marker(v: &serde_json::Value, depth: usize) -> Option<String> {
+    use serde_json::Value;
+    match v {
+        Value::Array(items) => items.iter().find_map(|i| gemini_media_marker(i, depth + 1)),
+        Value::Object(map) => gemini_map_marker(map, depth),
+        _ => None,
+    }
+    .or_else(|| {
+        (depth > MODALITY_WALK_MAX_DEPTH).then(|| {
+            format!(
+                "the request nests deeper than {MODALITY_WALK_MAX_DEPTH} levels, so its media parts cannot be checked"
+            )
+        })
+    })
+}
+
+/// [`gemini_media_marker`] for one object (the body itself, or any object inside it).
+fn gemini_map_marker(
+    map: &serde_json::Map<String, serde_json::Value>,
+    depth: usize,
+) -> Option<String> {
+    use serde_json::Value;
+    if depth > MODALITY_WALK_MAX_DEPTH {
+        return Some(format!(
+            "the request nests deeper than {MODALITY_WALK_MAX_DEPTH} levels, so its media parts cannot be checked"
+        ));
+    }
+    for (key, value) in map {
+        match key.as_str() {
+            // A JSON null is read like an absent key.
+            "inlineData"
+            | "inline_data"
+            | "fileData"
+            | "file_data"
+            | "responseModalities"
+            | "response_modalities"
+                if value.is_null() => {}
+            "inlineData" | "inline_data" | "fileData" | "file_data" => {
+                // Every media type key present must be priced, and one must be present.
+                let priced = value.as_object().is_some_and(|media| {
+                    let types: Vec<_> = ["mimeType", "mime_type"]
+                        .iter()
+                        .filter_map(|k| media.get(*k))
+                        .collect();
+                    !types.is_empty() && types.into_iter().all(|t| is_priced_mime(Some(t)))
+                });
+                if !priced {
+                    return Some(format!(
+                        "a `{key}` part whose media type is missing or is not an image, PDF or text type bills above the token rate or cannot be priced"
+                    ));
+                }
+            }
+            "responseModalities" | "response_modalities" => {
+                let text_only = value.as_array().is_some_and(|list| {
+                    !list.is_empty() && list.iter().all(|m| m.as_str() == Some("TEXT"))
+                });
+                if !text_only {
+                    return Some(format!(
+                        "`{key}` is empty or names an output modality other than TEXT, which bills above the token rate"
+                    ));
+                }
+            }
+            _ => {}
+        }
+        if let Value::Array(_) | Value::Object(_) = value {
+            if let Some(found) = gemini_media_marker(value, depth + 1) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// Content part types of an OpenAI chat or responses request that bill at the token rate.
+const OPENAI_PRICED_PART_TYPES: &[&str] = &[
+    "text",
+    "image_url",
+    "input_text",
+    "input_image",
+    "output_text",
+    "refusal",
+];
+
+/// Responses input item types that are plain conversation turns (no server-side tool run).
+const OPENAI_PRICED_ITEM_TYPES: &[&str] = &[
+    "message",
+    "function_call",
+    "function_call_output",
+    "custom_tool_call",
+    "custom_tool_call_output",
+    "reasoning",
+    "item_reference",
+];
+
+/// The conversation items of an OpenAI-shaped body (`messages` or `input`), where a single
+/// object is read like a one-element array. A plain string input is text.
+fn openai_items(v: &serde_json::Value) -> Vec<&serde_json::Value> {
+    match v {
+        serde_json::Value::Array(items) => items.iter().collect(),
+        serde_json::Value::Object(_) => vec![v],
+        _ => Vec::new(),
+    }
+}
+
+/// An OpenAI chat or responses content part, or item, outside the token-rate allowlist: a
+/// part type other than text and image, a message that carries an `audio` reference, or an
+/// item of a type that runs something server side.
+fn openai_content_marker(obj: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    use serde_json::Value;
+    for key in ["messages", "input"] {
+        let Some(value) = obj.get(key) else { continue };
+        for item in openai_items(value) {
+            let item = match item {
+                Value::String(_) => continue,
+                Value::Object(item) => item,
+                _ => {
+                    return Some(format!(
+                        "an entry of `{key}` that is not an object or a string cannot be shown to bill tokens alone"
+                    ))
+                }
+            };
+            if item.get("audio").is_some_and(|a| !a.is_null()) {
+                return Some(
+                    "a message carrying an `audio` object bills above the token rate".to_string(),
+                );
+            }
+            if let Some(found) = image_part_marker(item) {
+                return Some(found);
+            }
+            let item_type = item.get("type").filter(|t| !t.is_null());
+            if let Some(t) = item_type {
+                let known = t.as_str().is_some_and(|t| {
+                    OPENAI_PRICED_ITEM_TYPES.contains(&t) || OPENAI_PRICED_PART_TYPES.contains(&t)
+                });
+                if !known {
+                    return Some(format!(
+                        "the `{key}` entry type {t} is not one the card prices at the token rate"
+                    ));
+                }
+            }
+            let parts = match item.get("content") {
+                Some(c @ (Value::Array(_) | Value::Object(_))) => openai_items(c),
+                _ => Vec::new(),
+            };
+            for part in parts {
+                if matches!(part, Value::String(_)) {
+                    continue;
+                }
+                let ok = part
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|t| OPENAI_PRICED_PART_TYPES.contains(&t));
+                if ok {
+                    if let Some(found) = part.as_object().and_then(image_part_marker) {
+                        return Some(found);
+                    }
+                } else {
+                    return Some(
+                        "a content part that is not text or an image (for example `input_audio`) bills above the token rate or cannot be priced"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+    }
+    None
+}
+
+/// A nested modality marker that bills above the base token rate inside an otherwise
+/// admitted field, or that the proxy cannot show bills at it. Gemini: a recursive walk of the
+/// whole body (see [`gemini_media_marker`]). OpenAI chat, responses and Azure: a content part
+/// or item outside the token-rate allowlist (see [`openai_content_marker`]). Only these are
+/// inspected; other nested options are not (bounded).
+fn modality_marker(
+    dialect: Dialect,
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
+    match dialect {
+        Dialect::Gemini => gemini_map_marker(obj, 0),
+        Dialect::OpenAiChat | Dialect::OpenAiResponses | Dialect::Azure => {
+            openai_content_marker(obj)
+        }
+        Dialect::Anthropic | Dialect::Converse => None,
+    }
+}
+
+/// A request that the proxy cannot show to bill tokens alone: any top-level field that is
+/// not on the protocol's allowlist table (see the comment above the tables), or a field on
+/// it whose value is not the plain shape (a tool that is not a plain client tool, a beta
+/// that is not priced). Such a request is refused with `403 modifier_unpriced` before the
+/// upstream call. Returns what was found.
+fn unpriced_modifier(protocol: &str, upstream: &str, body: &serde_json::Value) -> Option<String> {
+    let Some(obj) = body.as_object() else {
+        return Some(
+            "a request body that is not a JSON object cannot be shown to bill tokens alone"
+                .to_string(),
+        );
+    };
+    let (tables, dialect) = request_tables(protocol, upstream);
+    for (key, value) in obj {
+        let kind = tables
+            .iter()
+            .flat_map(|t| t.iter())
+            .find(|(name, _)| name == key)
+            .map(|(_, kind)| *kind);
+        match kind {
+            None => {
+                return Some(format!(
+                    "the request field `{key}` is not one the rate card prices for {protocol}: it may bill above the token price (unknown request features are refused; widening the allowlist is a code change)"
+                ))
+            }
+            Some(kind) if !field_is_priced(kind, dialect, value) => {
+                return Some(format!(
+                    "the value of `{key}` is not a shape that bills tokens alone for {protocol} (only plain client tools, and betas that do not change the price, are admitted)"
+                ))
+            }
+            Some(_) => {}
+        }
+    }
+    modality_marker(dialect, obj).map(|m| {
+        format!("{m} for {protocol} (unpriced modalities are refused until the card prices them)")
+    })
+}
+
+/// The first `anthropic-beta` header value that is not on [`PRICED_BETAS`] (every header
+/// line is read; a value that is not visible ASCII is refused too). The header is forwarded
+/// upstream only when this returns `None`.
+fn unpriced_beta_header(headers: &HeaderMap) -> Option<String> {
+    for value in headers.get_all("anthropic-beta") {
+        let Ok(text) = value.to_str() else {
+            return Some("an anthropic-beta header that is not plain text".to_string());
+        };
+        if let Some(bad) = text
+            .split(',')
+            .map(str::trim)
+            .filter(|b| !b.is_empty())
+            .find(|b| !PRICED_BETAS.contains(b))
+        {
+            return Some(format!(
+                "the anthropic-beta value `{bad}` is not one that leaves the token price unchanged"
+            ));
+        }
+    }
+    None
+}
+
 /// A JSON error response shaped like an OpenAI API error so the harness's model
 /// client surfaces it cleanly rather than as an opaque transport failure.
 fn llm_error(status: StatusCode, kind: &str, message: &str) -> Response {
@@ -611,11 +1463,24 @@ async fn llm_proxy_impl(
     //     `llm.allowed_models`; the deny happens BEFORE any upstream call. It runs
     //     ABOVE the streaming decision (4d) so a `stream:true` request can NOT evade
     //     the model allowlist — buffered and streaming enforce identically.
+    // The body's model is checked here only where the body picks the model. Where the
+    // resolved upstream URL selects it (Gemini, Vertex, Bedrock, Azure) the body names none
+    // or an ignored one, and the allowlist is applied to the routed model below.
     let requested_model = request_body
         .as_ref()
         .and_then(|b| b.get("model"))
         .and_then(|m| m.as_str());
-    if !capability.llm_model_allowed(requested_model) {
+    let url_picks_model = request_body.is_some()
+        && matches!(
+            url_model(
+                &llm.protocol,
+                &upstream,
+                requested_model,
+                &state.config.llm_proxy.azure_deployments,
+            ),
+            UrlModel::Names { .. }
+        );
+    if !url_picks_model && !capability.llm_model_allowed(requested_model) {
         return llm_error(
             StatusCode::FORBIDDEN,
             "permission_error",
@@ -626,6 +1491,109 @@ async fn llm_proxy_impl(
                     .unwrap_or_else(|| "(unspecified)".to_string()),
             ),
         );
+    }
+
+    // 4b-bis. Priced models only (`[llm_proxy] require_priced_model`, default on). A model
+    //     the rate card does not price books $0 in the metering plane (its token event is
+    //     rejected as unpriced), so a budget cap would never trip for it: refuse it here,
+    //     BEFORE any upstream call, exactly where the allowlist above refuses. Fail closed
+    //     both ways: a request that carries a body but names no model cannot be shown to be
+    //     priced, and with no card configured nothing is. A bodiless request (a model list,
+    //     a health probe) is not a billed call and is not gated.
+    //
+    //     WHICH model: the one the resolved upstream URL selects where the URL picks it
+    //     (Gemini/Vertex `models/<id>`, Bedrock `model/<id>`, Azure `deployments/<name>`
+    //     through the operator's map; see `url_model`), else the body's. The upstream
+    //     ignores a body `model` that disagrees with its URL, so a body model that differs
+    //     from the URL's is refused, and the allowlist, the gate and the meter all use the
+    //     routed model. Without this an agent could name a priced model in the body and
+    //     reach an unpriced one through the path.
+    let body_model = request_body
+        .as_ref()
+        .and_then(|b| b.get("model"))
+        .and_then(|m| m.as_str());
+    let route = if request_body.is_some() {
+        url_model(
+            &llm.protocol,
+            &upstream,
+            body_model,
+            &state.config.llm_proxy.azure_deployments,
+        )
+    } else {
+        UrlModel::BodyPicks
+    };
+    let (gated_model, route_refusal): (Option<String>, Option<String>) = match &route {
+        UrlModel::BodyPicks => (body_model.map(str::to_string), None),
+        UrlModel::Names { model, body_ok } => (
+            Some(model.clone()),
+            body_model
+                .filter(|b| *b != model && Some(*b) != body_ok.as_deref())
+                .map(|b| {
+                    format!("the body names model '{b}' but the upstream URL selects '{model}'")
+                }),
+        ),
+        UrlModel::Unresolvable(why) => (body_model.map(str::to_string), Some(why.clone())),
+    };
+    // The allowlist applies to the model the URL selects too, not only the body's.
+    // Azure: the operator may list the deployment name (what the caller sends) or the model it
+    // maps to.
+    if let UrlModel::Names { model, body_ok } = &route {
+        if !capability.llm_model_allowed(Some(model))
+            && !body_ok
+                .as_deref()
+                .is_some_and(|d| capability.llm_model_allowed(Some(d)))
+        {
+            return llm_error(
+                StatusCode::FORBIDDEN,
+                "permission_error",
+                &format!("Model '{model}' is not permitted for this LLM-proxy capability"),
+            );
+        }
+    }
+    if state.config.llm_proxy.require_priced_model && request_body.is_some() {
+        let priced = route_refusal.is_none()
+            && gated_model
+                .as_deref()
+                .is_some_and(|m| state.config.llm_proxy.rate_card.covers(m));
+        if !priced {
+            tracing::warn!(
+                model = gated_model.as_deref().unwrap_or("(unspecified)"),
+                card_configured = state.config.llm_proxy.rate_card.is_configured(),
+                route_refusal = route_refusal.as_deref().unwrap_or(""),
+                "LLM request refused: model is not priced by the rate card"
+            );
+            return llm_error(
+                StatusCode::FORBIDDEN,
+                "model_unpriced",
+                &format!(
+                    "Model {} is not priced by the rate card, so its spend could not be metered against a budget; the request was not sent{}",
+                    gated_model
+                        .as_deref()
+                        .map(|m| format!("'{m}'"))
+                        .unwrap_or_else(|| "(unspecified)".to_string()),
+                    route_refusal
+                        .as_deref()
+                        .map(|r| format!(" ({r})"))
+                        .unwrap_or_default(),
+                ),
+            );
+        }
+        // The card prices tokens at one input and one output price per model. A request
+        // field that raises the provider's price beyond that would be booked too low.
+        let unpriced = request_body
+            .as_ref()
+            .and_then(|b| unpriced_modifier(&llm.protocol, &upstream, b))
+            .or_else(|| unpriced_beta_header(&headers));
+        if let Some(found) = unpriced {
+            tracing::warn!(found = %found, "LLM request refused: it sets a price modifier the rate card does not hold");
+            return llm_error(
+                StatusCode::FORBIDDEN,
+                "modifier_unpriced",
+                &format!(
+                    "The request sets a price modifier the rate card does not hold, so its spend could not be metered against a budget; the request was not sent ({found})"
+                ),
+            );
+        }
     }
 
     // 4c. Per-call output-token ceiling (rate_companion per-call leg, P1-8): clamp the
@@ -683,8 +1651,9 @@ async fn llm_proxy_impl(
     }
     // NVIDIA hangs when `stream_options` accompanies a non-empty OpenAI `tools` array.
     // Normalize only that known-incompatible provider shape, including a client-supplied
-    // stream_options, and intentionally meter it V13a-only. Other providers' tool
-    // streams (and NVIDIA streams without tools) retain the usage trailer.
+    // stream_options. NVIDIA cannot send a usage trailer with tools, so that stream is
+    // charged an ESTIMATE (`dims.estimated = "true"`, VUL-01) rather than exact counts.
+    // Other providers' tool streams (and NVIDIA streams without tools) retain the trailer.
     let nvidia_tool_stream = use_streaming
         && request_body
             .as_mut()
@@ -733,6 +1702,7 @@ async fn llm_proxy_impl(
             "_feir_provider": provider,
             "_feir_region": region,
             "_feir_channel": channel_name,
+            "_feir_request_model": gated_model,
         }),
     };
 
@@ -882,7 +1852,7 @@ mod tests {
     use super::{
         apply_reasoning_effort, clamp_max_output_tokens, default_output_token_field,
         is_openai_chat_endpoint, normalize_nvidia_tool_stream_options, provider_feature_enabled,
-        reasoning_effort_shape, ReasoningEffortShape,
+        reasoning_effort_shape, unpriced_modifier, url_model, ReasoningEffortShape, UrlModel,
     };
     use serde_json::json;
     use std::sync::Mutex;
@@ -1371,5 +2341,541 @@ mod tests {
             // ...but the same capability WITHOUT the field is still fine.
             assert!(build(protocol, None, base).validate().is_ok());
         }
+    }
+
+    // ---- feir-ops#6 review round 1: the routed model and price modifiers -----------------
+
+    fn names(model: &str) -> UrlModel {
+        UrlModel::Names {
+            model: model.to_string(),
+            body_ok: None,
+        }
+    }
+
+    fn no_map() -> std::collections::HashMap<String, String> {
+        Default::default()
+    }
+
+    #[test]
+    fn gemini_and_vertex_take_the_model_from_the_url_not_the_body() {
+        let g =
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-9-pro:generateContent";
+        // The body names a different model: the URL's is the routed one.
+        assert_eq!(
+            url_model("gemini", g, Some("claude-haiku-4-5"), &no_map()),
+            names("gemini-9-pro")
+        );
+        let v = "https://us-central1-aiplatform.googleapis.com/v1/projects/p/locations/us-central1/publishers/anthropic/models/claude-opus-5:rawPredict";
+        assert_eq!(
+            url_model("vertex-ai", v, None, &no_map()),
+            names("claude-opus-5")
+        );
+        // A model baked into provider_base (no method suffix) is the same segment.
+        let baked = "https://generativelanguage.googleapis.com/v1beta/models/gemini-9-pro/x";
+        assert_eq!(
+            url_model("gemini", baked, None, &no_map()),
+            names("gemini-9-pro")
+        );
+        // Two model segments, or a dangling one, are ambiguous: refused, not guessed.
+        let two = "https://h.example/v1/models/a/models/b:generateContent";
+        assert!(matches!(
+            url_model("gemini", two, None, &no_map()),
+            UrlModel::Unresolvable(_)
+        ));
+        let dangling = "https://h.example/v1/models";
+        assert!(matches!(
+            url_model("gemini", dangling, None, &no_map()),
+            UrlModel::Unresolvable(_)
+        ));
+        // No models segment: only the OpenAI-compatible endpoint takes the body's model.
+        let compat = "https://h.example/v1beta/openai/chat/completions";
+        assert_eq!(
+            url_model("gemini", compat, Some("m"), &no_map()),
+            UrlModel::BodyPicks
+        );
+        let tuned = "https://h.example/v1/endpoints/123:predict";
+        assert!(matches!(
+            url_model("vertex-ai", tuned, Some("m"), &no_map()),
+            UrlModel::Unresolvable(_)
+        ));
+    }
+
+    #[test]
+    fn bedrock_takes_the_percent_decoded_model_from_the_model_segment() {
+        let base = "https://bedrock-runtime.us-east-1.amazonaws.com";
+        for proto in ["bedrock-converse", "bedrock-invoke"] {
+            assert_eq!(
+                url_model(
+                    proto,
+                    &format!("{base}/model/anthropic.claude-3-haiku-20240307-v1%3A0/converse"),
+                    None,
+                    &no_map()
+                ),
+                names("anthropic.claude-3-haiku-20240307-v1:0")
+            );
+        }
+        // A literal colon (also legal in a path) is not a method separator here.
+        assert_eq!(
+            url_model(
+                "bedrock-invoke",
+                &format!("{base}/model/anthropic.claude-3-haiku-20240307-v1:0/invoke"),
+                None,
+                &no_map()
+            ),
+            names("anthropic.claude-3-haiku-20240307-v1:0")
+        );
+        // An inference-profile id with an encoded slash stays one segment.
+        assert_eq!(
+            url_model(
+                "bedrock-converse",
+                &format!("{base}/model/arn%3Aaws%3Abedrock%3Aus-east-1%3A1%3Ainference-profile%2Fp/converse"),
+                None,
+                &no_map()
+            ),
+            names("arn:aws:bedrock:us-east-1:1:inference-profile/p")
+        );
+        // No model segment, or an empty one: refused, even with a body model.
+        for url in [
+            format!("{base}/foundation-models"),
+            format!("{base}/model//converse"),
+        ] {
+            assert!(
+                matches!(
+                    url_model("bedrock-converse", &url, Some("anything"), &no_map()),
+                    UrlModel::Unresolvable(_)
+                ),
+                "{url}"
+            );
+        }
+    }
+
+    #[test]
+    fn azure_names_a_deployment_that_only_the_operators_map_can_price() {
+        let map: std::collections::HashMap<String, String> =
+            [("prod-4o".to_string(), "gpt-4o".to_string())].into();
+        let base = "https://acme.openai.azure.com/openai";
+        assert_eq!(
+            url_model(
+                "azure-openai",
+                &format!("{base}/deployments/prod-4o/chat/completions"),
+                None,
+                &map
+            ),
+            UrlModel::Names {
+                model: "gpt-4o".to_string(),
+                body_ok: Some("prod-4o".to_string())
+            }
+        );
+        // An unmapped deployment cannot be priced.
+        assert!(matches!(
+            url_model(
+                "azure-openai",
+                &format!("{base}/deployments/other/chat/completions"),
+                None,
+                &map
+            ),
+            UrlModel::Unresolvable(_)
+        ));
+        // The v1 API has no deployment segment: the body's model is the deployment name.
+        assert_eq!(
+            url_model(
+                "azure-openai",
+                &format!("{base}/v1/chat/completions"),
+                Some("prod-4o"),
+                &map
+            ),
+            UrlModel::Names {
+                model: "gpt-4o".to_string(),
+                body_ok: Some("prod-4o".to_string())
+            }
+        );
+        assert!(matches!(
+            url_model(
+                "azure-openai",
+                &format!("{base}/v1/chat/completions"),
+                None,
+                &map
+            ),
+            UrlModel::Unresolvable(_)
+        ));
+        // With no map nothing is priced.
+        assert!(matches!(
+            url_model(
+                "azure-openai",
+                &format!("{base}/deployments/prod-4o/chat/completions"),
+                None,
+                &no_map()
+            ),
+            UrlModel::Unresolvable(_)
+        ));
+    }
+
+    #[test]
+    fn body_routed_protocols_use_the_body_model() {
+        for proto in [
+            "openai-chat",
+            "openai-responses",
+            "anthropic-messages",
+            "nvidia",
+        ] {
+            assert_eq!(
+                url_model(
+                    proto,
+                    "https://api.example/v1/messages",
+                    Some("m"),
+                    &no_map()
+                ),
+                UrlModel::BodyPicks
+            );
+        }
+    }
+
+    const ANTHROPIC: &str = "anthropic-messages";
+
+    fn refused(protocol: &str, upstream: &str, body: serde_json::Value) {
+        assert!(
+            unpriced_modifier(protocol, upstream, &body).is_some(),
+            "{protocol} {body}"
+        );
+    }
+
+    fn passes(protocol: &str, upstream: &str, body: serde_json::Value) {
+        assert_eq!(
+            unpriced_modifier(protocol, upstream, &body),
+            None,
+            "{protocol} {body}"
+        );
+    }
+
+    #[test]
+    fn an_unlisted_top_level_field_is_refused_on_every_protocol() {
+        // Default-deny: a field nobody priced is refused, whatever it is called.
+        let anthropic = [
+            json!({"compaction": {"type": "compact_20260112"}}),
+            json!({"context_management": {"edits": [{"type": "compact_20260112"}]}}),
+            json!({"fallbacks": [{"model": "m"}]}),
+            json!({"fallback_credit_token": "t"}),
+            json!({"speed": "fast"}),
+            json!({"speed": "standard"}),
+            json!({"inference_geo": "global"}),
+            json!({"inference_geo": "us"}),
+            json!({"service_tier": "auto"}),
+            json!({"service_tier": "priority"}),
+            json!({"serviceTier": "default"}),
+            json!({"ServiceTier": "priority"}),
+            json!({"SERVICE_TIER": "priority"}),
+            json!({"a_field_added_next_year": 1}),
+            json!({"container": "c"}),
+            json!({"mcp_servers": []}),
+            json!({"output_config": {"format": {}}}),
+        ];
+        for body in anthropic {
+            refused(ANTHROPIC, "https://api.anthropic.com/v1/messages", body);
+        }
+        for body in [
+            json!({"service_tier": "default"}),
+            json!({"web_search_options": {}}),
+            json!({"modalities": ["audio"]}),
+            json!({"audio": {}}),
+            json!({"compaction": {}}),
+            json!({"context_management": []}),
+            json!({"unknown": 1}),
+        ] {
+            refused(
+                "openai-chat",
+                "https://api.openai.com/v1/chat/completions",
+                body.clone(),
+            );
+            refused(
+                "nvidia",
+                "https://integrate.api.nvidia.com/v1/chat/completions",
+                body,
+            );
+        }
+        for body in [
+            json!({"service_tier": "flex"}),
+            json!({"background": true}),
+            json!({"prompt": {"id": "p"}}),
+            json!({"unknown": 1}),
+        ] {
+            refused(
+                "openai-responses",
+                "https://api.openai.com/v1/responses",
+                body,
+            );
+        }
+        for body in [
+            json!({"serviceTier": "priority"}),
+            json!({"service_tier": "flex"}),
+            json!({"serviceTier": {"type": "priority"}}),
+            json!({"performanceConfig": {"latency": "optimized"}}),
+            json!({"guardrailConfig": {}}),
+            json!({"additionalModelRequestFields": {"anthropic_beta": ["x"]}}),
+            json!({"unknown": 1}),
+        ] {
+            refused("bedrock-converse", "https://b/model/m/converse", body);
+        }
+        for body in [
+            json!({"serviceTier": "priority"}),
+            json!({"service_tier": "priority"}),
+            json!({"ServiceTier": "priority"}),
+            json!({"unknown": 1}),
+        ] {
+            refused(
+                "gemini",
+                "https://g/v1beta/models/m:generateContent",
+                body.clone(),
+            );
+            refused(
+                "vertex-ai",
+                "https://v/v1/projects/p/models/m:generateContent",
+                body,
+            );
+        }
+        refused(
+            "azure-openai",
+            "https://a/openai/deployments/d/chat/completions",
+            json!({"data_sources": []}),
+        );
+        // A protocol the table does not know admits no field at all.
+        refused("observed-only", "https://x", json!({"messages": []}));
+        // A body that is not an object has no field to price.
+        refused(ANTHROPIC, "https://x", json!([1]));
+    }
+
+    #[test]
+    fn a_plain_priced_request_passes_on_every_protocol() {
+        passes(
+            ANTHROPIC,
+            "https://api.anthropic.com/v1/messages",
+            json!({"model": "m", "max_tokens": 5, "messages": [], "system": "s", "temperature": 0.1,
+                "top_p": 1, "top_k": 3, "stop_sequences": ["x"], "stream": true,
+                "metadata": {"user_id": "u"}, "thinking": {"type": "enabled", "budget_tokens": 2048},
+                "tool_choice": {"type": "auto"},
+                "tools": [{"name": "get_weather", "description": "d", "input_schema": {"type": "object"}}]}),
+        );
+        passes(
+            "openai-chat",
+            "https://api.openai.com/v1/chat/completions",
+            json!({"model": "m", "messages": [], "max_tokens": 5, "temperature": 0.2, "stream": true,
+                "stream_options": {"include_usage": true}, "tool_choice": "auto",
+                "tools": [{"type": "function", "function": {"name": "f", "parameters": {}}}],
+                "reasoning_effort": "low", "user": "u"}),
+        );
+        passes(
+            "openai-responses",
+            "https://api.openai.com/v1/responses",
+            json!({"model": "m", "input": "hi", "instructions": "i", "max_output_tokens": 5,
+                "reasoning": {"effort": "low"}, "store": false,
+                "tools": [{"type": "function", "name": "f", "parameters": {}}]}),
+        );
+        passes(
+            "gemini",
+            "https://g/v1beta/models/m:generateContent",
+            json!({"contents": [], "systemInstruction": {}, "generationConfig": {}, "safetySettings": [],
+                "toolConfig": {"functionCallingConfig": {"mode": "AUTO"}},
+                "tools": [{"functionDeclarations": [{"name": "f", "parameters": {}}]}]}),
+        );
+        // The OpenAI-compatible endpoint takes the chat body.
+        passes(
+            "gemini",
+            "https://g/v1beta/openai/chat/completions",
+            json!({"model": "m", "messages": []}),
+        );
+        passes(
+            "vertex-ai",
+            "https://v/v1/projects/p/locations/l/publishers/anthropic/models/m:rawPredict",
+            json!({"anthropic_version": "vertex-2023-10-16", "anthropic_beta": ["prompt-caching-2024-07-31"],
+                "messages": [], "max_tokens": 5}),
+        );
+        passes(
+            "bedrock-converse",
+            "https://b/model/m/converse",
+            json!({"messages": [], "system": [], "inferenceConfig": {"maxTokens": 5},
+                "toolConfig": {"tools": [{"toolSpec": {"name": "f", "inputSchema": {"json": {}}}}, {"cachePoint": {"type": "default"}}],
+                    "toolChoice": {"auto": {}}}}),
+        );
+        passes(
+            "bedrock-invoke",
+            "https://b/model/m/invoke",
+            json!({"anthropic_version": "bedrock-2023-05-31", "messages": [], "max_tokens": 5}),
+        );
+        passes(
+            "azure-openai",
+            "https://a/openai/deployments/d/chat/completions",
+            json!({"messages": [], "tools": [{"type": "function", "function": {"name": "f"}}]}),
+        );
+    }
+
+    #[test]
+    fn only_plain_client_tools_pass_and_the_shape_is_exact() {
+        // Server tools, a typed tool nobody listed, and an untyped object with a foreign key.
+        for tools in [
+            json!([{"type": "web_search_20250305", "name": "web_search"}]),
+            json!([{"type": "web_fetch_20250910", "name": "web_fetch"}]),
+            json!([{"type": "tool_search_tool_regex_20251119", "name": "t"}]),
+            json!([{"type": "code_execution_20250522", "name": "code_execution"}]),
+            json!([{"type": "bash_code_execution_20250825", "name": "bash_code_execution"}]),
+            json!([{"type": "text_editor_code_execution_20250825", "name": "x"}]),
+            json!([{"type": "advisor_20260301", "name": "advisor", "model": "m"}]),
+            json!([{"type": "quantum_lookup_20271201", "name": "q"}]),
+            json!([{"type": "bash_20991231", "name": "bash"}]),
+            json!([{"name": "f", "input_schema": {}, "server_side": true}]),
+            json!([{"name": "f", "input_schema": {}, "max_uses": 5}]),
+            json!([{"name": "f"}]),
+            json!([{"type": "custom", "name": "c", "input_schema": {}, "allowed_callers": ["x"]}]),
+            json!([{"future_server_tool": {}}]),
+            json!([{}]),
+            json!(["web_search"]),
+            json!({"type": "web_search"}),
+            json!([{"name": "f", "input_schema": {}}, {"type": "memory_20250818"}]),
+        ] {
+            refused(ANTHROPIC, "https://x", json!({"tools": tools}));
+        }
+        for tools in [
+            json!([{"type": "web_search_preview"}]),
+            json!([{"type": "file_search"}]),
+            json!([{"type": "function", "function": {"name": "f"}, "extra": 1}]),
+            json!([{"type": "function", "function": {"name": "f", "web": true}}]),
+            json!([{"type": "function"}]),
+            json!([{"function": {"name": "f"}}]),
+            json!([{"name": "f", "input_schema": {}}]),
+        ] {
+            refused(
+                "openai-chat",
+                "https://api.openai.com/v1/chat/completions",
+                json!({"tools": tools}),
+            );
+        }
+        refused(
+            "openai-responses",
+            "https://api.openai.com/v1/responses",
+            json!({"tools": [{"type": "function", "name": "f", "vector_store_ids": ["v"]}]}),
+        );
+        for tools in [
+            json!([{"google_search": {}}]),
+            json!([{"googleSearchRetrieval": {}}]),
+            json!([{"urlContext": {}}]),
+            json!([{"retrieval": {"vertexAiSearch": {"datastore": "d"}}}]),
+            json!([{"enterpriseWebSearch": {}}]),
+            json!([{"functionDeclarations": [], "googleSearch": {}}]),
+            json!([{"functionDeclarations": [{"name": "f", "grounding": true}]}]),
+        ] {
+            refused(
+                "gemini",
+                "https://g/v1beta/models/m:generateContent",
+                json!({"tools": tools}),
+            );
+        }
+        for tool_config in [
+            json!({"tools": [{"systemTool": {"name": "nova_grounding"}}]}),
+            json!({"tools": [{"toolSpec": {"name": "f"}, "systemTool": {"name": "x"}}]}),
+            json!({"tools": [{"toolSpec": {"name": "f", "extra": 1}}]}),
+            json!({"tools": [{"toolSpec": {"name": "f"}}], "extra": 1}),
+            json!({"tools": [{}]}),
+            json!({"tools": "x"}),
+        ] {
+            refused(
+                "bedrock-converse",
+                "https://b/model/m/converse",
+                json!({"toolConfig": tool_config}),
+            );
+        }
+        // Gemini's toolConfig is an object of the function-calling settings only.
+        refused(
+            "gemini",
+            "https://g/v1beta/models/m:generateContent",
+            json!({"toolConfig": {"x": 1}}),
+        );
+        refused(
+            "gemini",
+            "https://g/v1beta/models/m:generateContent",
+            json!({"toolConfig": 1}),
+        );
+        // Anthropic client tools by their exact versioned type.
+        for t in [
+            "bash_20250124",
+            "text_editor_20250728",
+            "memory_20250818",
+            "computer_20251124",
+        ] {
+            passes(
+                ANTHROPIC,
+                "https://x",
+                json!({"tools": [{"type": t, "name": "n"}]}),
+            );
+        }
+        passes(
+            ANTHROPIC,
+            "https://x",
+            json!({"tools": [{"type": "custom", "name": "c", "input_schema": {}, "cache_control": {"type": "ephemeral"}}]}),
+        );
+    }
+
+    #[test]
+    fn an_anthropic_beta_in_the_body_must_be_on_the_allowlist() {
+        let up = "https://v/v1/projects/p/publishers/anthropic/models/m:rawPredict";
+        for beta in [
+            json!(["compact-2026-01-12"]),
+            json!(["prompt-caching-2024-07-31", "fast-mode-2026-02-01"]),
+            json!("context-1m-2025-08-07"),
+            json!([1]),
+            json!({"a": 1}),
+        ] {
+            refused(
+                "vertex-ai",
+                up,
+                json!({"anthropic_beta": beta, "messages": []}),
+            );
+        }
+        refused(
+            "bedrock-invoke",
+            "https://b/model/m/invoke",
+            json!({"anthropic_beta": ["context-management-2025-06-27"]}),
+        );
+        passes(
+            "bedrock-invoke",
+            "https://b/model/m/invoke",
+            json!({"anthropic_beta": ["interleaved-thinking-2025-05-14"]}),
+        );
+    }
+
+    #[test]
+    fn the_anthropic_beta_header_is_forwarded_only_for_priced_betas() {
+        use super::unpriced_beta_header;
+        use axum::http::{HeaderMap, HeaderValue};
+        let h = |v: &[&str]| {
+            let mut m = HeaderMap::new();
+            for x in v {
+                m.append("anthropic-beta", HeaderValue::from_str(x).unwrap());
+            }
+            m
+        };
+        assert_eq!(unpriced_beta_header(&HeaderMap::new()), None);
+        assert_eq!(
+            unpriced_beta_header(&h(&["prompt-caching-2024-07-31"])),
+            None
+        );
+        assert_eq!(
+            unpriced_beta_header(&h(&[
+                "prompt-caching-2024-07-31, interleaved-thinking-2025-05-14"
+            ])),
+            None
+        );
+        for bad in [
+            "compact-2026-01-12",
+            "fast-mode-2026-02-01",
+            "context-1m-2025-08-07",
+            "prompt-caching-2024-07-31,compact-2026-01-12",
+            "something-new-2027-01-01",
+            "Prompt-Caching-2024-07-31",
+        ] {
+            assert!(unpriced_beta_header(&h(&[bad])).is_some(), "{bad}");
+        }
+        // A second header line is read too.
+        assert!(
+            unpriced_beta_header(&h(&["prompt-caching-2024-07-31", "compact-2026-01-12"]))
+                .is_some()
+        );
     }
 }

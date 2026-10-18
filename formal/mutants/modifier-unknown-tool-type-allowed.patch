@@ -1,0 +1,13 @@
+diff --git a/src/web/llm_proxy.rs b/src/web/llm_proxy.rs
+index 423671c..9570df0 100644
+--- a/src/web/llm_proxy.rs
++++ b/src/web/llm_proxy.rs
+@@ -583,7 +583,7 @@ fn tool_is_plain(dialect: Dialect, tool: &serde_json::Value) -> bool {
+                     ],
+                 ) && has_name(obj)
+             }
+-            _ => false,
++            _ => true,
+         },
+         Dialect::OpenAiChat => openai_chat_tool(obj, kind),
+         Dialect::OpenAiResponses => openai_responses_tool(obj, kind),

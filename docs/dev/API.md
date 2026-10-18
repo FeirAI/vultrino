@@ -47,8 +47,13 @@ k8s **startup** probe's vault-decrypt boot gate depends on; it deliberately stay
 dependency-free so a transient dependency blip can't restart a singleton pod.
 
 ```json
-{ "status": "ok", "version": "0.1.0" }
+{ "status": "ok", "version": "0.1.0", "meter_lost_total": 0, "meter_gap_pending": 0 }
 ```
+
+`meter_lost_total` counts event appends that failed since the process started and
+`meter_gap_pending` counts failed appends whose `meter.lost` gap marker has not been
+written yet (see [METERING.md](METERING.md)). Both are in-memory counters; `status`
+stays `ok` while the process is alive, because a restart does not repair a full disk.
 
 ### `GET /api/v1/ready` — no auth
 
@@ -62,7 +67,7 @@ contend with the fd-locked vault). `200` takes the pod in; `503` takes it out of
 the Service's endpoints (without restarting it, unlike a failing liveness check).
 
 ```json
-{ "status": "ready", "outbox_pending": 0 }
+{ "status": "ready", "outbox_pending": 0, "meter_gap_pending": 0 }
 ```
 
 ```json
@@ -295,7 +300,11 @@ credential: `schema`, `plane`, `build` (`version`, `rustc`, `git_sha`, `git_dirt
 `key_distinct_from_govder_key`, `shared_key_escape`), `engine` (`default_deny`, `tenants_in_observe_mode`,
 `unlisted_tenant_mode`), `policies` (`total`, `rate_limit_default_not_deny`: ids of enforced policies that have a
 `RateLimit` condition and a non-deny default), `vault.format_version` (the version this binary writes; a vault is
-migrated when it is opened), and `secret_fingerprints`: an object from relationship name to a list of keyed
+migrated when it is opened), `meter` (`append_failures_total`, `gap_pending`, `gap_markers_emitted`,
+`last_failure_at`: failed outbox appends, see [METERING.md](METERING.md)), `rate_card` (`require_priced_model`,
+`configured`, `sha256`: the fingerprint of the rate-card file as read at start, the same digest leria reports for the file; `file_sha256`: the file as last read successfully (it differs from `sha256` after the file changed, when coverage is the intersection of the two); `entries`;
+`last_error`: set when a changed file could not be used and the previous card still serves; the path is never reported),
+and `secret_fingerprints`: an object from relationship name to a list of keyed
 fingerprints of the shared secrets this process holds, for `vultrino-outbox-poll` and `vultrino-approval-push` (the
 `[outbox] hmac_secret`, one value fingerprinted once per relationship), `workload-assertion` (one fingerprint per verifier secret the workload exchange accepts, the same
 list it verifies with, so a rotation overlap reports both; present only while the exchange is configured),
@@ -418,9 +427,14 @@ delivery uses, plus its `Govder-Signature` when a signing secret is configured):
     { "body": { "sequence": 42, "subject": "…", "event": "meter.observed", "payload": {…}, "created_at": "…" },
       "signature": "sha256=…" }
   ],
-  "next_cursor": 42
+  "next_cursor": 42,
+  "meter_gap_pending": 0
 }
 ```
+
+`meter_gap_pending` is the number of failed event appends not yet announced by a
+`meter.lost` marker. A poller must not treat an idle page as caught up while it is
+non-zero. It is on the envelope, not inside a signed body.
 
 `next_cursor` is what a consumer persists for the next poll. See
 [METERING.md](METERING.md) for the `meter.observed` payloads.

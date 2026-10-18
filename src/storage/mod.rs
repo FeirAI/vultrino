@@ -676,6 +676,12 @@ pub trait StorageBackend: Send + Sync {
         Ok(vec![])
     }
 
+    /// Append-failure counters of the outbox (VUL-02). The default reports zeros: a backend
+    /// that does not persist events cannot lose one.
+    fn meter_loss(&self) -> crate::outbox::MeterLossSnapshot {
+        crate::outbox::MeterLossSnapshot::default()
+    }
+
     /// The next deliverable pending events (V9): the earliest still-pending event
     /// per subject (so per-subject ordering is preserved — a later event for a
     /// subject is withheld until its earlier one is delivered), ascending by

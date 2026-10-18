@@ -1,0 +1,14 @@
+diff --git a/src/outbox.rs b/src/outbox.rs
+index 9941631..eaa1de1 100644
+--- a/src/outbox.rs
++++ b/src/outbox.rs
+@@ -736,8 +736,7 @@ impl UsageAccumulator {
+             }
+             self.cache_input_tokens = self.cache_input_tokens.max(cache_input_tokens(obj));
+             let (iter_input, iter_output) = iterations_total(obj);
+-            self.iter_input = self.iter_input.max(iter_input);
+-            self.iter_output = self.iter_output.max(iter_output);
++            let _ = (iter_input, iter_output);
+             self.tool_prompt_tokens = self.tool_prompt_tokens.max(
+                 obj.get("toolUsePromptTokenCount")
+                     .and_then(serde_json::Value::as_u64)

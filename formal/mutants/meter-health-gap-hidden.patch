@@ -1,0 +1,13 @@
+diff --git a/src/web/api.rs b/src/web/api.rs
+index f13d971..34698a0 100644
+--- a/src/web/api.rs
++++ b/src/web/api.rs
+@@ -1724,7 +1724,7 @@ pub async fn api_health(State(state): State<AppState>) -> impl IntoResponse {
+         status: "ok".to_string(),
+         version: env!("CARGO_PKG_VERSION").to_string(),
+         meter_lost_total: loss.lost_total,
+-        meter_gap_pending: loss.gap_pending,
++        meter_gap_pending: 0,
+     })
+ }
+ 

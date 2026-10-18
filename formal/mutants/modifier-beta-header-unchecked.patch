@@ -1,0 +1,13 @@
+diff --git a/src/web/llm_proxy.rs b/src/web/llm_proxy.rs
+index 423671c..763623b 100644
+--- a/src/web/llm_proxy.rs
++++ b/src/web/llm_proxy.rs
+@@ -757,7 +757,7 @@ fn unpriced_modifier(protocol: &str, upstream: &str, body: &serde_json::Value) -
+ /// line is read; a value that is not visible ASCII is refused too). The header is forwarded
+ /// upstream only when this returns `None`.
+ fn unpriced_beta_header(headers: &HeaderMap) -> Option<String> {
+-    for value in headers.get_all("anthropic-beta") {
++    for value in headers.get_all("anthropic-beta-unchecked") {
+         let Ok(text) = value.to_str() else {
+             return Some("an anthropic-beta header that is not plain text".to_string());
+         };

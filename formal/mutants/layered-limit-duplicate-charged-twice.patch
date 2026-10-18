@@ -1,0 +1,15 @@
+diff --git a/src/policy/mod.rs b/src/policy/mod.rs
+index 0de94f6..be17181 100644
+--- a/src/policy/mod.rs
++++ b/src/policy/mod.rs
+@@ -743,9 +743,7 @@ impl PolicyEngine {
+                 {
+                     matched = true;
+                     for limit in limits {
+-                        if !guards.contains(&limit) {
+-                            guards.push(limit);
+-                        }
++                        guards.push(limit);
+                     }
+                 }
+             }

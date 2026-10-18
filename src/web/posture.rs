@@ -23,6 +23,7 @@ pub(crate) fn build_posture(
     default_deny: bool,
     policies: &[Policy],
     workload: &WorkloadVerifier,
+    meter: &crate::outbox::MeterLossSnapshot,
 ) -> Value {
     let secret_fingerprints = secret_fingerprints(config, workload);
     // Same condition the server uses to build its Averin client.
@@ -51,6 +52,8 @@ pub(crate) fn build_posture(
         .map(|p| p.id.as_str())
         .collect();
     fail_open_rate_limits.sort_unstable();
+
+    let card = config.llm_proxy.rate_card.status();
 
     json!({
         "schema": POSTURE_SCHEMA,
@@ -122,6 +125,28 @@ pub(crate) fn build_posture(
         },
         "vault": {
             "format_version": crate::storage::STORAGE_VERSION,
+        },
+        // The priced-model gate. `sha256` is the fingerprint of the rate-card file read
+        // (the same file leria prices with, so a deploy check can compare the planes) as it
+        // was at START: a later edit only narrows coverage and shows up as `file_sha256`
+        // differing from `sha256`; `last_error` is set when a changed file could not be used and the previous card
+        // is still serving. The path is never reported.
+        "rate_card": {
+            "require_priced_model": config.llm_proxy.require_priced_model,
+            "configured": card.configured,
+            "sha256": card.sha256,
+            "file_sha256": card.file_sha256,
+            "entries": card.entries,
+            "last_error": card.last_error,
+        },
+        // VUL-02: failed event appends. `gap_pending > 0` means the outbox is failing (or
+        // has not had a successful append since it failed) and consumers may be missing
+        // events; a `meter.lost` marker follows the next successful append.
+        "meter": {
+            "append_failures_total": meter.lost_total,
+            "gap_pending": meter.gap_pending,
+            "gap_markers_emitted": meter.markers_emitted,
+            "last_failure_at": meter.last_lost_at,
         },
         // FEI-40: keyed fingerprints of the shared secrets this process holds, per relationship
         // (see crate::secret_fp). The verifier compares them with the other planes' to find a
@@ -218,6 +243,7 @@ mod tests {
             true,
             &policies,
             &WorkloadVerifier::Disabled,
+            &Default::default(),
         );
         assert_eq!(
             v["policies"]["rate_limit_default_not_deny"],
@@ -228,7 +254,13 @@ mod tests {
 
     #[test]
     fn report_names_the_vul38_evidence_floor_mode() {
-        let v = build_posture(&Config::default(), true, &[], &WorkloadVerifier::Disabled);
+        let v = build_posture(
+            &Config::default(),
+            true,
+            &[],
+            &WorkloadVerifier::Disabled,
+            &Default::default(),
+        );
         assert_eq!(v["averin"]["d8_evidence_floor"], "money_and_irreversible");
         // With two-phase evidence off the floor setting has no effect: every non-reversible
         // action keeps the committed-evidence floor, and the report says so.
@@ -238,7 +270,13 @@ mod tests {
              resource_id = \"r\"\nd8_complete_evidence = true\nd8_evidence_floor = \"human_floor\"\n",
         )
         .unwrap();
-        let v = build_posture(&cfg, true, &[], &WorkloadVerifier::Disabled);
+        let v = build_posture(
+            &cfg,
+            true,
+            &[],
+            &WorkloadVerifier::Disabled,
+            &Default::default(),
+        );
         assert_eq!(v["averin"]["d8_evidence_floor"], "human_floor");
         assert_eq!(v["averin"]["d8_evidence_floor_effective"], "human_floor");
         let cfg = Config::parse(
@@ -246,7 +284,13 @@ mod tests {
              resource_id = \"r\"\nd8_complete_evidence = true\n",
         )
         .unwrap();
-        let v = build_posture(&cfg, true, &[], &WorkloadVerifier::Disabled);
+        let v = build_posture(
+            &cfg,
+            true,
+            &[],
+            &WorkloadVerifier::Disabled,
+            &Default::default(),
+        );
         assert_eq!(
             v["averin"]["d8_evidence_floor_effective"],
             "money_and_irreversible"
@@ -266,17 +310,107 @@ mod tests {
         )
         .unwrap();
         for cfg in [empty_resource, disabled] {
-            let v = build_posture(&cfg, true, &[], &WorkloadVerifier::Disabled);
+            let v = build_posture(
+                &cfg,
+                true,
+                &[],
+                &WorkloadVerifier::Disabled,
+                &Default::default(),
+            );
             assert_eq!(v["averin"]["d8_evidence_floor_effective"], "human_floor");
         }
     }
 
     #[test]
     fn report_reflects_the_live_engine_default_and_never_claims_deny_it_was_not_given() {
-        let v = build_posture(&Config::default(), false, &[], &WorkloadVerifier::Disabled);
+        let v = build_posture(
+            &Config::default(),
+            false,
+            &[],
+            &WorkloadVerifier::Disabled,
+            &Default::default(),
+        );
         assert_eq!(v["engine"]["default_deny"], false);
-        let v = build_posture(&Config::default(), true, &[], &WorkloadVerifier::Disabled);
+        let v = build_posture(
+            &Config::default(),
+            true,
+            &[],
+            &WorkloadVerifier::Disabled,
+            &Default::default(),
+        );
         assert_eq!(v["engine"]["default_deny"], true);
+    }
+
+    #[test]
+    fn report_carries_the_meter_append_loss_counters() {
+        let healthy = build_posture(
+            &Config::default(),
+            true,
+            &[],
+            &WorkloadVerifier::Disabled,
+            &crate::outbox::MeterLossSnapshot::default(),
+        );
+        assert_eq!(healthy["meter"]["append_failures_total"], 0);
+        assert_eq!(healthy["meter"]["gap_pending"], 0);
+        assert!(healthy["meter"]["last_failure_at"].is_null());
+        let failing = build_posture(
+            &Config::default(),
+            true,
+            &[],
+            &WorkloadVerifier::Disabled,
+            &crate::outbox::MeterLossSnapshot {
+                lost_total: 4,
+                gap_pending: 2,
+                markers_emitted: 1,
+                last_lost_at: Some(chrono::Utc::now()),
+            },
+        );
+        assert_eq!(failing["meter"]["append_failures_total"], 4);
+        assert_eq!(failing["meter"]["gap_pending"], 2);
+        assert_eq!(failing["meter"]["gap_markers_emitted"], 1);
+        assert!(failing["meter"]["last_failure_at"].is_string());
+    }
+
+    #[test]
+    fn report_carries_the_rate_card_fingerprint_and_the_priced_model_gate() {
+        use sha2::Digest;
+        // No card: the gate is on (the default) and nothing is configured.
+        let v = build_posture(
+            &Config::default(),
+            true,
+            &[],
+            &WorkloadVerifier::Disabled,
+            &Default::default(),
+        );
+        assert_eq!(v["rate_card"]["require_priced_model"], true);
+        assert_eq!(v["rate_card"]["configured"], false);
+        assert!(v["rate_card"]["sha256"].is_null());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("card.json");
+        let doc = br#"{"rate_card_version":"p","entries":[{"model_ref":"m","asset":"tokens","price_micros_per_unit":1},
+            {"model_ref_prefix":"m","asset":"tokens","price_micros_per_unit":1}]}"#;
+        std::fs::write(&path, doc).unwrap();
+        let mut cfg = Config::default();
+        cfg.llm_proxy = cfg.llm_proxy.with_rate_card_path(&path).unwrap();
+        cfg.llm_proxy.require_priced_model = false;
+        let v = build_posture(
+            &cfg,
+            true,
+            &[],
+            &WorkloadVerifier::Disabled,
+            &Default::default(),
+        );
+        assert_eq!(v["rate_card"]["require_priced_model"], false);
+        assert_eq!(v["rate_card"]["configured"], true);
+        assert_eq!(v["rate_card"]["entries"], 2);
+        // The same digest `sha256sum` prints for the file: what leria reports for it.
+        assert_eq!(
+            v["rate_card"]["sha256"],
+            hex::encode(sha2::Sha256::digest(doc))
+        );
+        // The path is never reported.
+        assert!(!v.to_string().contains("card.json"));
     }
 
     #[test]
@@ -285,18 +419,36 @@ mod tests {
         cfg.tenants.insert("b".into(), TenantMode::Observe);
         cfg.tenants.insert("a".into(), TenantMode::Observe);
         cfg.tenants.insert("c".into(), TenantMode::Enforce);
-        let v = build_posture(&cfg, true, &[], &WorkloadVerifier::Disabled);
+        let v = build_posture(
+            &cfg,
+            true,
+            &[],
+            &WorkloadVerifier::Disabled,
+            &Default::default(),
+        );
         assert_eq!(v["engine"]["tenants_in_observe_mode"], json!(["a", "b"]));
         assert_eq!(v["engine"]["unlisted_tenant_mode"], "enforce");
     }
 
     #[test]
     fn report_carries_the_sod_flag_and_the_vault_format_and_no_secret_material() {
-        let v = build_posture(&Config::default(), true, &[], &WorkloadVerifier::Disabled);
+        let v = build_posture(
+            &Config::default(),
+            true,
+            &[],
+            &WorkloadVerifier::Disabled,
+            &Default::default(),
+        );
         assert_eq!(v["approvals"]["enforce_separation_of_duty"], false);
         let mut cfg = Config::default();
         cfg.approval.enforce_separation_of_duty = true;
-        let v = build_posture(&cfg, true, &[], &WorkloadVerifier::Disabled);
+        let v = build_posture(
+            &cfg,
+            true,
+            &[],
+            &WorkloadVerifier::Disabled,
+            &Default::default(),
+        );
         assert_eq!(v["approvals"]["enforce_separation_of_duty"], true);
         assert_eq!(
             v["vault"]["format_version"],
@@ -339,7 +491,13 @@ mod tests {
                 govder: Some(govder(f, m, esc)),
                 ..Config::default()
             };
-            let v = build_posture(&cfg, true, &[], &WorkloadVerifier::Disabled);
+            let v = build_posture(
+                &cfg,
+                true,
+                &[],
+                &WorkloadVerifier::Disabled,
+                &Default::default(),
+            );
             let a = &v["approver_identity"];
             assert_eq!(a["govder_configured"], true);
             assert_eq!(a["key_configured"], configured, "{f}/{m:?}");
@@ -373,7 +531,13 @@ mod tests {
         cfg.outbox.enabled = true;
         cfg.outbox.url = Some("http://govder.invalid/webhooks/vultrino-approvals".into());
         cfg.govder = Some(govder_cfg(Some("approver-key-M")));
-        let v = build_posture(&cfg, true, &[], &WorkloadVerifier::Disabled);
+        let v = build_posture(
+            &cfg,
+            true,
+            &[],
+            &WorkloadVerifier::Disabled,
+            &Default::default(),
+        );
         let fp = &v["secret_fingerprints"];
         assert_eq!(
             fp["vultrino-outbox-poll"],
@@ -404,7 +568,13 @@ mod tests {
     fn report_omits_the_push_relationship_when_the_outbox_does_not_push() {
         let mut cfg = Config::default();
         cfg.outbox.hmac_secret = Some("outbox-secret-A".into());
-        let v = build_posture(&cfg, true, &[], &WorkloadVerifier::Disabled);
+        let v = build_posture(
+            &cfg,
+            true,
+            &[],
+            &WorkloadVerifier::Disabled,
+            &Default::default(),
+        );
         assert!(v["secret_fingerprints"]
             .get("vultrino-outbox-poll")
             .is_some());
@@ -412,12 +582,24 @@ mod tests {
             .get("vultrino-approval-push")
             .is_none());
         cfg.outbox.enabled = true; // enabled but no URL: still nowhere to push
-        let v = build_posture(&cfg, true, &[], &WorkloadVerifier::Disabled);
+        let v = build_posture(
+            &cfg,
+            true,
+            &[],
+            &WorkloadVerifier::Disabled,
+            &Default::default(),
+        );
         assert!(v["secret_fingerprints"]
             .get("vultrino-approval-push")
             .is_none());
         cfg.outbox.url = Some("  ".into());
-        let v = build_posture(&cfg, true, &[], &WorkloadVerifier::Disabled);
+        let v = build_posture(
+            &cfg,
+            true,
+            &[],
+            &WorkloadVerifier::Disabled,
+            &Default::default(),
+        );
         assert!(v["secret_fingerprints"]
             .get("vultrino-approval-push")
             .is_none());
@@ -431,17 +613,35 @@ mod tests {
         let mut cfg = Config::default();
         cfg.averin.api_key = Some("averin-project-bearer".into());
         cfg.averin.enabled = false;
-        let v = build_posture(&cfg, true, &[], &WorkloadVerifier::Disabled);
+        let v = build_posture(
+            &cfg,
+            true,
+            &[],
+            &WorkloadVerifier::Disabled,
+            &Default::default(),
+        );
         assert!(v["secret_fingerprints"].get("averin-api-key").is_none());
         cfg.averin.enabled = true;
-        let v = build_posture(&cfg, true, &[], &WorkloadVerifier::Disabled);
+        let v = build_posture(
+            &cfg,
+            true,
+            &[],
+            &WorkloadVerifier::Disabled,
+            &Default::default(),
+        );
         assert_eq!(
             v["secret_fingerprints"]["averin-api-key"],
             json!([fingerprint("averin-project-bearer", "averin-api-key").unwrap()])
         );
         assert!(!v.to_string().contains("averin-project-bearer"));
         cfg.averin.api_key = None;
-        let v = build_posture(&cfg, true, &[], &WorkloadVerifier::Disabled);
+        let v = build_posture(
+            &cfg,
+            true,
+            &[],
+            &WorkloadVerifier::Disabled,
+            &Default::default(),
+        );
         assert!(v["secret_fingerprints"].get("averin-api-key").is_none());
     }
 
@@ -452,7 +652,13 @@ mod tests {
     fn report_carries_averin_api_key_configured_with_the_fingerprint_condition() {
         let mut cfg = Config::default();
         let flag = |c: &Config| {
-            build_posture(c, true, &[], &WorkloadVerifier::Disabled)["averin"]["api_key_configured"]
+            build_posture(
+                c,
+                true,
+                &[],
+                &WorkloadVerifier::Disabled,
+                &Default::default(),
+            )["averin"]["api_key_configured"]
                 .clone()
         };
         // Present as a boolean in every state, not omitted.
@@ -462,7 +668,13 @@ mod tests {
         assert_eq!(flag(&cfg), json!(false));
         cfg.averin.enabled = true;
         assert_eq!(flag(&cfg), json!(true));
-        let v = build_posture(&cfg, true, &[], &WorkloadVerifier::Disabled);
+        let v = build_posture(
+            &cfg,
+            true,
+            &[],
+            &WorkloadVerifier::Disabled,
+            &Default::default(),
+        );
         assert!(!v.to_string().contains("averin-project-bearer"));
         cfg.averin.api_key = Some(String::new());
         assert_eq!(flag(&cfg), json!(false));
@@ -475,13 +687,25 @@ mod tests {
     /// held.
     #[test]
     fn report_omits_unset_secrets_and_an_unusable_approver_key() {
-        let v = build_posture(&Config::default(), true, &[], &WorkloadVerifier::Disabled);
+        let v = build_posture(
+            &Config::default(),
+            true,
+            &[],
+            &WorkloadVerifier::Disabled,
+            &Default::default(),
+        );
         assert_eq!(v["secret_fingerprints"], json!({}));
         let cfg = Config {
             govder: Some(govder_cfg(Some("assertion-F"))), // M equal to F: disabled
             ..Config::default()
         };
-        let v = build_posture(&cfg, true, &[], &WorkloadVerifier::Disabled);
+        let v = build_posture(
+            &cfg,
+            true,
+            &[],
+            &WorkloadVerifier::Disabled,
+            &Default::default(),
+        );
         assert!(v["secret_fingerprints"].get("approver-key").is_none());
         assert!(v["secret_fingerprints"].get("tenant-assertion").is_some());
     }
@@ -498,7 +722,13 @@ mod tests {
         let rel = "workload-assertion";
         let listed = parse_verifier_secrets(&format!(" {a} , {b} ,")).unwrap();
         let verifier = WorkloadVerifier::Configured(std::sync::Arc::new(listed));
-        let v = build_posture(&Config::default(), true, &[], &verifier);
+        let v = build_posture(
+            &Config::default(),
+            true,
+            &[],
+            &verifier,
+            &Default::default(),
+        );
         assert_eq!(
             v["secret_fingerprints"][rel],
             json!([fingerprint(a, rel).unwrap(), fingerprint(b, rel).unwrap()])
@@ -506,10 +736,16 @@ mod tests {
         let text = v.to_string();
         assert!(!text.contains(a) && !text.contains(b));
         // Disabled, or enabled but invalid: the exchange verifies nothing, so nothing is reported.
-        let v = build_posture(&Config::default(), true, &[], &WorkloadVerifier::Disabled);
+        let v = build_posture(
+            &Config::default(),
+            true,
+            &[],
+            &WorkloadVerifier::Disabled,
+            &Default::default(),
+        );
         assert!(v["secret_fingerprints"].get(rel).is_none());
         let invalid = WorkloadVerifier::Invalid("workload assertion verifier is not configured");
-        let v = build_posture(&Config::default(), true, &[], &invalid);
+        let v = build_posture(&Config::default(), true, &[], &invalid, &Default::default());
         assert!(v["secret_fingerprints"].get(rel).is_none());
     }
 }

@@ -1,0 +1,16 @@
+diff --git a/src/web/llm_proxy.rs b/src/web/llm_proxy.rs
+index 14620ec..3e1b882 100644
+--- a/src/web/llm_proxy.rs
++++ b/src/web/llm_proxy.rs
+@@ -846,9 +846,9 @@ async fn llm_proxy_impl(
+     let (gated_model, route_refusal): (Option<String>, Option<String>) = match &route {
+         UrlModel::BodyPicks => (body_model.map(str::to_string), None),
+         UrlModel::Names { model, body_ok } => (
+-            Some(model.clone()),
++            Some(body_model.map(str::to_string).unwrap_or_else(|| model.clone())),
+             body_model
+-                .filter(|b| *b != model && Some(*b) != body_ok.as_deref())
++                .filter(|b| false && *b != model && Some(*b) != body_ok.as_deref())
+                 .map(|b| {
+                     format!("the body names model '{b}' but the upstream URL selects '{model}'")
+                 }),

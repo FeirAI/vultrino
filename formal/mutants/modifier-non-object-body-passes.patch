@@ -1,0 +1,13 @@
+diff --git a/src/web/llm_proxy.rs b/src/web/llm_proxy.rs
+index 423671c..ebcbc9d 100644
+--- a/src/web/llm_proxy.rs
++++ b/src/web/llm_proxy.rs
+@@ -724,6 +724,8 @@ fn field_is_priced(kind: Kind, dialect: Dialect, value: &serde_json::Value) -> b
+ /// upstream call. Returns what was found.
+ fn unpriced_modifier(protocol: &str, upstream: &str, body: &serde_json::Value) -> Option<String> {
+     let Some(obj) = body.as_object() else {
++        return None;
++        #[allow(unreachable_code)]
+         return Some(
+             "a request body that is not a JSON object cannot be shown to bill tokens alone"
+                 .to_string(),

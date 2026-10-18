@@ -22,6 +22,7 @@ pub mod outbox;
 pub mod plain_http;
 pub mod plugins;
 pub mod policy;
+pub mod ratecard;
 pub mod revocation;
 pub mod router;
 pub mod secret_fp;

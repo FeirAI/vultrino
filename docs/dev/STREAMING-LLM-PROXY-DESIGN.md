@@ -333,6 +333,10 @@ is authoritative.
   must stay consistent with the buffered path (post-execute) and must fire even on halt
   mid-stream so a halted agent's call cannot escape metering. It fires regardless of whether
   usage was seen.
+- **Superseded by VUL-01 (see METERING.md):** the rule below was the original v1 design. A
+  stream that does not end with a complete usage trailer is now charged an estimate
+  (`dims.estimated = "true"`), and a client disconnect drains the upstream first so the
+  exact trailer still arrives. Original text:
 - **V13b tokens** fires **only on clean EOF with a parsed usage split**. On
   abort/halt/disconnect/mid-stream-SSE-`error` → **V13a only, skip V13b**. *Why:* a truncated
   OpenAI stream has **no** usage frame at all (terminal-only), so there is nothing to emit;

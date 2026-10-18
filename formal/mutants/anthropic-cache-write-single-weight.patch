@@ -1,0 +1,13 @@
+diff --git a/src/outbox.rs b/src/outbox.rs
+index 11a0f21..b76671b 100644
+--- a/src/outbox.rs
++++ b/src/outbox.rs
+@@ -285,7 +285,7 @@ pub struct TokenUsage {
+ /// TTLs: the booking is never below the real charge for a write, and over-counts a 5-minute
+ /// write by up to 1.6x. Bedrock's `cacheWriteInputTokens` is billed at 1.25x and is counted
+ /// the same way.
+-const CACHE_WRITE_WEIGHT: u64 = 2;
++const CACHE_WRITE_WEIGHT: u64 = 1;
+ 
+ /// Input tokens a provider reports OUTSIDE its plain input count: Anthropic's
+ /// `cache_creation_input_tokens` and `cache_read_input_tokens` (and Bedrock Converse's

@@ -1,0 +1,12 @@
+diff --git a/src/web/llm_proxy.rs b/src/web/llm_proxy.rs
+index 423671c..1dea29e 100644
+--- a/src/web/llm_proxy.rs
++++ b/src/web/llm_proxy.rs
+@@ -440,6 +440,7 @@ const GEMINI_FIELDS: &[(&str, Kind)] = &[
+     ("cachedContent", Plain),
+     ("cached_content", Plain),
+     ("labels", Plain),
++    ("serviceTier", Plain),
+     ("toolConfig", GeminiToolConfig),
+     ("tool_config", GeminiToolConfig),
+     ("tools", Tools),

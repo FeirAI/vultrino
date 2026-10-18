@@ -1,0 +1,13 @@
+diff --git a/src/web/llm_proxy.rs b/src/web/llm_proxy.rs
+index 45d02b2..37ccc85 100644
+--- a/src/web/llm_proxy.rs
++++ b/src/web/llm_proxy.rs
+@@ -944,7 +944,7 @@ fn openai_content_marker(obj: &serde_json::Map<String, serde_json::Value>) -> Op
+                 let ok = part
+                     .get("type")
+                     .and_then(Value::as_str)
+-                    .is_some_and(|t| OPENAI_PRICED_PART_TYPES.contains(&t));
++                    .is_some();
+                 if ok {
+                     if let Some(found) = part.as_object().and_then(image_part_marker) {
+                         return Some(found);

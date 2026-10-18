@@ -1,0 +1,15 @@
+diff --git a/src/web/llm_proxy.rs b/src/web/llm_proxy.rs
+index 423671c..9476832 100644
+--- a/src/web/llm_proxy.rs
++++ b/src/web/llm_proxy.rs
+@@ -707,7 +707,9 @@ fn field_is_priced(kind: Kind, dialect: Dialect, value: &serde_json::Value) -> b
+                 ],
+             )
+         }),
+-        Betas => match value {
++        Betas => true,
++        #[allow(unreachable_patterns)]
++        _ if false => match value {
+             serde_json::Value::String(s) => betas_priced(s),
+             serde_json::Value::Array(list) => {
+                 list.iter().all(|b| b.as_str().is_some_and(betas_priced))

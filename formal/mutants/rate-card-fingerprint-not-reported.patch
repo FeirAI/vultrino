@@ -1,0 +1,13 @@
+diff --git a/src/web/posture.rs b/src/web/posture.rs
+index 9a13876..22c51f0 100644
+--- a/src/web/posture.rs
++++ b/src/web/posture.rs
+@@ -97,7 +97,7 @@ pub(crate) fn build_posture(
+         "rate_card": {
+             "require_priced_model": config.llm_proxy.require_priced_model,
+             "configured": card.configured,
+-            "sha256": card.sha256,
++            "sha256": Option::<String>::None,
+             "file_sha256": card.file_sha256,
+             "entries": card.entries,
+             "last_error": card.last_error,

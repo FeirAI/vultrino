@@ -659,16 +659,15 @@ impl PolicyEngine {
         // scan stops at the first matched rule, which is the strongest outcome
         // present (a weaker tier is never evaluated, so it is never charged).
         //
-        // KNOWN LIMITATION (layered RateLimit — bounded): the FIRST matching Allow
-        // rule short-circuits and returns Allow, so if a credential/principal has
-        // two Allow-`RateLimit` rules (e.g. a per-minute AND a per-day cap), only the
-        // first-iterated one is charged+enforced per request; the second is not
-        // conjunctively evaluated. Each cap now has its OWN counter (see
-        // `rate_limit_key`), so they no longer corrupt each other — but "all caps
-        // must pass" is not enforced for layered Allow-`RateLimit` rules. To enforce a
-        // hard ceiling today, express it as a single rule, or as a Deny rule (Deny is
-        // evaluated first and is authoritative). Making layered RateLimit Allow rules
-        // conjunctive is tracked in LIMITATIONS.md.
+        // Layered rate limits (VUL-15): the Allow tier is conjunctive over rate limits.
+        // Every matching Allow rule contributes its top-level `RateLimit` leaves (a rule
+        // that is a bare `RateLimit` or an `and` of conditions) to one guard set; the
+        // request is admitted only if EVERY guard in the set has room, and then every
+        // guard is charged, under one lock (`charge_rate_limits`). A refused request
+        // charges nothing. A per-minute AND a per-day cap written as two Allow rules (in
+        // one policy or in two matching policies) are therefore both enforced, whatever
+        // the storage order. A `RateLimit` nested under `or`/`not` keeps its inline
+        // evaluation (see `allow_tier_matches`).
         let mut deny_policy: Option<&str> = None;
         let broadened_prompt = std::cell::Cell::new(false);
         let policy_defaults: Vec<PolicyAction> =
@@ -683,6 +682,9 @@ impl PolicyEngine {
                     RuleOutcome::Allow => PolicyAction::Allow,
                     RuleOutcome::Kill | RuleOutcome::NoMatch => return false,
                 };
+                if tier == RuleOutcome::Allow {
+                    return self.allow_tier_matches(&matching_policies, input, record);
+                }
                 for policy in &matching_policies {
                     for rule in &policy.rules {
                         if rule.action != wanted {
@@ -767,6 +769,118 @@ impl PolicyEngine {
             deny_policy.unwrap_or_default(),
             default_deny_policy,
         )
+    }
+
+    /// Whether the Allow tier matches, with layered rate limits enforced conjunctively
+    /// (VUL-15).
+    ///
+    /// Every Allow rule of every matching policy is looked at (the scan no longer stops
+    /// at the first match, so storage order cannot choose which cap is enforced). A rule
+    /// matches when its non-rate-limit conditions hold; its top-level `RateLimit` leaves
+    /// (a bare `RateLimit`, or inside an `and`, at any `and` depth) join one guard set,
+    /// de-duplicated by `(max, window_secs)` because that pair names the counter. The
+    /// tier matches only when at least one rule matched and every guard has room; all
+    /// guards are then charged together. An exhausted guard makes the whole tier not
+    /// match, so the request falls through to the policy default, exactly as a single
+    /// exhausted rule always did.
+    ///
+    /// `record == false` (the post-approval resume) charges and checks nothing: the slot
+    /// was taken when the request opened.
+    fn allow_tier_matches(&self, policies: &[&Policy], input: &EvalInput, record: bool) -> bool {
+        let mut matched = false;
+        let mut guards: Vec<(u32, u64)> = Vec::new();
+        for policy in policies {
+            for rule in &policy.rules {
+                if rule.action != PolicyAction::Allow {
+                    continue;
+                }
+                if let PolicyCondition::SpendCap {
+                    asset,
+                    per_action_max,
+                } = &rule.condition
+                {
+                    if self.spend_within_cap(input.spend, asset, *per_action_max, record) {
+                        matched = true;
+                    }
+                    continue;
+                }
+                let mut rest: Vec<&PolicyCondition> = Vec::new();
+                let mut limits: Vec<(u32, u64)> = Vec::new();
+                split_rate_limits(&rule.condition, &mut rest, &mut limits);
+                if rest
+                    .iter()
+                    .all(|c| self.eval_pair(c, input, record, Want::NARROW).0)
+                {
+                    matched = true;
+                    for limit in limits {
+                        if !guards.contains(&limit) {
+                            guards.push(limit);
+                        }
+                    }
+                }
+            }
+        }
+        if !matched {
+            return false;
+        }
+        if guards.is_empty() || !record {
+            return true;
+        }
+        self.charge_rate_limits(
+            input.credential_alias,
+            input.principal.map(rate_limit_principal),
+            &guards,
+        )
+    }
+
+    /// Check that every `(max, window_secs)` counter has room and, only if all do, charge
+    /// them all, under one write lock so two concurrent requests cannot both pass the
+    /// check on the last slot. Invalid dimensions (`max == 0` or `window_secs == 0`)
+    /// refuse before any state is touched, like [`Self::check_rate_limit`].
+    fn charge_rate_limits(
+        &self,
+        credential_alias: &str,
+        principal_id: Option<&str>,
+        guards: &[(u32, u64)],
+    ) -> bool {
+        if guards
+            .iter()
+            .any(|(max, window_secs)| *max == 0 || *window_secs == 0)
+        {
+            return false;
+        }
+        let mut limits = self.rate_limits.write();
+        let now = Instant::now();
+        for (max, window_secs) in guards {
+            let key = rate_limit_key(credential_alias, principal_id, *max, *window_secs);
+            let (count, elapsed) = match limits.get(&key) {
+                Some(s) => (
+                    s.count,
+                    now.duration_since(s.window_start) >= Duration::from_secs(*window_secs),
+                ),
+                None => (0, false),
+            };
+            if !fixed_window_transition(count, elapsed, *max).allowed {
+                return false;
+            }
+        }
+        for (max, window_secs) in guards {
+            let key = rate_limit_key(credential_alias, principal_id, *max, *window_secs);
+            let state = limits.entry(key).or_insert_with(|| RateLimitState {
+                count: 0,
+                window_start: now,
+            });
+            let transition = fixed_window_transition(
+                state.count,
+                now.duration_since(state.window_start) >= Duration::from_secs(*window_secs),
+                *max,
+            );
+            state.count = transition.next_count;
+            if transition.reset_window {
+                state.window_start = now;
+            }
+        }
+        true
     }
 
     /// Evaluate a single condition against the request input.
@@ -1001,6 +1115,25 @@ impl PolicyEngine {
 impl Default for PolicyEngine {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Split an Allow rule condition into its top-level `RateLimit` leaves (a bare
+/// `RateLimit`, or any reached through nested `and`) and everything else. A `RateLimit`
+/// under `or` or `not` stays in `rest` and is evaluated inline.
+fn split_rate_limits<'a>(
+    condition: &'a PolicyCondition,
+    rest: &mut Vec<&'a PolicyCondition>,
+    limits: &mut Vec<(u32, u64)>,
+) {
+    match condition {
+        PolicyCondition::RateLimit { max, window_secs } => limits.push((*max, *window_secs)),
+        PolicyCondition::And(children) => {
+            for child in children {
+                split_rate_limits(child, rest, limits);
+            }
+        }
+        other => rest.push(other),
     }
 }
 
@@ -2920,6 +3053,215 @@ mod tests {
             // `spent` marks the shapes where the exhausted limit did not deny.
             assert_eq!(spent, !matches!(second, PolicyDecision::Deny(_)));
         }
+    }
+
+    // ==================== Layered Allow-RateLimit rules (VUL-15) ====================
+
+    fn layered_input<'a>(cred: &'a str, action: Option<&'a str>) -> EvalInput<'a> {
+        EvalInput {
+            credential_alias: cred,
+            url: None,
+            method: None,
+            action,
+            principal: None,
+            spend: None,
+        }
+    }
+
+    fn rl_rule(max: u32, window_secs: u64) -> PolicyCondition {
+        PolicyCondition::RateLimit { max, window_secs }
+    }
+
+    fn layered_policy(id: &str, limits: &[(u32, u64)]) -> Policy {
+        let mut p = Policy::deny_all(id, "*");
+        for (max, window) in limits {
+            p = p.with_rule(rl_rule(*max, *window), PolicyAction::Allow);
+        }
+        p
+    }
+
+    /// The reported bug: a per-minute AND a per-day cap as two Allow rules. Before the fix
+    /// the exhausted rule stopped matching and the OTHER rule still allowed, so the tighter
+    /// cap was no cap. Both storage orders must give the same answer.
+    #[test]
+    fn layered_allow_rate_limits_are_all_enforced_in_either_rule_order() {
+        for limits in [[(2, 60), (100, 86400)], [(100, 86400), (2, 60)]] {
+            let engine = PolicyEngine::new();
+            engine.add_policy(layered_policy("layered", &limits));
+            let call = || engine.evaluate_full(&layered_input("cred", None));
+            assert_eq!(call(), PolicyDecision::Allow);
+            assert_eq!(call(), PolicyDecision::Allow);
+            assert!(
+                matches!(call(), PolicyDecision::Deny(_)),
+                "the 2 per minute cap must bind although the 100 per day rule still has room \
+                 (rule order {limits:?})"
+            );
+        }
+        // And the long cap binds when it is the tight one.
+        let engine = PolicyEngine::new();
+        engine.add_policy(layered_policy("layered", &[(100, 60), (2, 86400)]));
+        let call = || engine.evaluate_full(&layered_input("cred", None));
+        assert_eq!(call(), PolicyDecision::Allow);
+        assert_eq!(call(), PolicyDecision::Allow);
+        assert!(matches!(call(), PolicyDecision::Deny(_)));
+    }
+
+    /// A refused request charges no guard, so a burst that is turned away does not spend
+    /// the long allowance. Checked on the counters themselves.
+    #[test]
+    fn a_refused_layered_request_charges_nothing() {
+        let engine = PolicyEngine::new();
+        engine.add_policy(layered_policy("layered", &[(2, 60), (5, 86400)]));
+        let call = || engine.evaluate_full(&layered_input("cred", None));
+        assert_eq!(call(), PolicyDecision::Allow);
+        assert_eq!(call(), PolicyDecision::Allow);
+        for _ in 0..4 {
+            assert!(matches!(call(), PolicyDecision::Deny(_)));
+        }
+        let limits = engine.rate_limits.read();
+        assert_eq!(
+            limits
+                .get(&rate_limit_key("cred", None, 2, 60))
+                .unwrap()
+                .count,
+            2
+        );
+        assert_eq!(
+            limits
+                .get(&rate_limit_key("cred", None, 5, 86400))
+                .unwrap()
+                .count,
+            2,
+            "four refused calls must not consume the day allowance"
+        );
+    }
+
+    /// Two matching policies each carrying one Allow-RateLimit rule are layered too.
+    #[test]
+    fn layered_limits_across_two_matching_policies_are_all_enforced() {
+        let engine = PolicyEngine::new();
+        engine.add_policy(layered_policy("minute", &[(2, 60)]));
+        engine.add_policy(layered_policy("day", &[(100, 86400)]));
+        let call = || engine.evaluate_full(&layered_input("cred", None));
+        assert_eq!(call(), PolicyDecision::Allow);
+        assert_eq!(call(), PolicyDecision::Allow);
+        assert!(matches!(call(), PolicyDecision::Deny(_)));
+    }
+
+    /// Two rules with the same dimensions name one counter: it is charged once per
+    /// request, not once per rule, so the cap is the number the operator wrote.
+    #[test]
+    fn duplicate_limit_dimensions_are_charged_once() {
+        let engine = PolicyEngine::new();
+        engine.add_policy(layered_policy("dup", &[(3, 60), (3, 60)]));
+        let call = || engine.evaluate_full(&layered_input("cred", None));
+        for _ in 0..3 {
+            assert_eq!(call(), PolicyDecision::Allow);
+        }
+        assert!(matches!(call(), PolicyDecision::Deny(_)));
+    }
+
+    /// The govder shape: `and(action_match, rate_limit, rate_limit)` per action grant. A rule
+    /// whose action does not match is not a candidate, so it charges nothing; two granted
+    /// actions on one credential are layered by their own limits only.
+    #[test]
+    fn layered_limits_only_charge_the_rules_that_match_the_request() {
+        let engine = PolicyEngine::new();
+        let mut p = Policy::deny_all("grants", "*");
+        for (action, max) in [("llm.a", 1u32), ("llm.b", 5u32)] {
+            p = p.with_rule(
+                PolicyCondition::And(vec![
+                    PolicyCondition::ActionMatch(action.to_string()),
+                    rl_rule(max, 60),
+                    rl_rule(100, 86400),
+                ]),
+                PolicyAction::Allow,
+            );
+        }
+        engine.add_policy(p);
+        let a = || engine.evaluate_full(&layered_input("cred", Some("llm.a")));
+        let b = || engine.evaluate_full(&layered_input("cred", Some("llm.b")));
+        assert_eq!(a(), PolicyDecision::Allow);
+        assert!(
+            matches!(a(), PolicyDecision::Deny(_)),
+            "llm.a is capped at 1 per minute"
+        );
+        // llm.b has its own 5 per minute counter and was never charged by llm.a's refusals.
+        for _ in 0..5 {
+            assert_eq!(b(), PolicyDecision::Allow);
+        }
+        assert!(matches!(b(), PolicyDecision::Deny(_)));
+        let limits = engine.rate_limits.read();
+        assert_eq!(
+            limits
+                .get(&rate_limit_key("cred", None, 100, 86400))
+                .unwrap()
+                .count,
+            6,
+            "the shared day counter holds exactly the six admitted calls"
+        );
+    }
+
+    /// An unlimited Allow rule that also matches does not switch the caps off: the guards of
+    /// the tier apply to the request whichever Allow rule matched.
+    #[test]
+    fn an_unlimited_allow_rule_does_not_bypass_a_matching_limit() {
+        let engine = PolicyEngine::new();
+        let p = Policy::deny_all("mixed", "*")
+            .with_rule(PolicyCondition::Always, PolicyAction::Allow)
+            .with_rule(rl_rule(1, 60), PolicyAction::Allow);
+        engine.add_policy(p);
+        let call = || engine.evaluate_full(&layered_input("cred", None));
+        assert_eq!(call(), PolicyDecision::Allow);
+        assert!(matches!(call(), PolicyDecision::Deny(_)));
+    }
+
+    /// A broad allow-all policy on the credential does not let an exhausted limit of another
+    /// matching policy through (it did before VUL-15: the exhausted rule stopped matching and
+    /// the other policy's plain Allow rule admitted the request).
+    #[test]
+    fn an_allow_all_policy_does_not_bypass_another_policys_limit() {
+        let engine = PolicyEngine::new();
+        engine.add_policy(Policy::allow_all("open", "*"));
+        engine.add_policy(
+            Policy::allow_all("open-rule", "*")
+                .with_rule(PolicyCondition::Always, PolicyAction::Allow),
+        );
+        engine.add_policy(layered_policy("limited", &[(2, 60)]));
+        let call = || engine.evaluate_full(&layered_input("cred", None));
+        assert_eq!(call(), PolicyDecision::Allow);
+        assert_eq!(call(), PolicyDecision::Allow);
+        assert!(
+            matches!(call(), PolicyDecision::Deny(_)),
+            "the 2 per minute limit binds although another matching policy allows everything"
+        );
+    }
+
+    /// The post-approval resume re-checks nothing and charges nothing, as before.
+    #[test]
+    fn layered_limits_are_not_charged_or_checked_on_resume() {
+        let engine = PolicyEngine::new();
+        engine.add_policy(layered_policy("layered", &[(1, 60), (1, 86400)]));
+        for _ in 0..3 {
+            assert_eq!(
+                engine.evaluate_readonly_full(&layered_input("cred", None)),
+                PolicyDecision::Allow
+            );
+        }
+        assert!(engine.rate_limits.read().is_empty());
+    }
+
+    /// An invalid limit inside a layered set refuses the request and creates no state, even
+    /// when a sibling limit is valid and has room.
+    #[test]
+    fn an_invalid_layered_limit_refuses_without_charging_the_valid_one() {
+        let engine = PolicyEngine::new();
+        engine.add_policy(layered_policy("bad", &[(5, 60), (0, 60)]));
+        assert!(matches!(
+            engine.evaluate_full(&layered_input("cred", None)),
+            PolicyDecision::Deny(_)
+        ));
+        assert!(engine.rate_limits.read().is_empty());
     }
 
     /// The engine maps each precedence outcome to the decision and reason the

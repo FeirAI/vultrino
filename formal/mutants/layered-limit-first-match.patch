@@ -1,0 +1,18 @@
+diff --git a/src/policy/mod.rs b/src/policy/mod.rs
+index 0de94f6..4742887 100644
+--- a/src/policy/mod.rs
++++ b/src/policy/mod.rs
+@@ -747,6 +747,13 @@ impl PolicyEngine {
+                             guards.push(limit);
+                         }
+                     }
++                    return guards.is_empty()
++                        || !record
++                        || self.charge_rate_limits(
++                            input.credential_alias,
++                            input.principal.map(rate_limit_principal),
++                            &guards,
++                        );
+                 }
+             }
+         }

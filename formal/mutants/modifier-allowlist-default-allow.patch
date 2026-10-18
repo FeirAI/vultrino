@@ -1,0 +1,12 @@
+diff --git a/src/web/llm_proxy.rs b/src/web/llm_proxy.rs
+index 423671c..b75cb09 100644
+--- a/src/web/llm_proxy.rs
++++ b/src/web/llm_proxy.rs
+@@ -737,6 +737,7 @@ fn unpriced_modifier(protocol: &str, upstream: &str, body: &serde_json::Value) -
+             .find(|(name, _)| name == key)
+             .map(|(_, kind)| *kind);
+         match kind {
++            None if true => {}
+             None => {
+                 return Some(format!(
+                     "the request field `{key}` is not one the rate card prices for {protocol}: it may bill above the token price (unknown request features are refused; widening the allowlist is a code change)"

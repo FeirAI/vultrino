@@ -493,6 +493,83 @@ async fn test_health_endpoint() {
 }
 
 #[tokio::test]
+async fn test_health_and_ready_report_a_failed_outbox_append() {
+    // VUL-02: a failed event append used to vanish into a log line. It is now a counter on
+    // /api/v1/health and /api/v1/ready, and drops back to a pending-gap of zero once the next
+    // successful append has carried the meter.lost marker.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("store.enc");
+    let password = SecretString::from("test-password");
+    let storage: Arc<dyn StorageBackend> =
+        Arc::new(FileStorage::new(&path, &password).await.unwrap());
+    let admin = AdminAuth::new("admin", "password123").unwrap();
+    let resolver = vultrino::router::CredentialResolver::new(storage.clone());
+    let exec_server = Arc::new(vultrino::server::VultrinoServer::new(
+        Config::default(),
+        storage.clone(),
+        resolver,
+    ));
+    let server = WebServer::new(
+        WebConfig {
+            bind: "127.0.0.1:0".to_string(),
+            enabled: true,
+        },
+        Config::default(),
+        storage.clone(),
+        AuthManager::new(),
+        admin,
+        exec_server,
+    );
+    let router = server.into_router();
+    let get = |router: axum::Router, uri: &'static str| async move {
+        let resp = router
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        (status, body)
+    };
+
+    let (status, health) = get(router.clone(), "/api/v1/health").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(health["meter_lost_total"], 0);
+    assert_eq!(health["meter_gap_pending"], 0);
+
+    // A directory where the outbox writer wants its temp file fails every append, for any user.
+    let tmp = dir.path().join("outbox.tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    assert!(storage
+        .append_event("a", "meter.observed", serde_json::json!({}))
+        .await
+        .is_err());
+
+    let (status, health) = get(router.clone(), "/api/v1/health").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a failing outbox does not fail liveness"
+    );
+    assert_eq!(health["status"], "ok");
+    assert_eq!(health["meter_lost_total"], 1);
+    assert_eq!(health["meter_gap_pending"], 1);
+    let (_, ready) = get(router.clone(), "/api/v1/ready").await;
+    assert_eq!(ready["meter_gap_pending"], 1);
+
+    std::fs::remove_dir(&tmp).unwrap();
+    storage
+        .append_event("a", "meter.observed", serde_json::json!({}))
+        .await
+        .unwrap();
+    let (_, health) = get(router.clone(), "/api/v1/health").await;
+    assert_eq!(health["meter_lost_total"], 1, "the lifetime counter stays");
+    assert_eq!(
+        health["meter_gap_pending"], 0,
+        "the marker has been written"
+    );
+}
+
+#[tokio::test]
 async fn test_ready_endpoint_healthy() {
     // Observability item 4 / #5: a healthy process reports 200 + "ready", with no
     // failing_components key (omitted, not an empty array — see ReadyResponse's
@@ -2470,6 +2547,87 @@ async fn test_admin_halt_rejects_glob_label() {
         .list_policies()
         .iter()
         .any(|p| p.kill));
+}
+
+#[tokio::test]
+async fn test_event_feed_reports_pending_meter_gap_while_appends_fail() {
+    // LER-02: during a sustained append failure the feed's idle pages looked identical to a
+    // quiet gateway. The envelope now carries `meter_gap_pending` so a poller can refuse to
+    // treat the feed as caught up while it is non-zero, and it drops to 0 once the marker
+    // is written.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("store.enc");
+    let password = SecretString::from("test-password");
+    let storage: Arc<dyn StorageBackend> =
+        Arc::new(FileStorage::new(&path, &password).await.unwrap());
+    let auth_manager = AuthManager::new();
+    let (key, api_key) = auth_manager
+        .create_api_key("admin-key", "admin", None)
+        .unwrap();
+    storage.store_api_key(&api_key).await.unwrap();
+    let admin = AdminAuth::new("admin", "password123").unwrap();
+    let resolver = vultrino::router::CredentialResolver::new(storage.clone());
+    let exec_server = Arc::new(vultrino::server::VultrinoServer::new(
+        Config::default(),
+        storage.clone(),
+        resolver,
+    ));
+    let router = WebServer::new(
+        WebConfig {
+            bind: "127.0.0.1:0".to_string(),
+            enabled: true,
+        },
+        Config::default(),
+        storage.clone(),
+        auth_manager,
+        admin,
+        exec_server,
+    )
+    .into_router();
+    let feed = |router: axum::Router, key: String| async move {
+        let resp = router
+            .oneshot(admin_req(
+                "GET",
+                "/api/v1/events?after=0",
+                &key,
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        serde_json::from_str::<serde_json::Value>(&body_string(resp).await).unwrap()
+    };
+
+    assert_eq!(
+        feed(router.clone(), key.clone()).await["meter_gap_pending"],
+        0
+    );
+
+    let tmp = dir.path().join("outbox.tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    assert!(storage
+        .append_event("a", "meter.observed", serde_json::json!({}))
+        .await
+        .is_err());
+    let body = feed(router.clone(), key.clone()).await;
+    assert_eq!(
+        body["meter_gap_pending"], 1,
+        "failing appends are visible on the feed"
+    );
+    assert!(body["events"].as_array().unwrap().is_empty());
+
+    std::fs::remove_dir(&tmp).unwrap();
+    storage
+        .append_event("a", "meter.observed", serde_json::json!({}))
+        .await
+        .unwrap();
+    let body = feed(router, key).await;
+    assert_eq!(body["meter_gap_pending"], 0);
+    assert!(body["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["body"]["event"] == "meter.lost"));
 }
 
 #[tokio::test]
@@ -8718,11 +8876,13 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for RejectLog {
 async fn test_approval_decision_route_refuses_every_assertion_failure_opaquely_and_logs_the_reason()
 {
     let log = RejectLog::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_writer(log.clone())
-        .with_ansi(false)
-        .finish();
-    let _guard = tracing::subscriber::set_default(subscriber);
+    let dispatch = tracing::Dispatch::new(
+        tracing_subscriber::fmt()
+            .with_writer(log.clone())
+            .with_ansi(false)
+            .finish(),
+    );
+    let _guard = tracing::dispatcher::set_default(&dispatch);
 
     let (router, storage, key, id) =
         build_hard_sod_recipe_fixture("team-a", two_teammate_rule(), "High").await;
@@ -8788,6 +8948,12 @@ async fn test_approval_decision_route_refuses_every_assertion_failure_opaquely_a
         ),
     ];
     for (name, assertion, reason) in cases {
+        // Re-install the scoped subscriber before each case. set_default rebuilds tracing's
+        // process-wide callsite interest cache; without it a concurrently running test that
+        // registers the same callsite while no subscriber is active on its thread can cache
+        // "never" for it, and this test then misses a log line that was emitted (observed in
+        // CI as a flaky miss of the second or later case's reason).
+        let _case_guard = tracing::dispatcher::set_default(&dispatch);
         let req = Request::builder()
             .method("POST")
             .uri(&uri)

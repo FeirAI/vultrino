@@ -1,0 +1,13 @@
+diff --git a/src/ratecard.rs b/src/ratecard.rs
+index 59f166c..b9391e8 100644
+--- a/src/ratecard.rs
++++ b/src/ratecard.rs
+@@ -306,7 +306,7 @@ pub fn pick_meter_model(
+         return Some(served.to_string());
+     }
+     if let Some(req) = requested {
+-        if dated_under(req, served) && card.covers(req) {
++        if card.covers(req) {
+             return Some(req.to_string());
+         }
+     }

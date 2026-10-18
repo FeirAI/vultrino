@@ -1,0 +1,13 @@
+diff --git a/src/web/llm_proxy.rs b/src/web/llm_proxy.rs
+index 423671c..9511412 100644
+--- a/src/web/llm_proxy.rs
++++ b/src/web/llm_proxy.rs
+@@ -689,7 +689,7 @@ fn field_is_priced(kind: Kind, dialect: Dialect, value: &serde_json::Value) -> b
+                 })
+             })
+         }),
+-        ConverseToolConfig => value.as_object().is_some_and(|c| {
++        ConverseToolConfig => value.as_object().is_some_and(|_c| true) || value.as_object().is_some_and(|c| {
+             only_keys(c, &["tools", "toolChoice"])
+                 && c.get("tools").is_none_or(|t| {
+                     t.as_array()

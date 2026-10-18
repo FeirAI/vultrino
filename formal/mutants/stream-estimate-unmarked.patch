@@ -1,0 +1,13 @@
+diff --git a/src/server/mod.rs b/src/server/mod.rs
+index 552feb4..1b4b7d3 100644
+--- a/src/server/mod.rs
++++ b/src/server/mod.rs
+@@ -861,7 +861,7 @@ async fn emit_stream_meter(
+                 attribution,
+                 Some(state.usage),
+                 state.model.as_deref(),
+-                state.estimated,
++                false,
+             )
+             .await
+         }
