@@ -1,0 +1,13 @@
+diff --git a/src/averin/mod.rs b/src/averin/mod.rs
+index 8f70357..13d0a0d 100644
+--- a/src/averin/mod.rs
++++ b/src/averin/mod.rs
+@@ -187,7 +187,7 @@ impl Drop for InflightGuard {
+             // The task panicked/was cancelled before recording an outcome — count the
+             // lost seal so the `failed` counter and its alarm reflect reality.
+             self.metrics.record_failed();
+-            if let Some((client, token_id, request_id, seq)) = self.gap.take() {
++            if let Some((client, token_id, request_id, seq)) = None::<(AverinClient, String, String, u32)> {
+                 client.record_receipt_gap(
+                     &token_id,
+                     Some(&request_id),

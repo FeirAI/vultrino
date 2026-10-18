@@ -1,8 +1,8 @@
 diff --git a/src/web/api.rs b/src/web/api.rs
-index 6ae8993..5329f42 100644
+index 646c2ac..d3ad652 100644
 --- a/src/web/api.rs
 +++ b/src/web/api.rs
-@@ -3669,9 +3669,6 @@ pub async fn api_list_sessions(_admin: AdminApiAuth, State(state): State<AppStat
+@@ -3675,9 +3675,6 @@ pub async fn api_list_sessions(_admin: AdminApiAuth, State(state): State<AppStat
  /// tenant. Read-only; booleans, counts, ids and build provenance only, never a secret, a rule or
  /// a credential (see `posture::build_posture`).
  pub async fn api_posture(admin: AdminApiAuth, State(state): State<AppState>) -> Response {
@@ -11,4 +11,4 @@ index 6ae8993..5329f42 100644
 -    }
      let engine = state.server.policy_engine();
      let policies = engine.list_policies();
-     let report = super::posture::build_posture(&state.config, engine.default_deny(), &policies);
+     let report = super::posture::build_posture(

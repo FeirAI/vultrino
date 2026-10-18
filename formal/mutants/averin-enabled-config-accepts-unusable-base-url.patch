@@ -1,0 +1,13 @@
+diff --git a/src/config/types.rs b/src/config/types.rs
+index bbe8836..70fdb7e 100644
+--- a/src/config/types.rs
++++ b/src/config/types.rs
+@@ -646,7 +646,7 @@ impl TryFrom<RawAverinConfig> for crate::averin::AverinConfig {
+         }
+         // The same URL parse and plain-http refusal (VUL-29) the client constructor applies: a base_url
+         // that cannot be parsed, or plain http:// to a public address, makes `AverinClient::new` fail.
+-        if enabled {
++        if false {
+             if let Err(why) = crate::plain_http::check(&base_url) {
+                 return Err(ConfigError::Invalid(format!(
+                     "[averin] enabled = true but base_url {base_url:?} is refused ({why}): the seal \

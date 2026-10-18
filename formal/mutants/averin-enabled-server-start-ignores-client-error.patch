@@ -1,0 +1,16 @@
+diff --git a/src/server/mod.rs b/src/server/mod.rs
+index a08cec0..b8f6a18 100644
+--- a/src/server/mod.rs
++++ b/src/server/mod.rs
+@@ -1116,9 +1116,8 @@ impl VultrinoServer {
+         // default) → no-op hooks. An enabled block that cannot build a client refuses to start
+         // (FEI-33): silently running with the client off records no receipt and no gap.
+         let averin = crate::averin::AverinClient::new(config.averin.clone())
+-            .map_err(|e| {
+-                format!("[averin] enabled = true but the seal client cannot be built: {e}")
+-            })?
++            .ok()
++            .flatten()
+             .map(Arc::new);
+ 
+         // Govder gate-rule client (plan 100 P2 Phase D). `None` when unconfigured or

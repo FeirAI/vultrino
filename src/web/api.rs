@@ -3685,7 +3685,12 @@ pub async fn api_posture(admin: AdminApiAuth, State(state): State<AppState>) -> 
     }
     let engine = state.server.policy_engine();
     let policies = engine.list_policies();
-    let report = super::posture::build_posture(&state.config, engine.default_deny(), &policies);
+    let report = super::posture::build_posture(
+        &state.config,
+        engine.default_deny(),
+        &policies,
+        &state.workload_verifier,
+    );
     (StatusCode::OK, Json(report)).into_response()
 }
 
