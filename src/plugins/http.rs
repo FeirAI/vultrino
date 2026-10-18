@@ -1598,6 +1598,62 @@ mod tests {
     }
 
     #[test]
+    fn plugin_drops_agent_openai_scope_headers_and_writes_the_credentials() {
+        let agent = serde_json::json!({
+            "OpenAI-Organization": "org-attacker0000000000",
+            "openai-organization": "org-attacker1111111111",
+            "openai-project": "proj_attacker00000000",
+            "x-keep": "1"
+        });
+        let request_with = |meta: &[(&str, &str)]| {
+            let mut cred = crate::Credential::new(
+                "c".to_string(),
+                CredentialData::ApiKey {
+                    key: Secret::new("k"),
+                    header_name: "authorization".to_string(),
+                    header_prefix: "Bearer ".to_string(),
+                },
+            );
+            for (k, v) in meta {
+                cred = cred.with_metadata(*k, *v);
+            }
+            HttpPlugin::scoped_params(&PluginRequest {
+                credential: cred,
+                action: "request".to_string(),
+                params: serde_json::json!({
+                    "method": "POST",
+                    "url": "https://api.openai.com/v1/chat/completions",
+                    "headers": agent,
+                }),
+                context: crate::RequestContext::new(),
+            })
+            .map(|p| p.headers)
+        };
+        let org = "org-AbCdEfGh1234567890XyZ";
+        let project = "proj_AbCdEfGh1234567890XyZ";
+        let h = request_with(&[
+            (crate::OPENAI_ORGANIZATION_META, org),
+            (crate::OPENAI_PROJECT_META, project),
+        ])
+        .unwrap();
+        assert_eq!(h.get("openai-organization").map(String::as_str), Some(org));
+        assert_eq!(h.get("openai-project").map(String::as_str), Some(project));
+        assert_eq!(
+            h.keys()
+                .filter(|k| k.eq_ignore_ascii_case("openai-organization"))
+                .count(),
+            1
+        );
+        assert_eq!(h.get("x-keep").map(String::as_str), Some("1"));
+        let h = request_with(&[]).unwrap();
+        assert!(!h
+            .keys()
+            .any(|k| k.to_ascii_lowercase().starts_with("openai-")));
+        assert_eq!(h.get("x-keep").map(String::as_str), Some("1"));
+        assert!(request_with(&[(crate::OPENAI_PROJECT_META, "bad\r\nx-evil: 1")]).is_err());
+    }
+
+    #[test]
     fn plugin_drops_agent_workspace_header_and_writes_the_credentials() {
         let ws = "wrkspc_01JwQvzr7rXLA5AGx3HKfFUJ";
         let agent = serde_json::json!({

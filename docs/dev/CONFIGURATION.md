@@ -194,6 +194,22 @@ so a workspace-scoped key keeps working unchanged, and a key that spans several
 workspaces and has no setting is left for Anthropic to refuse rather than letting the
 caller choose.
 
+**Multi-organization OpenAI keys.** OpenAI bills and scopes a request to the
+organization and project named by the `openai-organization` and `openai-project`
+headers when a key can reach more than one. To pin them, set the credential's
+`openai_organization_id` (`org-` followed by 8 to 64 ASCII letters or digits) and
+`openai_project_id` (`proj_` followed by 8 to 64 ASCII letters or digits) metadata, for
+example `vultrino meta set <alias> openai_organization_id org-...`. Either may be set
+alone. Anything else is refused when it is set, and a stored value that fails the same
+check at use time fails the request with a configuration error before any upstream
+call. Vultrino sends the stored value on `/llm` (chat and responses, buffered and
+streamed), `POST /api/v1/execute`, the MCP `http_request` tool and approval replay, and
+drops any `openai-organization` or `openai-project` a caller sent, whatever the case.
+A credential with no setting sends neither header, so a key that spans several
+organizations or projects is left for OpenAI to refuse rather than letting the agent
+choose which one is billed. This applies to any credential, so it also removes the two
+headers on an Azure OpenAI route, where they are not used.
+
 ### `[[policies]]` — static declarative policies
 
 ```toml

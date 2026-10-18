@@ -651,6 +651,18 @@ the buffered-vs-streaming branch, so a `{"stream": true}` request cannot evade i
   approval replay alike, because it is applied where every path reaches the plugin. A
   caller therefore cannot pick a workspace with the same bearer on any of them.
 
+- **OpenAI organization and project (operator-owned, every path):** a key that spans
+  several organizations or projects is scoped by the `openai-organization` and
+  `openai-project` headers. They are stored on the credential as the
+  `openai_organization_id` (`org-` plus 8 to 64 ASCII letters or digits) and
+  `openai_project_id` (`proj_` plus 8 to 64 ASCII letters or digits) metadata keys; any
+  other value is refused when it is set. Before dispatch, Vultrino removes any
+  `openai-organization` or `openai-project` the caller sent (any case, including on
+  `/llm`, where they are no longer forwarded) and writes the credential's values, or
+  none. This holds on `/llm` (buffered and streamed), `POST /api/v1/execute`, the MCP
+  `http_request` tool and approval replay. A stored value that fails its check answers
+  `/llm` with 500 and a message naming the metadata key, before any upstream call.
+
 - **Reasoning effort (gateway-owned):** when the capability sets
   `llm.reasoning_effort` (one of `none`, `minimal`, `low`, `medium`, `high`),
   Vultrino WRITES it into the body, **overwriting a client-supplied value of any

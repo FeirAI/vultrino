@@ -732,15 +732,75 @@ pub fn is_valid_anthropic_workspace_id(id: &str) -> bool {
     }
 }
 
+/// Credential metadata key holding the operator-set OpenAI organization id, sent as
+/// the `openai-organization` header. On a key that spans several organizations the
+/// header picks the one that is billed and scoped, so the value belongs to the
+/// credential, never to the agent. See [`plugins::apply_workspace_scope`].
+pub const OPENAI_ORGANIZATION_META: &str = "openai_organization_id";
+
+/// Credential metadata key holding the operator-set OpenAI project id, sent as the
+/// `openai-project` header (same reasoning as [`OPENAI_ORGANIZATION_META`]).
+pub const OPENAI_PROJECT_META: &str = "openai_project_id";
+
+/// `prefix` then 8 to 64 ASCII letters or digits. Strict on purpose: the value
+/// becomes an HTTP header value, so whitespace, control characters and separators
+/// are refused.
+fn is_prefixed_alnum_id(id: &str, prefix: &str) -> bool {
+    match id.strip_prefix(prefix) {
+        Some(rest) => {
+            (8..=64).contains(&rest.len()) && rest.bytes().all(|b| b.is_ascii_alphanumeric())
+        }
+        None => false,
+    }
+}
+
+/// Whether `id` is an acceptable OpenAI organization id: `org-` then 8 to 64 ASCII
+/// letters or digits.
+pub fn is_valid_openai_organization_id(id: &str) -> bool {
+    is_prefixed_alnum_id(id, "org-")
+}
+
+/// Whether `id` is an acceptable OpenAI project id: `proj_` then 8 to 64 ASCII
+/// letters or digits.
+pub fn is_valid_openai_project_id(id: &str) -> bool {
+    is_prefixed_alnum_id(id, "proj_")
+}
+
+/// The validation message for a gateway-owned metadata key, or `None` for a key with
+/// no format contract.
+fn metadata_format_error(key: &str, value: &str) -> Option<String> {
+    let (ok, shape) = if key == ANTHROPIC_WORKSPACE_META {
+        (
+            is_valid_anthropic_workspace_id(value),
+            "'wrkspc_' followed by 8 to 64 ASCII letters or digits",
+        )
+    } else if key == OPENAI_ORGANIZATION_META {
+        (
+            is_valid_openai_organization_id(value),
+            "'org-' followed by 8 to 64 ASCII letters or digits",
+        )
+    } else if key == OPENAI_PROJECT_META {
+        (
+            is_valid_openai_project_id(value),
+            "'proj_' followed by 8 to 64 ASCII letters or digits",
+        )
+    } else {
+        return None;
+    };
+    if ok {
+        None
+    } else {
+        Some(format!("metadata {key} must be {shape}"))
+    }
+}
+
 /// Validate one credential metadata entry at write time (CLI `vultrino meta
 /// set`, `POST /api/v1/credentials`). Only keys with a format contract are checked.
 pub fn validate_credential_metadata_entry(key: &str, value: &str) -> Result<(), String> {
-    if key == ANTHROPIC_WORKSPACE_META && !is_valid_anthropic_workspace_id(value) {
-        return Err(format!(
-            "metadata {ANTHROPIC_WORKSPACE_META} must be 'wrkspc_' followed by 8 to 64 ASCII letters or digits"
-        ));
+    match metadata_format_error(key, value) {
+        Some(e) => Err(e),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// Whether a `UrlToken` secret can be put into a URL path without changing the URL's
