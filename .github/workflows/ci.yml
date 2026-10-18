@@ -110,7 +110,7 @@ jobs:
   formal-fast:
     name: formal register and fast mutants
     runs-on: ubuntu-latest
-    # About 56 minutes on main with 105 fast-tier mutants (measured); a cold
+    # 42 to 56 minutes on main at 105 fast mutants; about 60 at 110 (measured). A cold
     # dependency build (a Cargo.lock change, or a new cache key) adds several
     # minutes. 30 and then 60 were hit (issue #47, PR #74 runs).
     timeout-minutes: 90
