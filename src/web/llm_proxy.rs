@@ -741,7 +741,7 @@ async fn llm_proxy_impl(
     if use_streaming {
         return match state
             .server
-            .execute_gated_streaming(execute_request, exec_auth)
+            .execute_gated_streaming_llm_channel(execute_request, exec_auth)
             .await
         {
             Ok(crate::server::StreamingOutcome::Streaming(exec)) => {
@@ -805,7 +805,11 @@ async fn llm_proxy_impl(
         };
     }
 
-    match state.server.execute_gated(execute_request, exec_auth).await {
+    match state
+        .server
+        .execute_gated_llm_channel(execute_request, exec_auth)
+        .await
+    {
         Ok(ExecutionOutcome::Completed(response)) => {
             // Return the provider body + status verbatim (post egress-scrub, so no
             // model key ever reflects back). Preserve the provider Content-Type so

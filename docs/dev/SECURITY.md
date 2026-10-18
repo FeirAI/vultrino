@@ -324,6 +324,17 @@ every turn with `[llm_proxy] streaming_enabled = false`. See
 - A browser-originated MCP request's `Origin` must match the request `Host` or an
   entry in `VULTRINO_MCP_ALLOWED_ORIGINS`, else the MCP transport rejects it (`403`).
 
+## LLM credentials are `/llm`-only
+
+A credential referenced by an LLM-proxy capability can be used only through the
+metered `/llm` proxy. `POST /api/v1/execute`, the MCP `http_request` tool and named
+tools refuse it with `403` before policy evaluation, approval, use-token consumption,
+evidence or any upstream call, because those paths do not apply the channel's model
+allowlist, priced-model gate, price-modifier allowlist or output-token ceiling. A
+catalog that cannot be read refuses as well. This does not stop an operator from
+storing a second credential for the same provider that no LLM channel references; that
+credential is an ordinary credential, governed by its policies only.
+
 ## What Vultrino deliberately does NOT do
 
 - **No cumulative spend/budget accounting.** Only per-action, stateless SpendCap.

@@ -1538,6 +1538,7 @@ impl VultrinoServer {
         &self,
         request: ExecuteRequest,
         exec_auth: ExecAuth,
+        via_llm_channel: bool,
     ) -> Result<PreparedAction, VultrinoError> {
         let mut context = RequestContext::new();
 
@@ -1562,6 +1563,18 @@ impl VultrinoServer {
         // (V8) resolves to the canonical `plugin.action`; the label (if any) is
         // surfaced to the approver/audit.
         let credential = self.resolver.resolve(&request.credential).await?;
+
+        // LLM credentials are /llm-only. A credential that backs an LLM-proxy
+        // capability carries model spend; the generic dispatch paths (`/api/v1/execute`,
+        // MCP `http_request`, named tools) skip the /llm model allowlist, priced-model
+        // gate, price-modifier allowlist and output-token cap, so they must never reach
+        // it. Refused here, before policy evaluation, approval, use-token consumption or
+        // any evidence; an unreadable catalog also refuses (fail closed).
+        if !via_llm_channel {
+            self.refuse_llm_credential_off_channel(&credential.alias, &request.credential)
+                .await?;
+        }
+
         let (canonical_action, action_label) = self.config.resolve_action(&request.action);
         let (plugin_name, action_name) = parse_action(&canonical_action)?;
         let full_action = format!("{}.{}", plugin_name, action_name);
@@ -2164,7 +2177,30 @@ impl VultrinoServer {
         request: ExecuteRequest,
         exec_auth: ExecAuth,
     ) -> Result<ExecutionOutcome, VultrinoError> {
-        match self.prepare_execution(request, exec_auth).await? {
+        self.execute_gated_inner(request, exec_auth, false).await
+    }
+
+    /// The `/llm` proxy's entry: identical to [`Self::execute_gated`] except that it
+    /// may use a credential backing an LLM-proxy capability. Crate-private so no
+    /// other dispatch path can ask for the exemption.
+    pub(crate) async fn execute_gated_llm_channel(
+        &self,
+        request: ExecuteRequest,
+        exec_auth: ExecAuth,
+    ) -> Result<ExecutionOutcome, VultrinoError> {
+        self.execute_gated_inner(request, exec_auth, true).await
+    }
+
+    async fn execute_gated_inner(
+        &self,
+        request: ExecuteRequest,
+        exec_auth: ExecAuth,
+        via_llm_channel: bool,
+    ) -> Result<ExecutionOutcome, VultrinoError> {
+        match self
+            .prepare_execution(request, exec_auth, via_llm_channel)
+            .await?
+        {
             PreparedAction::Pending(approval) => Ok(ExecutionOutcome::Pending(approval)),
             PreparedAction::Ready(ready) => {
                 let response = self.run_action(*ready).await.map_err(|re| re.error)?;
@@ -3092,7 +3128,30 @@ impl VultrinoServer {
         request: ExecuteRequest,
         exec_auth: ExecAuth,
     ) -> Result<StreamingOutcome, VultrinoError> {
-        match self.prepare_execution(request, exec_auth).await? {
+        self.execute_gated_streaming_inner(request, exec_auth, false)
+            .await
+    }
+
+    /// Streaming twin of [`Self::execute_gated_llm_channel`] (the `/llm` proxy only).
+    pub(crate) async fn execute_gated_streaming_llm_channel(
+        &self,
+        request: ExecuteRequest,
+        exec_auth: ExecAuth,
+    ) -> Result<StreamingOutcome, VultrinoError> {
+        self.execute_gated_streaming_inner(request, exec_auth, true)
+            .await
+    }
+
+    async fn execute_gated_streaming_inner(
+        &self,
+        request: ExecuteRequest,
+        exec_auth: ExecAuth,
+        via_llm_channel: bool,
+    ) -> Result<StreamingOutcome, VultrinoError> {
+        match self
+            .prepare_execution(request, exec_auth, via_llm_channel)
+            .await?
+        {
             PreparedAction::Pending(approval) => Ok(StreamingOutcome::Pending(approval)),
             PreparedAction::Ready(ready) => {
                 let payload = ready.payload();
@@ -4497,6 +4556,45 @@ impl VultrinoServer {
     /// Trusted irreversibility for D3 floors: resolve from stored capability metadata
     /// (not requester-authored params). Production strict mode binds the executing
     /// credential as well as the canonical action or Govder label.
+    /// Refuse (403 `PolicyDenied`) a credential that backs any LLM-proxy capability
+    /// when the request did not arrive through `/llm`. Matches on the resolved alias
+    /// and on the alias as presented. A catalog that cannot be read refuses too.
+    async fn refuse_llm_credential_off_channel(
+        &self,
+        resolved_alias: &str,
+        presented: &str,
+    ) -> Result<(), VultrinoError> {
+        if let Err(error) = self.storage.reload().await {
+            tracing::error!(%error, "capability catalog reload failed while checking for an LLM credential");
+            return Err(VultrinoError::PolicyUnavailable(
+                "the capability catalog is unavailable, so Vultrino cannot establish whether \
+                 this credential is an LLM channel; nothing was executed"
+                    .to_string(),
+            ));
+        }
+        let caps = self.storage.list_capabilities().await.map_err(|error| {
+            tracing::error!(%error, "capability lookup failed while checking for an LLM credential");
+            VultrinoError::PolicyUnavailable(
+                "the capability catalog is unavailable, so Vultrino cannot establish whether \
+                 this credential is an LLM channel; nothing was executed"
+                    .to_string(),
+            )
+        })?;
+        let (a, b) = (resolved_alias.trim(), presented.trim());
+        if caps.iter().any(|cap| {
+            cap.is_llm_proxy() && {
+                let c = cap.credential_ref.trim();
+                c == a || c == b
+            }
+        }) {
+            return Err(VultrinoError::LlmChannelOnly(format!(
+                "credential '{resolved_alias}' is an LLM provider credential and is usable only \
+                 through the /llm proxy; nothing was executed"
+            )));
+        }
+        Ok(())
+    }
+
     async fn resolve_irreversibility_for_action(
         &self,
         credential_alias: &str,
@@ -6750,7 +6848,7 @@ mod tests {
             params: serde_json::json!({"url": "https://example.com/x", "method": "GET"}),
         };
         match server
-            .prepare_execution(read_request, ExecAuth::from_use_token(token.clone()))
+            .prepare_execution(read_request, ExecAuth::from_use_token(token.clone()), false)
             .await
             .expect("a read must not error")
         {
@@ -6769,7 +6867,7 @@ mod tests {
             params: serde_json::json!({"url": "https://example.com/x", "method": "POST"}),
         };
         match server
-            .prepare_execution(write_request, ExecAuth::from_use_token(token))
+            .prepare_execution(write_request, ExecAuth::from_use_token(token), false)
             .await
             .expect("preparing a gated write must not error")
         {

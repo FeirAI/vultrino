@@ -394,6 +394,14 @@ kernels.
 
 ## Documented-not-enforced / posture notes
 
+- **LLM credentials are `/llm`-only, by credential, not by provider.** A credential that
+  an LLM-proxy capability references is refused on `/api/v1/execute`, MCP `http_request`
+  and named tools. The marker is the capability's `credential_ref`: a second credential
+  holding the same provider key that no LLM capability references is an ordinary
+  credential and is not recognised as an LLM channel. Deleting the capability makes its
+  credential ordinary again. The check reads the capability catalog on every generic
+  dispatch (one extra catalog read per call).
+
 - **Reversibility truth remains operator authority.** Production `vultrino web`
   forces strict catalog posture: a catalog outage or missing exact declaration is
   refused, a presented label cannot borrow a canonical sibling, a request cannot
