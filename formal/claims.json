@@ -3674,6 +3674,11 @@
           "path": "src/storage/outbox_store.rs",
           "symbol": "OutboxStore::list_after_with_retention",
           "sha256": "bcbf290460e7df4b567ff9c40c154dd309bd0d295df23ffbac6f132fef02b2e1"
+        },
+        {
+          "path": "src/storage/outbox_store.rs",
+          "symbol": "OutboxStore::snapshot_of",
+          "sha256": "ff783111efa582008e1acc38fe4c561bd26251f4a7f200831e58d0b3aaea6e0e"
         }
       ],
       "mutants": [
