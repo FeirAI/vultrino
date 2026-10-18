@@ -19,7 +19,7 @@ boundary; production decides the same predicate with `Instant` and `Duration`.
 
 `iana-ipv4-special-registry-1.csv` and `iana-ipv6-special-registry-1.csv` are
 unmodified copies of the CSV files published by IANA, fetched with curl on
-2026-10-08 from:
+2026-10-18 from:
 
 - https://www.iana.org/assignments/iana-ipv4-special-registry/iana-ipv4-special-registry-1.csv
 - https://www.iana.org/assignments/iana-ipv6-special-registry/iana-ipv6-special-registry-1.csv
@@ -27,8 +27,8 @@ unmodified copies of the CSV files published by IANA, fetched with curl on
 SHA-256:
 
 ```text
-e3e39e76d00b1677335db8e9a805c7b9480ea2f4dc9e33f0b93cd3a905128d73  iana-ipv4-special-registry-1.csv
-775feea0621dec8735a44fbf30f762e721e8f0a1b3ab7eb341961a88cfce2139  iana-ipv6-special-registry-1.csv
+cbc4b7653c8bc640ba1e8e5d4ebbf11e7c7a1d867e7f1593aad001d3f8632aac  iana-ipv4-special-registry-1.csv
+bf56772aef97fbf9b4a27c98b8511f2bb1ba96da4b9ccc12ab203a2496faba66  iana-ipv6-special-registry-1.csv
 ```
 
 They are the input to the SSRF classifier specification in
@@ -41,7 +41,9 @@ Teredo 2001::/32 and 64:ff9b:1::/48 by an explicit rule, and decodes NAT64 over
 64:ff9b::/32 rather than only the /96 well-known prefix, to match the shipped
 decode (this only over-blocks). Rows the registry marks globally reachable but
 that sit inside a blocked row (192.0.0.9/32, 192.0.0.10/32, and the reachable
-rows inside 2001::/23) are blocked on purpose. The snapshots are refreshed by hand.
+rows inside 2001::/23) are blocked on purpose. The snapshots are refreshed by hand. The 2026-10-18 refresh changed only the
+formatting of the RFC citation column ("[RFC1918]" became "[RFC 1918]", multi-line
+citations became "; "-separated); no address block, flag or date changed.
 The scheduled `iana-snapshot-drift` CI job (daily, and on manual dispatch; not on
 pull requests) runs `formal/vectors/check-iana-drift.sh`, which downloads both
 files and compares them byte for byte with these copies; a difference or a
