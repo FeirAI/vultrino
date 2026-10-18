@@ -743,6 +743,15 @@
     },
     "llm-proxy-stream-uses-generic-entry": {
       "tier": "full"
+    },
+    "llm-refusal-spelling-only": {
+      "tier": "full"
+    },
+    "llm-refusal-before-tenant-gate": {
+      "tier": "full"
+    },
+    "llm-resume-refusal-removed": {
+      "tier": "full"
     }
   },
   "claims": [
@@ -895,12 +904,12 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::prepare_execution",
-          "sha256": "988296b828e918f533d0ca2ce2552341c1145a3dcaaf28190543666cfdb3e131"
+          "sha256": "750e753bebd2bf173c8e4357e728ac091d40714f0b9729e82f12283f73be3129"
         },
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::resume_approved",
-          "sha256": "e805ff78c78bda642a69a073d3bb3862017c1f511c6d773124680c7f2e368cfc"
+          "sha256": "5413c2aec031e35771fd684576b53126f3f35bb9faa12d16014b1177cefe12b6"
         },
         {
           "path": "src/server/mod.rs",
@@ -2519,7 +2528,7 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::resume_approved",
-          "sha256": "e805ff78c78bda642a69a073d3bb3862017c1f511c6d773124680c7f2e368cfc"
+          "sha256": "5413c2aec031e35771fd684576b53126f3f35bb9faa12d16014b1177cefe12b6"
         },
         {
           "path": "src/server/mod.rs",
@@ -2534,7 +2543,7 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::prepare_execution",
-          "sha256": "988296b828e918f533d0ca2ce2552341c1145a3dcaaf28190543666cfdb3e131"
+          "sha256": "750e753bebd2bf173c8e4357e728ac091d40714f0b9729e82f12283f73be3129"
         },
         {
           "path": "src/server/mod.rs",
@@ -3731,7 +3740,7 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::resume_approved",
-          "sha256": "e805ff78c78bda642a69a073d3bb3862017c1f511c6d773124680c7f2e368cfc"
+          "sha256": "5413c2aec031e35771fd684576b53126f3f35bb9faa12d16014b1177cefe12b6"
         },
         {
           "path": "src/server/mod.rs",
@@ -3842,25 +3851,26 @@
     },
     {
       "id": "llm-credential-channel-only",
-      "statement": "A credential referenced by an LLM-proxy capability (llm configured on a stored capability) is usable only through the /llm proxy. POST /api/v1/execute answers 403 llm_credential_channel_only and the MCP http_request tool returns the same refusal as a tool error, in both cases before policy evaluation, approval, use-token consumption, evidence or any upstream call: the upstream plugin is never invoked, no meter event is emitted and a one-use token keeps its use count of 0. A credential no LLM-proxy capability references still works through execute and http_request, and the /llm proxy (buffered and streaming) still works, because it alone calls the crate-private channel entries. A capability catalog that cannot be read refuses the request instead of admitting it.",
+      "statement": "A credential referenced by an LLM-proxy capability (llm configured on a stored capability) is usable only through the /llm proxy. The match is on credential identity: each such capability's credential_ref is resolved through the same resolver execution uses and compared by credential id with the credential being used, so a capability that names the credential by its vault id and a request that names it by alias (or the reverse) are both refused; the spelling comparison is kept as well. POST /api/v1/execute answers 403 llm_credential_channel_only and the MCP http_request tool returns the same refusal as a tool error, in both cases after the use-token scope and tenant-isolation checks (a cross-tenant or out-of-scope attempt keeps its own error and detect event) and before policy evaluation, approval, use-token consumption, evidence or any upstream call: the upstream plugin is never invoked, no meter event is emitted and a one-use token keeps its use count of 0. A credential no LLM-proxy capability references still works through execute and http_request, and the /llm proxy (buffered and streaming) still works, because it alone calls the crate-private channel entries. A capability catalog that cannot be read, or a credential_ref lookup that fails for a reason other than the credential not existing, refuses the request instead of admitting it. An approval on an LLM credential is never resumed: resume refuses it terminally, because the approval record does not say which channel opened it.",
       "method": "test",
       "artifacts": [
         "src/server/mod.rs",
         "src/web/llm_proxy.rs",
         "src/web/api.rs",
         "src/lib.rs",
-        "tests/llm_proxy_integration.rs"
+        "tests/llm_proxy_integration.rs",
+        "tests/approval_token_integration.rs"
       ],
       "gates": [
         "rust"
       ],
-      "detector": "set -e; cargo test --locked --no-default-features --test llm_proxy_integration llm_credential; cargo test --locked --no-default-features --test llm_proxy_integration non_llm_credential",
+      "detector": "set -e; cargo test --locked --no-default-features --test llm_proxy_integration llm_credential; cargo test --locked --no-default-features --test llm_proxy_integration non_llm_credential; cargo test --locked --no-default-features --test approval_token_integration llm_credential",
       "detector_kind": "cargo",
       "covers": [
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::refuse_llm_credential_off_channel",
-          "sha256": "8eaa83ef7fc02d6c2c37c87a4cc924f1fc7a1d74aebf0fb495e8b29f2d643c5d"
+          "sha256": "cb2fe7b6d038f2cde1d9438829802a1bee62a49f54511f9d04b6a6209bae7b0b"
         },
         {
           "path": "src/server/mod.rs",
@@ -3875,7 +3885,12 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::prepare_execution",
-          "sha256": "988296b828e918f533d0ca2ce2552341c1145a3dcaaf28190543666cfdb3e131"
+          "sha256": "750e753bebd2bf173c8e4357e728ac091d40714f0b9729e82f12283f73be3129"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::resume_approved",
+          "sha256": "5413c2aec031e35771fd684576b53126f3f35bb9faa12d16014b1177cefe12b6"
         },
         {
           "path": "src/web/api.rs",
@@ -3892,9 +3907,12 @@
         "llm-credential-refusal-removed",
         "llm-refusal-status-not-403",
         "llm-proxy-uses-generic-entry",
-        "llm-proxy-stream-uses-generic-entry"
+        "llm-proxy-stream-uses-generic-entry",
+        "llm-refusal-spelling-only",
+        "llm-refusal-before-tenant-gate",
+        "llm-resume-refusal-removed"
       ],
-      "does_not_establish": "That the unreadable-catalog refusal is exercised (no test injects a storage failure; the branch is a plain early return). That a provider key stored a second time as a credential that no LLM-proxy capability references is refused: it is an ordinary credential governed only by its policies. That the MCP named-tool and approval-resume paths are driven by their own test for this refusal: named tools reach the same prepare_execution check, and an approval can only be opened after that check passed, but only execute and http_request are driven here. The marker is the capability's credential_ref string matched against the resolved alias and the alias as presented, so a capability pointing at a credential by a spelling that differs in more than surrounding whitespace is not matched. One extra catalog read per generic dispatch is the cost. Model, price and token limits on /llm itself are covered by their own tests, not this claim."
+      "does_not_establish": "That the unreadable-catalog refusal is exercised (no test injects a storage failure; the branch is a plain early return). That a provider key stored a second time as a credential that no LLM-proxy capability references is refused: it is an ordinary credential governed only by its policies. That the MCP named-tool path is driven by its own test for this refusal: named tools reach the same prepare_execution check, but only execute and http_request are driven here. Resume is driven only for an approval opened before the credential backed an LLM channel; a /llm-opened approval is refused by the same unconditional check but is not separately driven. A capability whose credential_ref names no existing credential is matched by spelling only. The resolver is read once per LLM capability per generic dispatch; a credential created or renamed after the catalog read is judged by the state at that read. One extra catalog read per generic dispatch is the cost. Model, price and token limits on /llm itself are covered by their own tests, not this claim."
     }
   ]
 }

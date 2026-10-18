@@ -328,10 +328,15 @@ every turn with `[llm_proxy] streaming_enabled = false`. See
 
 A credential referenced by an LLM-proxy capability can be used only through the
 metered `/llm` proxy. `POST /api/v1/execute`, the MCP `http_request` tool and named
-tools refuse it with `403` before policy evaluation, approval, use-token consumption,
-evidence or any upstream call, because those paths do not apply the channel's model
-allowlist, priced-model gate, price-modifier allowlist or output-token ceiling. A
-catalog that cannot be read refuses as well. This does not stop an operator from
+tools refuse it with `403 llm_credential_channel_only` after the use-token scope and
+tenant-isolation checks (so a cross-tenant attempt keeps its own error and detect event)
+and before policy evaluation, approval, use-token consumption, evidence or any upstream
+call, because those paths do not apply the channel's model
+allowlist, priced-model gate, price-modifier allowlist or output-token ceiling. The match
+is on credential identity: the capability's `credential_ref` (alias or vault id) is
+resolved and compared by credential id, so naming the credential by a different spelling
+does not reach it. A catalog or credential lookup that fails refuses as well. An approval
+on an LLM credential is never resumed. This does not stop an operator from
 storing a second credential for the same provider that no LLM channel references; that
 credential is an ordinary credential, governed by its policies only.
 

@@ -396,11 +396,17 @@ kernels.
 
 - **LLM credentials are `/llm`-only, by credential, not by provider.** A credential that
   an LLM-proxy capability references is refused on `/api/v1/execute`, MCP `http_request`
-  and named tools. The marker is the capability's `credential_ref`: a second credential
-  holding the same provider key that no LLM capability references is an ordinary
+  and named tools. The marker is the capability's `credential_ref`, matched by credential
+  identity (an alias or a vault id naming the same credential both match); a
+  `credential_ref` that names no existing credential is matched by spelling only. A
+  second credential holding the same provider key that no LLM capability references is an ordinary
   credential and is not recognised as an LLM channel. Deleting the capability makes its
   credential ordinary again. The check reads the capability catalog on every generic
-  dispatch (one extra catalog read per call).
+  dispatch (one extra catalog read, plus one credential lookup per LLM capability, per
+  call). Approval resume refuses an LLM credential unconditionally, because the approval
+  record does not say which channel opened it; an approval opened on such a credential
+  through `execute` before this rule existed does not resume and must be re-requested
+  through `/llm`.
 
 - **Reversibility truth remains operator authority.** Production `vultrino web`
   forces strict catalog posture: a catalog outage or missing exact declaration is

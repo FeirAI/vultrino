@@ -114,8 +114,8 @@ the request carries its header, the resolved subject refines the principal.
 `400 execute_error` (policy denied, credential not found, SSRF block, plugin error;
 the message carries the reason);
 `403 llm_credential_channel_only` (the credential backs an LLM-proxy capability and is
-usable only through `/llm`; refused before policy, approval, use-token consumption or
-any upstream call).
+usable only through `/llm`; refused after the scope and tenant checks and before policy,
+approval, use-token consumption or any upstream call).
 
 ### `GET /api/v1/approvals/{id}` — poll/recover an approved action
 
@@ -598,8 +598,10 @@ the buffered-vs-streaming branch, so a `{"stream": true}` request cannot evade i
   the same credential elsewhere. `POST /api/v1/execute` answers
   `403 llm_credential_channel_only`; the MCP `http_request` tool and a named tool return
   the same refusal as a tool error. The refusal comes before policy evaluation, approval,
-  use-token consumption and any evidence or upstream call. If the capability catalog
-  cannot be read, the request is refused too. To call a provider outside `/llm`, store a
+  use-token consumption and any evidence or upstream call, and after the use-token scope
+  and tenant checks. The credential is matched by identity (alias or vault id). An
+  unreadable catalog or credential lookup refuses too, and an approval on an LLM
+  credential is not resumed. To call a provider outside `/llm`, store a
   separate credential that no LLM-proxy capability references.
 - **Provider gate:** the capability's protocol must be enabled via its
   `VULTRINO_PROVIDER_*_ENABLED` switch (default-deny) — else `403 provider_feature_disabled`.
