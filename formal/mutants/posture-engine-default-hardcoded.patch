@@ -1,8 +1,8 @@
 diff --git a/src/web/api.rs b/src/web/api.rs
-index 646c2ac..c3b51e7 100644
+index 17bc908..ed76e93 100644
 --- a/src/web/api.rs
 +++ b/src/web/api.rs
-@@ -3682,7 +3682,7 @@ pub async fn api_posture(admin: AdminApiAuth, State(state): State<AppState>) ->
+@@ -3701,7 +3701,7 @@ pub async fn api_posture(admin: AdminApiAuth, State(state): State<AppState>) ->
      let policies = engine.list_policies();
      let report = super::posture::build_posture(
          &state.config,
@@ -10,4 +10,4 @@ index 646c2ac..c3b51e7 100644
 +        true,
          &policies,
          &state.workload_verifier,
-     );
+         &state.storage.meter_loss(),
