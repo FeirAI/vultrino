@@ -22,7 +22,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -63,8 +63,17 @@ pub struct OutboxStore {
     markers_emitted: AtomicU64,
     /// Events pruned by the count cap since this process started (never reset).
     cap_pruned_total: AtomicU64,
-    /// The subset of those that were not Delivered (unread by any consumer).
+    /// The subset of those that were not Delivered, i.e. not acked by the push target (govder). In
+    /// poll-only mode (`outbox.enabled = false`) nothing is ever Delivered, so every prune counts
+    /// here. Vultrino cannot tell whether a poller (leria) read an event; a Delivered event may
+    /// still be unread by leria.
     cap_pruned_undelivered_total: AtomicU64,
+    /// GC passes in which the cap wanted to prune but its oldest event was protected by a staged
+    /// intent, so it pruned less than the excess (or nothing).
+    cap_blocked_total: AtomicU64,
+    /// True once this process has read the outbox file (or written it) successfully, so the
+    /// retention snapshot is not the empty never-loaded cache.
+    loaded_once: AtomicBool,
 }
 
 /// What one GC pass pruned.
@@ -74,6 +83,9 @@ pub struct GcOutcome {
     pub age_pruned: usize,
     /// Events pruned by the count cap.
     pub cap: CapPruned,
+    /// The cap wanted to prune more than it could because the oldest remaining event is
+    /// protected by a staged intent that was not cleared.
+    pub cap_blocked: bool,
 }
 
 impl GcOutcome {
@@ -103,7 +115,8 @@ impl CapPruned {
         *self.by_type.entry(e.event_type.clone()).or_insert(0) += 1;
     }
 
-    /// Pruned events that no consumer had acknowledged.
+    /// Pruned events the push target had not acked (not Delivered). This is a delivery state, not
+    /// a read state: vultrino cannot tell whether a poller read an event.
     pub fn undelivered(&self) -> usize {
         self.pruned
             .saturating_sub(self.by_state.get("delivered").copied().unwrap_or(0) as usize)
@@ -148,6 +161,8 @@ impl OutboxStore {
             markers_emitted: AtomicU64::new(0),
             cap_pruned_total: AtomicU64::new(0),
             cap_pruned_undelivered_total: AtomicU64::new(0),
+            cap_blocked_total: AtomicU64::new(0),
+            loaded_once: AtomicBool::new(false),
         }
     }
 
@@ -321,6 +336,25 @@ impl OutboxStore {
             .take(limit)
             .map(|(_, e)| e.clone())
             .collect())
+    }
+
+    /// [`Self::list_after`] plus the retention snapshot, both taken from ONE read of the cache, so
+    /// the unsigned hints on the events envelope cannot be skewed against the page by a concurrent
+    /// append or GC in this process.
+    pub async fn list_after_with_retention(
+        &self,
+        after: u64,
+        limit: usize,
+    ) -> Result<(Vec<OutboxEvent>, crate::outbox::OutboxRetentionSnapshot), StorageError> {
+        self.reload().await?;
+        let c = self.cache.read();
+        let page = c
+            .outbox
+            .range((after + 1)..)
+            .take(limit)
+            .map(|(_, e)| e.clone())
+            .collect();
+        Ok((page, self.snapshot_of(&c)))
     }
 
     /// Earliest-pending event per subject (read-only peek; no claim).
@@ -521,6 +555,7 @@ impl OutboxStore {
                         .take_while(|(_, e)| !is_protected(e))
                         .map(|(seq, _)| *seq)
                         .collect();
+                    out.cap_blocked = doomed.len() < excess;
                     for seq in doomed {
                         if let Some(e) = c.outbox.remove(&seq) {
                             out.cap.record(&e);
@@ -531,34 +566,76 @@ impl OutboxStore {
                 Ok((out, dirty))
             })
             .await?;
+        if outcome.cap_blocked {
+            self.cap_blocked_total.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                max_retained,
+                pruned = outcome.cap.pruned,
+                "outbox retention cap could not prune to the cap: the oldest retained event is protected \
+                 by a staged intent that was never cleared, so the outbox keeps growing; check the vault-side \
+                 intent clear (retained_events above max_retained_events in posture)"
+            );
+        }
         if outcome.cap.pruned > 0 {
             self.cap_pruned_total
                 .fetch_add(outcome.cap.pruned as u64, Ordering::Relaxed);
             self.cap_pruned_undelivered_total
                 .fetch_add(outcome.cap.undelivered() as u64, Ordering::Relaxed);
-            tracing::error!(
-                pruned = outcome.cap.pruned,
-                max_retained,
-                by_state = ?outcome.cap.by_state,
-                by_type = ?outcome.cap.by_type,
-                "outbox retention cap pruned the oldest events beyond max_retained_events; unread events \
-                 are lost to a slow consumer (it sees a sequence hole)"
-            );
+            let undelivered = outcome.cap.undelivered();
+            if undelivered > 0 {
+                tracing::error!(
+                    pruned = outcome.cap.pruned,
+                    undelivered,
+                    max_retained,
+                    by_state = ?outcome.cap.by_state,
+                    by_type = ?outcome.cap.by_type,
+                    "outbox retention cap pruned events the push target had not acked (in poll-only mode \
+                     every prune counts as undelivered); a consumer that had not read them sees a sequence hole"
+                );
+            } else {
+                tracing::info!(
+                    pruned = outcome.cap.pruned,
+                    max_retained,
+                    by_type = ?outcome.cap.by_type,
+                    "outbox retention cap pruned delivered events (acked by the push target); a poller that \
+                     had not read them sees a sequence hole"
+                );
+            }
         }
         Ok(outcome)
     }
 
     /// Retention view for posture, metrics and the events envelope. Reads the in-memory cache
-    /// (refreshed by every operation of this process and by the delivery loop), so it never
-    /// touches the file and is cheap enough for `/health`-class endpoints.
+    /// (refreshed by every operation of this process and by the delivery loop). A process that has
+    /// not yet touched the outbox (the file opens lazily) loads it once here, so the view is not a
+    /// healthy-looking empty cache; if that load fails, `loaded` is false and the other fields are
+    /// not to be trusted.
     pub fn retention_snapshot(&self) -> crate::outbox::OutboxRetentionSnapshot {
+        if !self.loaded_once.load(Ordering::Acquire) {
+            use tokio::runtime::{Handle, RuntimeFlavor};
+            let r = match Handle::try_current().map(|h| h.runtime_flavor()) {
+                Ok(RuntimeFlavor::MultiThread) => {
+                    tokio::task::block_in_place(|| self.reload_blocking())
+                }
+                _ => self.reload_blocking(),
+            };
+            if let Err(e) = r {
+                tracing::warn!(error = %e, "outbox retention snapshot could not load the outbox file");
+            }
+        }
         let c = self.cache.read();
+        self.snapshot_of(&c)
+    }
+
+    fn snapshot_of(&self, c: &OutboxCache) -> crate::outbox::OutboxRetentionSnapshot {
         crate::outbox::OutboxRetentionSnapshot {
+            loaded: self.loaded_once.load(Ordering::Acquire),
             retained_events: c.outbox.len() as u64,
             oldest_sequence: c.outbox.keys().next().copied(),
             last_sequence: c.outbox_seq,
             cap_pruned_total: self.cap_pruned_total.load(Ordering::Relaxed),
             cap_pruned_undelivered_total: self.cap_pruned_undelivered_total.load(Ordering::Relaxed),
+            cap_blocked_total: self.cap_blocked_total.load(Ordering::Relaxed),
         }
     }
 
@@ -602,6 +679,7 @@ impl OutboxStore {
         }
         *self.cache.write() = cache;
         *self.last_loaded.lock() = self.file_change_token();
+        self.loaded_once.store(true, Ordering::Release);
         Ok(result)
     }
 
@@ -621,12 +699,14 @@ impl OutboxStore {
         let _guard = flock.write().map_err(StorageError::Io)?;
         if let Some(token) = self.file_change_token() {
             if *self.last_loaded.lock() == Some(token) {
+                self.loaded_once.store(true, Ordering::Release);
                 return Ok(());
             }
         }
         let cache = self.read_from_disk()?;
         *self.cache.write() = cache;
         *self.last_loaded.lock() = self.file_change_token();
+        self.loaded_once.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -1358,6 +1438,89 @@ mod tests {
         assert_eq!(snap.retained_events, 2);
         assert_eq!(snap.oldest_sequence, Some(4));
         assert_eq!(snap.last_sequence, 5);
+    }
+
+    #[tokio::test]
+    async fn last_sequence_survives_the_age_stage_emptying_the_outbox() {
+        // The age stage prunes every delivered event: nothing is retained, but the highest
+        // assigned sequence still reads N (a poller at N-1 must not look "caught up" on a 0).
+        let (s, _d) = store();
+        for subj in ["A", "B", "C"] {
+            s.append(subj, "t", serde_json::json!({})).await.unwrap();
+        }
+        for seq in 1..=3 {
+            s.record_delivery(seq, true, None, 8).await.unwrap();
+        }
+        let out = s.gc_capped(0, usize::MAX, &HashSet::new()).await.unwrap();
+        assert_eq!(out.age_pruned, 3);
+        let snap = s.retention_snapshot();
+        assert_eq!(snap.retained_events, 0);
+        assert_eq!(snap.oldest_sequence, None);
+        assert_eq!(
+            snap.last_sequence, 3,
+            "last_sequence is outbox_seq, not the highest retained key"
+        );
+        let (page, hints) = s.list_after_with_retention(2, 100).await.unwrap();
+        assert!(page.is_empty());
+        assert_eq!(
+            hints.last_sequence, 3,
+            "an empty page with last_sequence > cursor is the hole rule"
+        );
+    }
+
+    #[tokio::test]
+    async fn cap_counters_tell_delivered_from_undelivered_prunes() {
+        let (s, _d) = store();
+        for subj in ["A", "B", "C", "D"] {
+            s.append(subj, "t", serde_json::json!({})).await.unwrap();
+        }
+        s.record_delivery(1, true, None, 8).await.unwrap(); // seq 1 delivered, 2 and 3 pending
+        let out = s.gc_capped(NO_AGE, 1, &HashSet::new()).await.unwrap();
+        assert_eq!(out.cap.pruned, 3);
+        assert_eq!(out.cap.undelivered(), 2);
+        let snap = s.retention_snapshot();
+        assert_eq!(snap.cap_pruned_total, 3);
+        assert_eq!(
+            snap.cap_pruned_undelivered_total, 2,
+            "the delivered one is not counted"
+        );
+    }
+
+    #[tokio::test]
+    async fn cap_blocked_by_a_staged_intent_is_counted() {
+        let (s, _d) = store();
+        s.append_deduped("d1", "A", "t", serde_json::json!({}))
+            .await
+            .unwrap(); // 1, staged intent that is never cleared
+        for subj in ["B", "C", "D"] {
+            s.append(subj, "t", serde_json::json!({})).await.unwrap();
+        }
+        let mut protected = HashSet::new();
+        protected.insert("d1".to_string());
+        let out = s.gc_capped(NO_AGE, 2, &protected).await.unwrap();
+        assert_eq!(out.cap.pruned, 0);
+        assert!(out.cap_blocked);
+        assert_eq!(s.retention_snapshot().cap_blocked_total, 1);
+        // Within the cap nothing is blocked.
+        let out = s.gc_capped(NO_AGE, 10, &protected).await.unwrap();
+        assert!(!out.cap_blocked);
+        assert_eq!(s.retention_snapshot().cap_blocked_total, 1);
+    }
+
+    #[tokio::test]
+    async fn a_process_that_never_touched_the_outbox_reports_the_real_retention() {
+        let (s, dir) = store();
+        for subj in ["A", "B", "C"] {
+            s.append(subj, "t", serde_json::json!({})).await.unwrap();
+        }
+        // A second store over the same file has not opened it yet (the file opens lazily).
+        let key = Arc::new(MasterKey::from_bytes(vec![7u8; 32]).unwrap());
+        let fresh = OutboxStore::new(dir.path().join("outbox.enc"), key);
+        let snap = fresh.retention_snapshot();
+        assert!(snap.loaded);
+        assert_eq!(snap.retained_events, 3, "not a healthy-looking empty cache");
+        assert_eq!(snap.oldest_sequence, Some(1));
+        assert_eq!(snap.last_sequence, 3);
     }
 
     #[tokio::test]

@@ -506,21 +506,14 @@ kernels.
   `receipt_gaps_overflowed` but not recorded individually. A process that dies between the
   action and the enqueue of its seal leaves neither a receipt nor a gap. A gap names an action
   that ran without a receipt; it does not say whether the action's own side effect succeeded.
-  **The outbox is capped, and the cap drops unread events.** `[outbox] max_retained_events`
-  (default 2000) bounds the retained events because every outbox operation rewrites the whole
-  file, so its cost is O(retained), bounded by the cap but not constant. The GC tick prunes the
-  oldest events beyond the cap whether or not they were delivered or read (never past a staged
-  intent). A consumer that is down for longer than the cap window loses the events it had not
-  read, and sees a hole in the signed sequences (and in the `oldest_sequence` hint); detecting
-  it and acting on it is the consumer's job. An undelivered approval event pruned this way is
-  lost (counted, not recovered). The counters are per process and reset on restart, and the
-  hints are unsigned.
-  **The gap event is not a permanent record on vultrino's side.** The outbox prunes every event
-  older than `[outbox] retention_secs` (default **2 days**), delivered or not, so a gap nobody
-  consumed in that window is gone. The consumer is govder: it receives the signed push on its
+  **The gap event is not a permanent record on vultrino's side.** The outbox prunes a delivered
+  event older than `[outbox] retention_secs` (default **2 days**), and the oldest events beyond
+  `[outbox] max_retained_events` whether or not delivered, so a gap survives the shorter of the
+  two windows (about an hour at the default cap on a busy host) and an undelivered gap beyond the
+  cap is dropped; a gap nobody consumed in that window is gone. The consumer is govder: it receives the signed push on its
   approval webhook, stores each gap (in Postgres when configured, otherwise in memory) before it
   acknowledges the delivery, and lists them per tenant on `GET /v1/evidence/receipt-gaps`. If
-  govder is down or unreachable for longer than the retention window, or has no push target
+  govder is down or unreachable for longer than the shorter of those windows, or has no push target
   configured, the gaps in that window are lost. leria ignores the event type; nothing pages anyone
   about a gap. See govder `docs/dev/API.md`.
   A declared human-floor capability, or a bare canonical verb shared by configured
@@ -567,6 +560,22 @@ kernels.
   is down in both modes. Whether an operator declared the real side effect
   truthfully is not checked, so the default mode's money line is only as good as the
   catalog's `reversibility` and the `money.*` naming.
+
+- **The outbox is capped, and the cap drops events a consumer may not have read.**
+  `[outbox] max_retained_events` (default 2000) bounds the retained events because every outbox
+  operation rewrites the whole file, so its cost is O(retained), bounded by the cap but not constant.
+  The GC tick prunes the oldest events beyond the cap whatever their delivery state (never past a
+  staged intent). A consumer that is down for longer than the cap window loses the events it had
+  not read, and sees a hole in the signed sequences (and in the `oldest_sequence` hint); detecting
+  it and acting on it is the consumer's job. Vultrino cannot tell whether a poller read an event:
+  in push mode `Delivered` means govder acked it, not that leria read it, and in poll-only mode
+  (`outbox.enabled = false`) nothing is ever `Delivered`. `cap_pruned_undelivered_total` therefore
+  counts events the push target had not acked, not unread events, and leria's hole detection is the
+  only unread-loss signal. An undelivered approval event pruned this way is lost (counted, not
+  recovered). The GC runs every 60 delivery passes, not on a wall-clock timer, so a hung push
+  target stretches the interval and the retained count can exceed the cap by more than the
+  steady-state rate times 5 minutes. The counters are per process and reset on restart, and the
+  hints are unsigned.
 - **An `internal_http` capability's HTTP verb is operator authority, and the agent
   may not send one.** The transport requires `method`, so a capability registered
   through the admin API must make it decidable: exactly one `target.methods` entry,

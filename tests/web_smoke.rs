@@ -9411,7 +9411,12 @@ async fn events_envelope_reports_oldest_and_last_sequence() {
     assert_eq!(full["oldest_sequence"], 1);
     assert_eq!(full["last_sequence"], 5);
 
-    // The cap prunes the 3 oldest; the hints move, the first event is seq 4.
+    // The cap prunes the 3 oldest; the hints move, the first event is seq 4. One of the pruned
+    // events was delivered, so the two counters differ.
+    assert!(storage
+        .record_event_delivery(2, true, None, 8)
+        .await
+        .unwrap());
     assert_eq!(storage.gc_outbox(u64::MAX, 2).await.unwrap(), 3);
     let capped = feed(router.clone(), key.clone()).await;
     assert_eq!(capped["oldest_sequence"], 4, "{capped}");
@@ -9436,7 +9441,9 @@ async fn events_envelope_reports_oldest_and_last_sequence() {
     assert_eq!(posture["outbox"]["oldest_sequence"], 4);
     assert_eq!(posture["outbox"]["last_sequence"], 5);
     assert_eq!(posture["outbox"]["cap_pruned_total"], 3);
-    assert_eq!(posture["outbox"]["cap_pruned_undelivered_total"], 3);
+    assert_eq!(posture["outbox"]["cap_pruned_undelivered_total"], 2);
+    assert_eq!(posture["outbox"]["snapshot_loaded"], true);
+    assert_eq!(posture["outbox"]["cap_blocked_total"], 0);
 
     // Metrics reports the same numbers under `outbox`.
     let resp = router
@@ -9453,5 +9460,29 @@ async fn events_envelope_reports_oldest_and_last_sequence() {
     assert_eq!(metrics["outbox"]["max_retained_events"], 2000);
     assert_eq!(metrics["outbox"]["retained_events"], 2);
     assert_eq!(metrics["outbox"]["cap_pruned_total"], 3);
-    assert_eq!(metrics["outbox"]["cap_pruned_undelivered_total"], 3);
+    assert_eq!(metrics["outbox"]["cap_pruned_undelivered_total"], 2);
+
+    // The age stage then prunes every delivered event: the outbox is empty, but the envelope
+    // still reports last_sequence 5 (so a poller at 4 sees an empty page with last_sequence >
+    // cursor) and oldest_sequence null.
+    for seq in [4, 5] {
+        assert!(storage
+            .record_event_delivery(seq, true, None, 8)
+            .await
+            .unwrap());
+    }
+    assert_eq!(storage.gc_outbox(0, 2000).await.unwrap(), 2);
+    let resp = router
+        .oneshot(admin_req(
+            "GET",
+            "/api/v1/events?after=4",
+            &key,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    let emptied: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    assert!(emptied["oldest_sequence"].is_null(), "{emptied}");
+    assert_eq!(emptied["last_sequence"], 5, "{emptied}");
+    assert_eq!(emptied["events"].as_array().unwrap().len(), 0);
 }

@@ -688,6 +688,18 @@ pub trait StorageBackend: Send + Sync {
         crate::outbox::OutboxRetentionSnapshot::default()
     }
 
+    /// One page of events after a cursor together with the retention snapshot taken from the same
+    /// read, so the unsigned hints on the events envelope are consistent with the page. The default
+    /// reads them separately (a backend that keeps no outbox has nothing to skew).
+    async fn list_events_page(
+        &self,
+        after: u64,
+        limit: usize,
+    ) -> Result<(Vec<OutboxEvent>, crate::outbox::OutboxRetentionSnapshot), StorageError> {
+        let events = self.list_events_after(after, limit).await?;
+        Ok((events, self.outbox_retention()))
+    }
+
     /// The next deliverable pending events (V9): the earliest still-pending event
     /// per subject (so per-subject ordering is preserved — a later event for a
     /// subject is withheld until its earlier one is delivered), ascending by

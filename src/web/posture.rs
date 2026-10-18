@@ -150,9 +150,10 @@ pub(crate) fn build_posture(
             "last_failure_at": meter.last_lost_at,
         },
         // Outbox retention: the count cap, what is retained now and how many events the cap has
-        // pruned (the unread ones are lost to a slow consumer, which sees a sequence hole). The
-        // counters are per process. A non-zero `cap_pruned_undelivered_total` means a consumer
-        // fell behind the cap window.
+        // pruned. `cap_pruned_undelivered_total` counts pruned events the push target had not
+        // acked (in poll-only mode every prune counts); it is a delivery state, not a read state:
+        // vultrino cannot tell whether a poller read an event, and leria's sequence-hole
+        // detection is the only unread-loss signal. The counters are per process.
         "outbox": {
             "max_retained_events": config.outbox.max_retained_events,
             "retained_events": retention.retained_events,
@@ -160,6 +161,8 @@ pub(crate) fn build_posture(
             "last_sequence": retention.last_sequence,
             "cap_pruned_total": retention.cap_pruned_total,
             "cap_pruned_undelivered_total": retention.cap_pruned_undelivered_total,
+            "cap_blocked_total": retention.cap_blocked_total,
+            "snapshot_loaded": retention.loaded,
         },
         // FEI-40: keyed fingerprints of the shared secrets this process holds, per relationship
         // (see crate::secret_fp). The verifier compares them with the other planes' to find a

@@ -3539,6 +3539,20 @@ impl StorageBackend for FileStorage {
         self.outbox.replay_dead_letter(sequence).await
     }
 
+    async fn list_events_page(
+        &self,
+        after: u64,
+        limit: usize,
+    ) -> Result<
+        (
+            Vec<crate::outbox::OutboxEvent>,
+            crate::outbox::OutboxRetentionSnapshot,
+        ),
+        StorageError,
+    > {
+        self.outbox.list_after_with_retention(after, limit).await
+    }
+
     fn outbox_retention(&self) -> crate::outbox::OutboxRetentionSnapshot {
         self.outbox.retention_snapshot()
     }

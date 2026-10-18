@@ -4004,6 +4004,8 @@ pub async fn api_metrics(admin: AdminApiAuth, State(state): State<AppState>) -> 
             "last_sequence": retention.last_sequence,
             "cap_pruned_total": retention.cap_pruned_total,
             "cap_pruned_undelivered_total": retention.cap_pruned_undelivered_total,
+            "cap_blocked_total": retention.cap_blocked_total,
+            "snapshot_loaded": retention.loaded,
         },
     });
     // Plan 087 — insert the seal counters ONLY when [averin] is enabled, so the
@@ -4044,8 +4046,8 @@ pub async fn api_list_events(
         return resp;
     }
     let limit = q.limit.unwrap_or(100).min(1000);
-    match state.storage.list_events_after(q.after, limit).await {
-        Ok(events) => {
+    match state.storage.list_events_page(q.after, limit).await {
+        Ok((events, retention)) => {
             // The next cursor is the highest sequence returned (or the request's
             // `after` if none) — what the consumer persists for the next poll.
             let next = events.last().map(|e| e.sequence).unwrap_or(q.after);
@@ -4073,10 +4075,10 @@ pub async fn api_list_events(
             let gap_pending = state.storage.meter_loss().gap_pending;
             // Retention hints (unsigned, like `meter_gap_pending`): the lowest retained and the
             // highest assigned sequence. A poller whose cursor is below `oldest_sequence - 1`, or
-            // whose page is empty while `last_sequence > cursor`, has lost events to the cap. The
-            // signed sequence hole stays the authoritative signal. The cache was refreshed by the
-            // read above.
-            let retention = state.storage.outbox_retention();
+            // whose page is empty while `last_sequence > cursor`, may have lost events to the cap.
+            // The signed sequence hole stays the authoritative signal. The hints come from the
+            // same read as the page (`list_events_page`), so a concurrent append or GC cannot skew
+            // them against it.
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
