@@ -39,3 +39,4 @@ credentials.enc
 # Local review/handoff working docs (not part of the codebase)
 /REVIEW.md
 /expansion-integration.md
+__pycache__/

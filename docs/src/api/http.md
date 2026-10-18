@@ -69,7 +69,9 @@ The body is **flat** (not nested under `params`):
 **`202`** → `{ "outcome": "pending_approval", "approval_id": "appr_…", … }` — the
 action did **not** run; poll the approval.
 **Errors:** `401` (bad bearer); `403 token_unusable` (revoked/expired/exhausted
-token); `400 execute_error` (policy denied, credential not found, SSRF block).
+token); `403 llm_credential_channel_only` (the credential backs an LLM channel and is
+usable only through `/llm`); `400 execute_error` (policy denied, credential not found,
+SSRF block).
 
 ### `GET /api/v1/approvals/{id}` — poll/recover an approved action
 

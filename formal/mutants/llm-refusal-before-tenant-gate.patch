@@ -1,0 +1,46 @@
+diff --git a/src/server/mod.rs b/src/server/mod.rs
+index a6b7ef8..c2c261a 100644
+--- a/src/server/mod.rs
++++ b/src/server/mod.rs
+@@ -1568,6 +1568,20 @@ impl VultrinoServer {
+         let (plugin_name, action_name) = parse_action(&canonical_action)?;
+         let full_action = format!("{}.{}", plugin_name, action_name);
+ 
++        // LLM credentials are /llm-only. A credential that backs an LLM-proxy
++        // capability carries model spend; the generic dispatch paths (`/api/v1/execute`,
++        // MCP `http_request`, named tools) skip the /llm model allowlist, priced-model
++        // gate, price-modifier allowlist and output-token cap, so they must never reach
++        // it. Matched on credential identity (id), not spelling. Placed AFTER the use-token
++        // scope check and the V11 tenant gate so a cross-tenant or out-of-scope attempt
++        // keeps its own error, detect event and counter and learns nothing about the
++        // credential; still before policy evaluation, approval, use-token consumption,
++        // evidence or any upstream call. An unreadable catalog or resolver refuses.
++        if !via_llm_channel {
++            self.refuse_llm_credential_off_channel(&credential, &request.credential)
++                .await?;
++        }
++
+         // Authoritative use-token scope enforcement at the seam where the token
+         // is actually spent — both credential and action scope, so the token's
+         // single-action restriction is defended in depth rather than only at the
+@@ -1634,20 +1648,6 @@ impl VultrinoServer {
+             }
+         }
+ 
+-        // LLM credentials are /llm-only. A credential that backs an LLM-proxy
+-        // capability carries model spend; the generic dispatch paths (`/api/v1/execute`,
+-        // MCP `http_request`, named tools) skip the /llm model allowlist, priced-model
+-        // gate, price-modifier allowlist and output-token cap, so they must never reach
+-        // it. Matched on credential identity (id), not spelling. Placed AFTER the use-token
+-        // scope check and the V11 tenant gate so a cross-tenant or out-of-scope attempt
+-        // keeps its own error, detect event and counter and learns nothing about the
+-        // credential; still before policy evaluation, approval, use-token consumption,
+-        // evidence or any upstream call. An unreadable catalog or resolver refuses.
+-        if !via_llm_channel {
+-            self.refuse_llm_credential_off_channel(&credential, &request.credential)
+-                .await?;
+-        }
+-
+         // Evaluate policy (URL / method / rate limits / principal / spend). A
+         // `Prompt` decision routes into the approval flow rather than failing.
+         // SB-03: the URL policy judges is the canonical URL with the caller's

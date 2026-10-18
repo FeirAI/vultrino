@@ -411,6 +411,11 @@ pub async fn api_execute(
             })),
         )
             .into_response(),
+        Err(e @ crate::VultrinoError::LlmChannelOnly(_)) => error_response(
+            StatusCode::FORBIDDEN,
+            "llm_credential_channel_only",
+            e.to_string(),
+        ),
         Err(e) => error_response(StatusCode::BAD_REQUEST, "execute_error", e.to_string()),
     }
 }

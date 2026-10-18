@@ -1,0 +1,13 @@
+diff --git a/src/web/llm_proxy.rs b/src/web/llm_proxy.rs
+index a87bcfc..31374e5 100644
+--- a/src/web/llm_proxy.rs
++++ b/src/web/llm_proxy.rs
+@@ -741,7 +741,7 @@ async fn llm_proxy_impl(
+     if use_streaming {
+         return match state
+             .server
+-            .execute_gated_streaming_llm_channel(execute_request, exec_auth)
++            .execute_gated_streaming(execute_request, exec_auth)
+             .await
+         {
+             Ok(crate::server::StreamingOutcome::Streaming(exec)) => {
