@@ -93,6 +93,12 @@ pub enum VultrinoError {
 
     #[error("Invalid request: {0}")]
     InvalidRequest(String),
+
+    /// The credential backs an LLM-proxy capability and was presented to a generic
+    /// dispatch path (`/api/v1/execute`, MCP `http_request`, a named tool). LLM
+    /// credentials are usable only through `/llm`; the HTTP API answers 403.
+    #[error("LLM credential is /llm-only: {0}")]
+    LlmChannelOnly(String),
 }
 
 /// The type of credential stored

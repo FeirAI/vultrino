@@ -1,0 +1,13 @@
+diff --git a/src/web/api.rs b/src/web/api.rs
+index d034f1a..d78a0f0 100644
+--- a/src/web/api.rs
++++ b/src/web/api.rs
+@@ -412,7 +412,7 @@ pub async fn api_execute(
+         )
+             .into_response(),
+         Err(e @ crate::VultrinoError::LlmChannelOnly(_)) => error_response(
+-            StatusCode::FORBIDDEN,
++            StatusCode::BAD_REQUEST,
+             "llm_credential_channel_only",
+             e.to_string(),
+         ),

@@ -1,0 +1,13 @@
+diff --git a/src/web/llm_proxy.rs b/src/web/llm_proxy.rs
+index a87bcfc..d90e872 100644
+--- a/src/web/llm_proxy.rs
++++ b/src/web/llm_proxy.rs
+@@ -807,7 +807,7 @@ async fn llm_proxy_impl(
+ 
+     match state
+         .server
+-        .execute_gated_llm_channel(execute_request, exec_auth)
++        .execute_gated(execute_request, exec_auth)
+         .await
+     {
+         Ok(ExecutionOutcome::Completed(response)) => {
