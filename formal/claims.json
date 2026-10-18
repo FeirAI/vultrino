@@ -737,6 +737,26 @@
       "tier": "fast",
       "claim": "anthropic-workspace-id-operator-owned"
     },
+    "openai-scope-server-strip-removed": {
+      "tier": "fast",
+      "claim": "openai-org-project-operator-owned"
+    },
+    "openai-scope-plugin-strip-removed": {
+      "tier": "full",
+      "claim": "openai-org-project-operator-owned"
+    },
+    "openai-scope-not-injected": {
+      "tier": "full",
+      "claim": "openai-org-project-operator-owned"
+    },
+    "openai-scope-use-time-recheck-removed": {
+      "tier": "full",
+      "claim": "openai-org-project-operator-owned"
+    },
+    "openai-id-format-check-removed": {
+      "tier": "full",
+      "claim": "openai-org-project-operator-owned"
+    },
     "unpriced-gate-default-off": {
       "tier": "full",
       "claim": "unpriced-model-refused"
@@ -1006,26 +1026,6 @@
     "posture-averin-api-key-configured-hardcoded-false": {
       "tier": "full"
     },
-    "outbox-cap-ignored": {
-      "tier": "fast",
-      "claim": "outbox-retention-bounded"
-    },
-    "outbox-cap-prunes-protected": {
-      "tier": "full",
-      "claim": "outbox-retention-bounded"
-    },
-    "outbox-cap-off-by-one": {
-      "tier": "full",
-      "claim": "outbox-retention-bounded"
-    },
-    "outbox-cap-not-counted": {
-      "tier": "full",
-      "claim": "outbox-retention-bounded"
-    },
-    "outbox-envelope-oldest-wrong": {
-      "tier": "full",
-      "claim": "outbox-retention-bounded"
-    },
     "llm-credential-refusal-removed": {
       "tier": "fast"
     },
@@ -1046,6 +1046,26 @@
     },
     "llm-resume-refusal-removed": {
       "tier": "full"
+    },
+    "outbox-cap-ignored": {
+      "tier": "fast",
+      "claim": "outbox-retention-bounded"
+    },
+    "outbox-cap-prunes-protected": {
+      "tier": "full",
+      "claim": "outbox-retention-bounded"
+    },
+    "outbox-cap-off-by-one": {
+      "tier": "full",
+      "claim": "outbox-retention-bounded"
+    },
+    "outbox-cap-not-counted": {
+      "tier": "full",
+      "claim": "outbox-retention-bounded"
+    },
+    "outbox-envelope-oldest-wrong": {
+      "tier": "full",
+      "claim": "outbox-retention-bounded"
     },
     "outbox-gc-loop-cap-unwired": {
       "tier": "full",
@@ -1074,6 +1094,10 @@
     "outbox-snapshot-loaded-hardcoded": {
       "tier": "full",
       "claim": "outbox-retention-bounded"
+    },
+    "llm-x-goog-user-project-forwarded": {
+      "tier": "full",
+      "claim": "openai-org-project-operator-owned"
     }
   },
   "claims": [
@@ -1226,7 +1250,7 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::prepare_execution",
-          "sha256": "750e753bebd2bf173c8e4357e728ac091d40714f0b9729e82f12283f73be3129"
+          "sha256": "934cd66017dd93b85284c9cb7e92d6857133b7ab18c2f3c9828e2efd66ffceef"
         },
         {
           "path": "src/server/mod.rs",
@@ -2856,17 +2880,17 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::run_action_streaming",
-          "sha256": "851408807309d2dd4ed58b49cf7e8dde00b9f4c8826b7f029092158e633219e0"
+          "sha256": "feb16191ec18bdc75a9c1acc4fe2d4e9c27051af2396197bde91307e4088b704"
         },
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::run_action",
-          "sha256": "96be35cc9c4181ee34b6e0b4cf422ffe71b994f4afbd01d01ab1bf811bfd3f15"
+          "sha256": "c2959c40c277bbb4a6d0e5ce1dbefd45978aa0d3913ac7ee3ffec32cdc0de140"
         },
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::prepare_execution",
-          "sha256": "750e753bebd2bf173c8e4357e728ac091d40714f0b9729e82f12283f73be3129"
+          "sha256": "934cd66017dd93b85284c9cb7e92d6857133b7ab18c2f3c9828e2efd66ffceef"
         },
         {
           "path": "src/server/mod.rs",
@@ -3656,71 +3680,6 @@
       "does_not_establish": "The counters and the pending marker are held in memory: if the process exits before an append succeeds again the marker is never written, and a consumer's stale watermark is the only remaining signal. Failures are produced by one injected fault (an unwritable temp path), not by a real full disk or a failing fsync. Only the direct append path is counted; events staged in the vault and drained later are retried by the reconciler instead. That a consumer acts on the marker is the leria claim for its poller, not this one. Says nothing about events lost while the process is down or about the outbox being tampered with. Failed appends do not fail the metered call: vultrino keeps admitting calls during an outage, and the pending count is the only in-band signal until the marker (so the fail-open choice stands and the consumer's watermark is the control). The count is in the unsigned envelope. That the consumer acts on it is the leria claim meter-lost-marker-holds-as-of."
     },
     {
-      "id": "outbox-retention-bounded",
-      "statement": "The signed outbox store keeps at most outbox.max_retained_events events (the store's GC; the timed loop wiring is covered by a separate sentence below). In the unit tests of the real outbox store, with the age window switched off so only the cap acts: when more events are retained than the cap, the GC prunes the oldest events beyond it whatever their delivery state (a pending, a dead-lettered and a delivered event are all pruned) and keeps a contiguous suffix of exactly the cap; it never prunes at or past an event whose staged-intent dedup id is still protected (it prunes only the events below it, and proceeds once the intent is cleared); a pass at or under the cap prunes nothing; a pass counts what it pruned by delivery state and by event type and adds them to the per-process counters cap_pruned_total and cap_pruned_undelivered_total; the cap still applies when the age cutoff cannot be represented. Below the cap an undelivered pending or dead-lettered event is still never pruned by the age stage. A poller whose cursor is behind the cap sees a sequence hole (its next event is above cursor + 1). Config load refuses max_retained_events below 100 or above 100000 and defaults it to 2000. In the web smoke test, GET /api/v1/events carries the unsigned hints oldest_sequence (null when nothing is retained) and last_sequence (which survives pruning, including when the age stage prunes every delivered event so that nothing is retained, oldest_sequence is null and last_sequence is still the highest assigned), and GET /api/v1/posture and GET /api/v1/metrics report max_retained_events, retained_events, oldest_sequence, last_sequence, cap_pruned_total and cap_pruned_undelivered_total (the two differ when a pruned event was delivered: the second counts events the push target had not acked, not events nobody read), cap_blocked_total (GC passes where a staged intent that was never cleared stopped the cap) and snapshot_loaded (true once this process has read the outbox file; the first report of a process that has not touched the outbox loads it instead of reporting an empty cache, and is false when that load fails, e.g. on an undecryptable file, so the other fields are then not to be trusted). The first page served by a fresh store over an existing file (a restart before the delivery loop has run) reloads the file, so it carries the retained events and the real last_sequence rather than an empty page with last_sequence 0. The page and the retention hints of GET /api/v1/events come from one read of the cache (list_events_page). The delivery loop's GC runs on wall-clock time and, driven at a 1 ms interval in a test, caps an outbox above max_retained_events to exactly the cap.",
-      "method": "test",
-      "artifacts": [
-        "src/storage/outbox_store.rs",
-        "src/storage/file.rs",
-        "src/config/types.rs",
-        "src/web/api.rs",
-        "src/web/posture.rs",
-        "src/server/mod.rs",
-        "tests/web_smoke.rs"
-      ],
-      "gates": [
-        "rust"
-      ],
-      "detector": "cargo test --locked --no-default-features --lib -- --exact storage::outbox_store::tests::cap_prunes_oldest_beyond_max_even_when_undelivered storage::outbox_store::tests::cap_stops_at_a_staged_intent storage::outbox_store::tests::cap_counts_pruned_by_state_and_type storage::outbox_store::tests::a_poller_behind_the_cap_sees_a_hole storage::outbox_store::tests::the_cap_applies_when_the_age_window_is_unrepresentable storage::outbox_store::tests::last_sequence_survives_the_age_stage_emptying_the_outbox storage::outbox_store::tests::cap_counters_tell_delivered_from_undelivered_prunes storage::outbox_store::tests::cap_blocked_by_a_staged_intent_is_counted storage::outbox_store::tests::a_process_that_never_touched_the_outbox_reports_the_real_retention storage::outbox_store::tests::the_first_page_after_a_restart_reloads_the_file storage::outbox_store::tests::a_snapshot_over_an_unreadable_outbox_file_reports_not_loaded server::durable_enqueue_tests::the_delivery_loop_gc_enforces_the_retention_cap storage::outbox_store::tests::gc_below_the_cap_never_prunes_an_undelivered_pending_event storage::outbox_store::tests::gc_below_the_cap_never_prunes_a_dead_lettered_event config::types::tests::max_retained_below_floor_refused && cargo test --locked --no-default-features --test web_smoke -- --exact events_envelope_reports_oldest_and_last_sequence",
-      "covers": [
-        {
-          "path": "src/storage/outbox_store.rs",
-          "symbol": "OutboxStore::gc_capped",
-          "sha256": "3d797742cf21eebcdabf11ea0cf3aa5f590197903bd7f892e53285974c564235"
-        },
-        {
-          "path": "src/storage/outbox_store.rs",
-          "symbol": "OutboxStore::retention_snapshot",
-          "sha256": "25f6041322c04dd6d0280225059d7082f5058536580b63d25b37126d66ace300"
-        },
-        {
-          "path": "src/web/api.rs",
-          "symbol": "api_list_events",
-          "sha256": "df53d49bf52085d033bbfb0db122567023789254554fac8e9e60d36dc7510f9d"
-        },
-        {
-          "path": "src/server/mod.rs",
-          "symbol": "deliver_outbox_periodically",
-          "sha256": "5af6b5520a50099c8dd4b95fa6a40133316210aef55df76047079d1a69da8cd8"
-        },
-        {
-          "path": "src/storage/outbox_store.rs",
-          "symbol": "OutboxStore::list_after_with_retention",
-          "sha256": "bcbf290460e7df4b567ff9c40c154dd309bd0d295df23ffbac6f132fef02b2e1"
-        },
-        {
-          "path": "src/storage/outbox_store.rs",
-          "symbol": "OutboxStore::snapshot_of",
-          "sha256": "ff783111efa582008e1acc38fe4c561bd26251f4a7f200831e58d0b3aaea6e0e"
-        }
-      ],
-      "mutants": [
-        "outbox-cap-ignored",
-        "outbox-cap-prunes-protected",
-        "outbox-cap-off-by-one",
-        "outbox-cap-not-counted",
-        "outbox-envelope-oldest-wrong",
-        "outbox-gc-loop-cap-unwired",
-        "outbox-last-sequence-highest-retained",
-        "outbox-cap-pruned-total-undelivered",
-        "outbox-cap-blocked-not-counted",
-        "outbox-snapshot-unloaded-cache",
-        "outbox-page-skips-reload",
-        "outbox-snapshot-loaded-hardcoded"
-      ],
-      "does_not_establish": "Example tests over small outboxes, not a property over every event mix. Per-operation cost is still O(retained) because every outbox operation rewrites the whole file; the cap bounds it, it does not make it constant, and no timing is measured here. A consumer that is down longer than the cap window loses the events it had not read: the cap drops events whether or not they were delivered (an undelivered approval event pruned this way is lost, counted but not recovered), and nothing here shows that a consumer detects or acts on the hole (that is the consumer's claim). Vultrino cannot tell whether a poller read an event: Delivered means the push target (govder) acked it, not that leria read it, and in poll-only mode nothing is ever Delivered, so cap_pruned_undelivered_total is a delivery count, not an unread-loss count. The counters are per process and reset on restart, and oldest_sequence and last_sequence are unsigned hints read from this process's cache (the signed sequence hole is the authoritative signal). The hints are taken in the same read as the page, but no test races an append against the read. The GC runs when 60 delivery intervals of wall-clock time have passed since the last GC, checked after each delivery pass, so a delivery pass stretched by a hung push target (up to 64 POSTs of 15 s) delays it by that long and the retained count can exceed the cap by what is appended meanwhile. The GC loop is driven by one test at a 1 ms interval with delivery disabled, not with a hung target. The posture and metrics reports are checked in one process with one outbox, not under concurrent writers or a second process. Says nothing about a vultrino outbox reset (both files gone)."
-    },
-    {
       "id": "stream-usage-charged-without-trailer",
       "statement": "A streamed LLM call is charged tokens even when the provider's usage trailer does not reach the client. With a gated test upstream: when the client hangs up before the trailer, the producer keeps draining the upstream and the token event carries the provider's exact counts (OpenAI-style trailer 11 and 22; Anthropic message_delta output 77 rather than message_start's provisional 1) with no estimated marker; when the stream ends without any trailer the token event carries an estimate (3000 generated bytes give 1000 output tokens, input from the request size) and dims.estimated is true; when the drain's idle cap fires first the call is charged an estimate and the drain stops at the cap; a halted stream and a stream with no trailer on the buffered fallback are charged estimates. In unit tests: an Anthropic message_start usage is not final, an OpenAI trailer, a Responses response.completed and an Anthropic message_delta are, a null usage is not; the estimate counts generated delta text and not framing, prefers the provider's real counts, is capped by the request's own output limit and is never zero; the estimated payload carries dims.estimated and the exact one does not. A halt that lands after the client has already hung up, while the producer is draining, closes the upstream within one chunk (the upstream is dropped, not drained to its idle cap) and the call is charged an estimate.",
       "method": "test",
@@ -3772,7 +3731,7 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::run_action_streaming",
-          "sha256": "851408807309d2dd4ed58b49cf7e8dde00b9f4c8826b7f029092158e633219e0"
+          "sha256": "feb16191ec18bdc75a9c1acc4fe2d4e9c27051af2396197bde91307e4088b704"
         }
       ],
       "mutants": [
@@ -4194,12 +4153,12 @@
         {
           "path": "src/plugins/mod.rs",
           "symbol": "apply_workspace_scope",
-          "sha256": "fa35061fe506c3b5b8a3c3ad4a5b7590b664ac52a33ffa6b06b65deeee51b632"
+          "sha256": "c357be3aec6382a69f9fbdfab517887790c216654db7fc1cd46611e1a522a447"
         },
         {
           "path": "src/plugins/mod.rs",
           "symbol": "apply_workspace_scope_to_params",
-          "sha256": "b4b2ff2c408d390c8569f2d8f4d91eff32180041bf73a41c6308c7bbcfbd5430"
+          "sha256": "1be917ffa39916729faea9a57a70d3636569186ce3427a68a34c8e0ba5c7786a"
         },
         {
           "path": "src/plugins/http.rs",
@@ -4214,12 +4173,27 @@
         {
           "path": "src/lib.rs",
           "symbol": "validate_credential_metadata_entry",
-          "sha256": "03d29f336aa209d2625c5e2ae85a34903bd67ccfaf3c6ed776f1a2902af384ee"
+          "sha256": "16653a14e87f523154f1914e92a38dad2486a5f6b4aebf3aacd02710fb4c0425"
         },
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::run_action",
-          "sha256": "96be35cc9c4181ee34b6e0b4cf422ffe71b994f4afbd01d01ab1bf811bfd3f15"
+          "sha256": "c2959c40c277bbb4a6d0e5ce1dbefd45978aa0d3913ac7ee3ffec32cdc0de140"
+        },
+        {
+          "path": "src/lib.rs",
+          "symbol": "metadata_format_error",
+          "sha256": "6c769d631c74d98e674107561167054e16e204f01b59f22570f87eb0c66233cc"
+        },
+        {
+          "path": "src/plugins/mod.rs",
+          "symbol": "GATEWAY_OWNED_SCOPES",
+          "sha256": "aeb2aaf5cdd06c5e3e72fc6dbe52fe2630df053c6298d1dfa86f268a734d9670"
+        },
+        {
+          "path": "src/plugins/mod.rs",
+          "symbol": "is_gateway_owned_header",
+          "sha256": "9deaa1ae1a2426f43bf8637d3da463a931d2e5763bf44fdbcb746e4ecce6d04f"
         }
       ],
       "mutants": [
@@ -4231,6 +4205,100 @@
         "workspace-id-format-check-removed"
       ],
       "does_not_establish": "That Anthropic accepts the configured workspace id, that the id belongs to the key's organization, or that the real upstream sees the header: the integration tests drive a stub plugin standing in for the http plugin and read the params handed to it, and the http plugin's own removal is tested on its parameter step, not on a live request. A credential holding an org-level key and no workspace id sends no workspace header, so Anthropic decides what that does. The buffered and the streaming dispatch in the server call the same helper, but only the buffered one is driven by a test for dispatch (the streaming path is driven only for the invalid-stored-value refusal). Other plugins (internal_http, WASM) get the server-side removal but have no workspace-id injection of their own. The header name is matched exactly (case-insensitively); other provider headers, and the gap that /api/v1/execute does not apply a capability's model allowlist or token ceiling to a credential no LLM channel references, are not covered here (a credential an LLM channel references is refused there, see llm-credential-channel-only). The format check is an operator-facing sanity check, not Anthropic's own validation."
+    },
+    {
+      "id": "openai-org-project-operator-owned",
+      "statement": "The OpenAI organization and project on an outgoing request are the operator's, never the caller's, on every path that reaches a plugin: /llm (openai-chat and openai-responses, buffered and streamed), POST /api/v1/execute, the MCP http_request tool and approval replay. They are stored on the credential (metadata keys openai_organization_id and openai_project_id). Before dispatch, any caller-supplied openai-organization or openai-project header (any case) is removed from the request, and the credential's value for each, if it has one, is written; a credential with none sends none, so the caller cannot choose which organization or project is billed with the same bearer on any of these paths. The /llm forwarded-header allowlist no longer includes either header. The http plugin repeats the same removal and write on its own parameters. The organization id must be org- and the project id proj_, each followed by 8 to 64 ASCII letters or digits: the CLI metadata set command and credential creation refuse anything else, and a stored value that fails the check at use time is refused (the request fails before any upstream call, shown by no plugin run and no meter event) instead of being written into a header. The refusal is a credential configuration error: /llm answers 500 with a message naming the misconfigured metadata key, never the stored value. A client-sent x-goog-user-project header is also dropped on every /llm route (buffered and streamed), because it picks the Google quota and billing project on Vertex AI and Gemini channels and their OpenAI-compatible routes; the request then uses the key's own project, the same as an unset gateway setting.",
+      "method": "test",
+      "artifacts": [
+        "src/plugins/mod.rs",
+        "src/plugins/http.rs",
+        "src/server/mod.rs",
+        "src/lib.rs",
+        "src/web/llm_proxy.rs",
+        "tests/llm_proxy_integration.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "set -e; cargo test --locked --no-default-features --test llm_proxy_integration openai_org_project; cargo test --locked --no-default-features --lib -- plugins::http::tests::plugin_drops_agent_openai_scope",
+      "detector_kind": "cargo",
+      "covers": [
+        {
+          "path": "src/plugins/mod.rs",
+          "symbol": "apply_workspace_scope",
+          "sha256": "c357be3aec6382a69f9fbdfab517887790c216654db7fc1cd46611e1a522a447"
+        },
+        {
+          "path": "src/plugins/mod.rs",
+          "symbol": "apply_workspace_scope_to_params",
+          "sha256": "1be917ffa39916729faea9a57a70d3636569186ce3427a68a34c8e0ba5c7786a"
+        },
+        {
+          "path": "src/plugins/http.rs",
+          "symbol": "HttpPlugin::scoped_params",
+          "sha256": "7825547c7a1618d027179dfdc2ae4cb6e566af51822162c77902512622929c7c"
+        },
+        {
+          "path": "src/lib.rs",
+          "symbol": "is_prefixed_alnum_id",
+          "sha256": "25fb1aafed06ea09fc3b0db7f07f85f9daebc30a9adaab5c94aee1ef6a5cbd69"
+        },
+        {
+          "path": "src/lib.rs",
+          "symbol": "is_valid_openai_organization_id",
+          "sha256": "8713197aa81372237f898fd6207accc55c6007b886129ab06787ba1e4afafade"
+        },
+        {
+          "path": "src/lib.rs",
+          "symbol": "is_valid_openai_project_id",
+          "sha256": "29d63468d16887938351beecc52bf3e602455cf615818f44bed6bbedf8b84ade"
+        },
+        {
+          "path": "src/lib.rs",
+          "symbol": "validate_credential_metadata_entry",
+          "sha256": "16653a14e87f523154f1914e92a38dad2486a5f6b4aebf3aacd02710fb4c0425"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::run_action",
+          "sha256": "c2959c40c277bbb4a6d0e5ce1dbefd45978aa0d3913ac7ee3ffec32cdc0de140"
+        },
+        {
+          "path": "src/lib.rs",
+          "symbol": "metadata_format_error",
+          "sha256": "6c769d631c74d98e674107561167054e16e204f01b59f22570f87eb0c66233cc"
+        },
+        {
+          "path": "src/plugins/mod.rs",
+          "symbol": "GATEWAY_OWNED_SCOPES",
+          "sha256": "aeb2aaf5cdd06c5e3e72fc6dbe52fe2630df053c6298d1dfa86f268a734d9670"
+        },
+        {
+          "path": "src/plugins/mod.rs",
+          "symbol": "is_gateway_owned_header",
+          "sha256": "9deaa1ae1a2426f43bf8637d3da463a931d2e5763bf44fdbcb746e4ecce6d04f"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "FORWARDED_PROVIDER_HEADERS",
+          "sha256": "13782789121b740aa7e1f28ab5bd3ee948de947639308c6ef9477b054483be27"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "forward_provider_headers",
+          "sha256": "0251da6e0e53f8d678a1f99518a540be605a18a6649e0e086a076ecf4ba1418a"
+        }
+      ],
+      "mutants": [
+        "openai-scope-server-strip-removed",
+        "openai-scope-plugin-strip-removed",
+        "openai-scope-not-injected",
+        "openai-scope-use-time-recheck-removed",
+        "openai-id-format-check-removed",
+        "llm-x-goog-user-project-forwarded"
+      ],
+      "does_not_establish": "That OpenAI accepts the configured organization or project id, that the id belongs to the key, or that the real upstream sees the header: the integration tests drive a stub plugin standing in for the http plugin and read the params handed to it, and the http plugin's own removal is tested on its parameter step, not on a live request. A credential with a multi-organization key and no setting sends no header, and OpenAI then bills and scopes the request to the key owner's default organization and project; it does not refuse it. The streaming path is driven for injection and removal on /llm; approval replay and the approval-open refusal reuse the Anthropic workspace claim's helper calls and are covered by its approval test, not by an OpenAI-specific one. The header removal applies to every credential and route, so it also removes the two headers on an Azure OpenAI route, where nothing sets them. Other plugins (internal_http, WASM) get the server-side removal but have no injection of their own. Only the three headers named in the gateway-owned table are operator-set; x-goog-user-project is dropped on /llm but there is no gateway-owned Google project setting yet (not offered, see LIMITATIONS), so a multi-project Google key always uses its own project, and the drop is on /llm only: POST /api/v1/execute and the MCP http_request tool still pass a caller-sent x-goog-user-project through. The x-goog-user-project test drives the openai-chat and openai-responses routes with a stub plugin, not a live Vertex AI or Gemini route; the allowlist is shared by every /llm protocol. Any other allowlisted provider header is still forwarded from the client on /llm. The format check is an operator-facing sanity check, not OpenAI's own validation, and the ceiling of 64 characters is this gateway's choice."
     },
     {
       "id": "unpriced-model-refused",
@@ -4252,7 +4320,7 @@
         {
           "path": "src/web/llm_proxy.rs",
           "symbol": "llm_proxy_impl",
-          "sha256": "0f298edb53dd55826b69c2313907fea3dd807d370b3939cc61e800fd2e9bd97d"
+          "sha256": "0a5222c37af837151b0eef9777b2955bddc1e3b26940bfa2ccf113bde7c19093"
         },
         {
           "path": "src/ratecard.rs",
@@ -4732,12 +4800,12 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::run_action",
-          "sha256": "96be35cc9c4181ee34b6e0b4cf422ffe71b994f4afbd01d01ab1bf811bfd3f15"
+          "sha256": "c2959c40c277bbb4a6d0e5ce1dbefd45978aa0d3913ac7ee3ffec32cdc0de140"
         },
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::run_action_streaming",
-          "sha256": "851408807309d2dd4ed58b49cf7e8dde00b9f4c8826b7f029092158e633219e0"
+          "sha256": "feb16191ec18bdc75a9c1acc4fe2d4e9c27051af2396197bde91307e4088b704"
         },
         {
           "path": "src/server/mod.rs",
@@ -5037,7 +5105,7 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::prepare_execution",
-          "sha256": "750e753bebd2bf173c8e4357e728ac091d40714f0b9729e82f12283f73be3129"
+          "sha256": "934cd66017dd93b85284c9cb7e92d6857133b7ab18c2f3c9828e2efd66ffceef"
         },
         {
           "path": "src/server/mod.rs",
@@ -5052,7 +5120,7 @@
         {
           "path": "src/web/llm_proxy.rs",
           "symbol": "llm_proxy_impl",
-          "sha256": "0f298edb53dd55826b69c2313907fea3dd807d370b3939cc61e800fd2e9bd97d"
+          "sha256": "0a5222c37af837151b0eef9777b2955bddc1e3b26940bfa2ccf113bde7c19093"
         }
       ],
       "mutants": [
@@ -5065,6 +5133,71 @@
         "llm-resume-refusal-removed"
       ],
       "does_not_establish": "That the unreadable-catalog refusal is exercised (no test injects a storage failure; the branch is a plain early return). That a provider key stored a second time as a credential that no LLM-proxy capability references is refused: it is an ordinary credential governed only by its policies. That the MCP named-tool path is driven by its own test for this refusal: named tools reach the same prepare_execution check, but only execute and http_request are driven here. Resume is driven only for an approval opened before the credential backed an LLM channel; a /llm-opened approval is refused by the same unconditional check but is not separately driven. A capability whose credential_ref names no existing credential is matched by spelling only. The resolver is read once per LLM capability per generic dispatch; a credential created or renamed after the catalog read is judged by the state at that read. One extra catalog read per generic dispatch is the cost. Model, price and token limits on /llm itself are covered by their own tests, not this claim."
+    },
+    {
+      "id": "outbox-retention-bounded",
+      "statement": "The signed outbox store keeps at most outbox.max_retained_events events (the store's GC; the timed loop wiring is covered by a separate sentence below). In the unit tests of the real outbox store, with the age window switched off so only the cap acts: when more events are retained than the cap, the GC prunes the oldest events beyond it whatever their delivery state (a pending, a dead-lettered and a delivered event are all pruned) and keeps a contiguous suffix of exactly the cap; it never prunes at or past an event whose staged-intent dedup id is still protected (it prunes only the events below it, and proceeds once the intent is cleared); a pass at or under the cap prunes nothing; a pass counts what it pruned by delivery state and by event type and adds them to the per-process counters cap_pruned_total and cap_pruned_undelivered_total; the cap still applies when the age cutoff cannot be represented. Below the cap an undelivered pending or dead-lettered event is still never pruned by the age stage. A poller whose cursor is behind the cap sees a sequence hole (its next event is above cursor + 1). Config load refuses max_retained_events below 100 or above 100000 and defaults it to 2000. In the web smoke test, GET /api/v1/events carries the unsigned hints oldest_sequence (null when nothing is retained) and last_sequence (which survives pruning, including when the age stage prunes every delivered event so that nothing is retained, oldest_sequence is null and last_sequence is still the highest assigned), and GET /api/v1/posture and GET /api/v1/metrics report max_retained_events, retained_events, oldest_sequence, last_sequence, cap_pruned_total and cap_pruned_undelivered_total (the two differ when a pruned event was delivered: the second counts events the push target had not acked, not events nobody read), cap_blocked_total (GC passes where a staged intent that was never cleared stopped the cap) and snapshot_loaded (true once this process has read the outbox file; the first report of a process that has not touched the outbox loads it instead of reporting an empty cache, and is false when that load fails, e.g. on an undecryptable file, so the other fields are then not to be trusted). The first page served by a fresh store over an existing file (a restart before the delivery loop has run) reloads the file, so it carries the retained events and the real last_sequence rather than an empty page with last_sequence 0. The page and the retention hints of GET /api/v1/events come from one read of the cache (list_events_page). The delivery loop's GC runs on wall-clock time and, driven at a 1 ms interval in a test, caps an outbox above max_retained_events to exactly the cap.",
+      "method": "test",
+      "artifacts": [
+        "src/storage/outbox_store.rs",
+        "src/storage/file.rs",
+        "src/config/types.rs",
+        "src/web/api.rs",
+        "src/web/posture.rs",
+        "src/server/mod.rs",
+        "tests/web_smoke.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --lib -- --exact storage::outbox_store::tests::cap_prunes_oldest_beyond_max_even_when_undelivered storage::outbox_store::tests::cap_stops_at_a_staged_intent storage::outbox_store::tests::cap_counts_pruned_by_state_and_type storage::outbox_store::tests::a_poller_behind_the_cap_sees_a_hole storage::outbox_store::tests::the_cap_applies_when_the_age_window_is_unrepresentable storage::outbox_store::tests::last_sequence_survives_the_age_stage_emptying_the_outbox storage::outbox_store::tests::cap_counters_tell_delivered_from_undelivered_prunes storage::outbox_store::tests::cap_blocked_by_a_staged_intent_is_counted storage::outbox_store::tests::a_process_that_never_touched_the_outbox_reports_the_real_retention storage::outbox_store::tests::the_first_page_after_a_restart_reloads_the_file storage::outbox_store::tests::a_snapshot_over_an_unreadable_outbox_file_reports_not_loaded server::durable_enqueue_tests::the_delivery_loop_gc_enforces_the_retention_cap storage::outbox_store::tests::gc_below_the_cap_never_prunes_an_undelivered_pending_event storage::outbox_store::tests::gc_below_the_cap_never_prunes_a_dead_lettered_event config::types::tests::max_retained_below_floor_refused && cargo test --locked --no-default-features --test web_smoke -- --exact events_envelope_reports_oldest_and_last_sequence",
+      "covers": [
+        {
+          "path": "src/storage/outbox_store.rs",
+          "symbol": "OutboxStore::gc_capped",
+          "sha256": "3d797742cf21eebcdabf11ea0cf3aa5f590197903bd7f892e53285974c564235"
+        },
+        {
+          "path": "src/storage/outbox_store.rs",
+          "symbol": "OutboxStore::retention_snapshot",
+          "sha256": "25f6041322c04dd6d0280225059d7082f5058536580b63d25b37126d66ace300"
+        },
+        {
+          "path": "src/web/api.rs",
+          "symbol": "api_list_events",
+          "sha256": "df53d49bf52085d033bbfb0db122567023789254554fac8e9e60d36dc7510f9d"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "deliver_outbox_periodically",
+          "sha256": "5af6b5520a50099c8dd4b95fa6a40133316210aef55df76047079d1a69da8cd8"
+        },
+        {
+          "path": "src/storage/outbox_store.rs",
+          "symbol": "OutboxStore::list_after_with_retention",
+          "sha256": "bcbf290460e7df4b567ff9c40c154dd309bd0d295df23ffbac6f132fef02b2e1"
+        },
+        {
+          "path": "src/storage/outbox_store.rs",
+          "symbol": "OutboxStore::snapshot_of",
+          "sha256": "ff783111efa582008e1acc38fe4c561bd26251f4a7f200831e58d0b3aaea6e0e"
+        }
+      ],
+      "mutants": [
+        "outbox-cap-ignored",
+        "outbox-cap-prunes-protected",
+        "outbox-cap-off-by-one",
+        "outbox-cap-not-counted",
+        "outbox-envelope-oldest-wrong",
+        "outbox-gc-loop-cap-unwired",
+        "outbox-last-sequence-highest-retained",
+        "outbox-cap-pruned-total-undelivered",
+        "outbox-cap-blocked-not-counted",
+        "outbox-snapshot-unloaded-cache",
+        "outbox-page-skips-reload",
+        "outbox-snapshot-loaded-hardcoded"
+      ],
+      "does_not_establish": "Example tests over small outboxes, not a property over every event mix. Per-operation cost is still O(retained) because every outbox operation rewrites the whole file; the cap bounds it, it does not make it constant, and no timing is measured here. A consumer that is down longer than the cap window loses the events it had not read: the cap drops events whether or not they were delivered (an undelivered approval event pruned this way is lost, counted but not recovered), and nothing here shows that a consumer detects or acts on the hole (that is the consumer's claim). Vultrino cannot tell whether a poller read an event: Delivered means the push target (govder) acked it, not that leria read it, and in poll-only mode nothing is ever Delivered, so cap_pruned_undelivered_total is a delivery count, not an unread-loss count. The counters are per process and reset on restart, and oldest_sequence and last_sequence are unsigned hints read from this process's cache (the signed sequence hole is the authoritative signal). The hints are taken in the same read as the page, but no test races an append against the read. The GC runs when 60 delivery intervals of wall-clock time have passed since the last GC, checked after each delivery pass, so a delivery pass stretched by a hung push target (up to 64 POSTs of 15 s) delays it by that long and the retained count can exceed the cap by what is appended meanwhile. The GC loop is driven by one test at a 1 ms interval with delivery disabled, not with a hung target. The posture and metrics reports are checked in one process with one outbox, not under concurrent writers or a second process. Says nothing about a vultrino outbox reset (both files gone)."
     }
   ]
 }

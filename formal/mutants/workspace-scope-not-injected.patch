@@ -1,13 +1,13 @@
 diff --git a/src/plugins/mod.rs b/src/plugins/mod.rs
-index 0b726ef..f11923a 100644
+index bd54019..119138d 100644
 --- a/src/plugins/mod.rs
 +++ b/src/plugins/mod.rs
-@@ -118,7 +118,7 @@ pub fn apply_workspace_scope(
-                 crate::ANTHROPIC_WORKSPACE_META
-             )));
+@@ -168,7 +168,7 @@ pub fn apply_workspace_scope(
+                     scope.meta
+                 )));
+             }
+-            headers.insert(scope.header.to_string(), value.clone());
++            let _ = value;
          }
--        headers.insert(ANTHROPIC_WORKSPACE_HEADER.to_string(), ws.clone());
-+        let _ = ws;
      }
      Ok(())
- }

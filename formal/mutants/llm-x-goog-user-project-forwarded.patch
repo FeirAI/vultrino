@@ -1,0 +1,12 @@
+diff --git a/src/web/llm_proxy.rs b/src/web/llm_proxy.rs
+index 3bc678f..f37e62a 100644
+--- a/src/web/llm_proxy.rs
++++ b/src/web/llm_proxy.rs
+@@ -109,6 +109,7 @@ const FORWARDED_PROVIDER_HEADERS: &[&str] = &[
+     "anthropic-version",
+     "anthropic-beta",
+     "openai-beta",
++    "x-goog-user-project",
+     "x-goog-api-client",
+     "x-ms-client-request-id",
+ ];
