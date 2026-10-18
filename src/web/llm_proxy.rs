@@ -1241,6 +1241,36 @@ fn clamp_max_output_tokens(body: &mut serde_json::Value, ceiling: u64, default_f
     }
 }
 
+/// The action a refusal before the channel is resolved is sealed under.
+const LLM_PRE_CAPABILITY_ACTION: &str = "llm.proxy";
+
+/// Note a refusal of the authenticated agent on the `/llm` entry point (feir-ops#1). Once the
+/// channel is resolved the context carries its credential and action; before that, the fixed
+/// [`LLM_PRE_CAPABILITY_ACTION`]. Noting is synchronous and cannot change the refusal returned.
+fn note_llm_refusal(
+    state: &AppState,
+    exec_auth: &ExecAuth,
+    capability: Option<&crate::capability::Capability>,
+    class: crate::refusal::RefusalClass,
+) {
+    let ctx = crate::refusal::RefusalCtx::new(
+        crate::refusal::RefusalEntry::Llm,
+        exec_auth
+            .auth
+            .as_ref()
+            .map(|a| (a.api_key.id.as_str(), a.api_key.agent_label.as_deref())),
+        capability.map_or(LLM_PRE_CAPABILITY_ACTION, |c| c.action.as_str()),
+    );
+    let ctx = match capability {
+        Some(c) => {
+            let action = c.action.clone();
+            ctx.resolved(&c.credential_ref, &action)
+        }
+        None => ctx,
+    };
+    state.server.note_gateway_refusal(&ctx, class);
+}
+
 /// Resolve the inbound Bearer to an [`ExecAuth`] (authenticate only; the
 /// capability's credential/action scope is enforced authoritatively inside
 /// `execute_gated`). A `vut_` is resolved from storage (reloaded so a token
@@ -1264,6 +1294,17 @@ async fn resolve_exec_auth(state: &AppState, secret: &str) -> Result<ExecAuth, R
             }
         };
         if let Err(e) = token.check_usable() {
+            // feir-ops#1: a valid token that is revoked, expired or used up is a refusal of the
+            // agent it belongs to (`token_unusable`); an unknown secret is unauthenticated and
+            // noted nowhere.
+            state.server.note_gateway_refusal(
+                &crate::refusal::RefusalCtx::new(
+                    crate::refusal::RefusalEntry::Llm,
+                    Some((token.id.as_str(), token.agent_label.as_deref())),
+                    LLM_PRE_CAPABILITY_ACTION,
+                ),
+                crate::refusal::RefusalClass::TokenUnusable,
+            );
             return Err(llm_error(
                 StatusCode::FORBIDDEN,
                 "permission_error",
@@ -1370,13 +1411,27 @@ async fn llm_proxy_impl(
         .await
     {
         Ok(c) => c,
-        Err(message) => return llm_error(StatusCode::FORBIDDEN, "permission_error", &message),
+        Err(message) => {
+            note_llm_refusal(
+                &state,
+                &exec_auth,
+                None,
+                crate::refusal::RefusalClass::NotGranted,
+            );
+            return llm_error(StatusCode::FORBIDDEN, "permission_error", &message);
+        }
     };
     let llm = capability
         .llm
         .as_ref()
         .expect("resolved LLM capability has llm config");
     if !provider_feature_enabled(&llm.protocol) {
+        note_llm_refusal(
+            &state,
+            &exec_auth,
+            Some(&capability),
+            crate::refusal::RefusalClass::ProviderDisabled,
+        );
         return llm_error(
             StatusCode::FORBIDDEN,
             "provider_feature_disabled",
@@ -1481,6 +1536,12 @@ async fn llm_proxy_impl(
             UrlModel::Names { .. }
         );
     if !url_picks_model && !capability.llm_model_allowed(requested_model) {
+        note_llm_refusal(
+            &state,
+            &exec_auth,
+            Some(&capability),
+            crate::refusal::RefusalClass::NotGranted,
+        );
         return llm_error(
             StatusCode::FORBIDDEN,
             "permission_error",
@@ -1543,6 +1604,12 @@ async fn llm_proxy_impl(
                 .as_deref()
                 .is_some_and(|d| capability.llm_model_allowed(Some(d)))
         {
+            note_llm_refusal(
+                &state,
+                &exec_auth,
+                Some(&capability),
+                crate::refusal::RefusalClass::NotGranted,
+            );
             return llm_error(
                 StatusCode::FORBIDDEN,
                 "permission_error",
@@ -1561,6 +1628,12 @@ async fn llm_proxy_impl(
                 card_configured = state.config.llm_proxy.rate_card.is_configured(),
                 route_refusal = route_refusal.as_deref().unwrap_or(""),
                 "LLM request refused: model is not priced by the rate card"
+            );
+            note_llm_refusal(
+                &state,
+                &exec_auth,
+                Some(&capability),
+                crate::refusal::RefusalClass::ModelUnpriced,
             );
             return llm_error(
                 StatusCode::FORBIDDEN,
@@ -1586,6 +1659,12 @@ async fn llm_proxy_impl(
             .or_else(|| unpriced_beta_header(&headers));
         if let Some(found) = unpriced {
             tracing::warn!(found = %found, "LLM request refused: it sets a price modifier the rate card does not hold");
+            note_llm_refusal(
+                &state,
+                &exec_auth,
+                Some(&capability),
+                crate::refusal::RefusalClass::ModifierUnpriced,
+            );
             return llm_error(
                 StatusCode::FORBIDDEN,
                 "modifier_unpriced",

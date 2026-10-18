@@ -235,6 +235,11 @@ pub struct SealMetricsSnapshot {
 /// Carries ids and a short error class only: never params, never a PoP seed or token secret.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ReceiptGap {
+    /// `receipt` (an action ran and its use receipt was not sealed) or `refusal` (a gateway
+    /// refusal was returned and its record was not sealed). A refusal gap is never an action
+    /// that ran: the outbox outcome is `refused_not_sealed`.
+    pub kind: GapKind,
+    /// For a `receipt` gap the use token id; for a `refusal` gap the refused agent.
     pub token_id: String,
     pub project_id: String,
     pub request_id: Option<String>,
@@ -246,11 +251,57 @@ pub struct ReceiptGap {
     pub at: chrono::DateTime<chrono::Utc>,
 }
 
+/// What a [`ReceiptGap`] is a gap in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GapKind {
+    /// An Observe-mode use receipt that was not sealed.
+    Receipt,
+    /// A gateway refusal record that was not sealed.
+    Refusal,
+}
+
+impl GapKind {
+    /// The outbox spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Receipt => "receipt",
+            Self::Refusal => "refusal",
+        }
+    }
+    /// The outbox `outcome`: what happened to the thing the gap is about.
+    pub fn outcome(self) -> &'static str {
+        match self {
+            Self::Receipt => "action_ran_without_receipt",
+            Self::Refusal => "refused_not_sealed",
+        }
+    }
+}
+
 /// Cap on pending, not yet drained gap records. A sustained Averin outage under load produces one
 /// per action; the server drains every couple of seconds, so this only overflows if the outbox
 /// itself is unwritable. Overflow is counted and logged, never silent.
 const MAX_PENDING_RECEIPT_GAPS: usize = 4096;
 const MAX_GAP_DETAIL_CHARS: usize = 200;
+
+/// feir-ops#1: how often due gateway refusals are sealed (a background drain, never a request).
+pub const REFUSAL_DRAIN_SECS: u64 = 2;
+/// Concurrent refusal posts (its own pool, separate from the use-seal fan-out).
+const REFUSAL_DRAIN_PERMITS: usize = 4;
+/// Records taken per drain tick.
+const REFUSAL_BATCH: usize = 64;
+/// Drain ticks a refusal record may fail transiently before it becomes a gap.
+const REFUSAL_MAX_TRIES: u32 = 3;
+
+/// The bounded, secret-free description of a refusal record for a gap detail.
+fn refusal_detail(rec: &crate::refusal::Outgoing) -> String {
+    format!(
+        "class={} entry={} attempts={}",
+        rec.class.map_or("summary", |c| c.as_str()),
+        rec.entry.map_or("-", |e| e.as_str()),
+        rec.attempts
+    )
+}
 
 /// Fail-mode on `/execute` when the synchronous seal fails or averin is
 /// unreachable. Mint is always fail-open (a token must not depend on averin).
@@ -331,6 +382,17 @@ pub struct AverinConfig {
     /// VUL-38 evidence floor while Averin cannot begin two-phase evidence. See
     /// [`D8EvidenceFloor`]. Default [`D8EvidenceFloor::MoneyAndIrreversible`].
     pub d8_evidence_floor: D8EvidenceFloor,
+    /// feir-ops#1: seal every gateway refusal as a `gateway-refusal` record
+    /// (`POST /v2/refusals`). Default true; only has an effect while the client is enabled.
+    /// A refusal is never delayed or changed by sealing: it is noted synchronously and sealed by a
+    /// background drain, and one that cannot be sealed becomes an `evidence.receipt_gap`.
+    pub seal_refusals: bool,
+    /// Coalescing window for refusals (seconds). Default 10; `0` falls back to the default.
+    pub refusal_window_secs: u64,
+    /// Refusal record burst (token bucket). Default 60; `0` falls back to the default.
+    pub refusal_burst: u32,
+    /// Refusal record refill, records per hour. Default 20; `0` falls back to the default.
+    pub refusal_records_per_hour: u32,
 }
 
 /// VUL-38: which declared-non-reversible actions are refused while Averin cannot begin the
@@ -392,6 +454,10 @@ impl Default for AverinConfig {
             durable: false,
             d8_complete_evidence: false,
             d8_evidence_floor: D8EvidenceFloor::MoneyAndIrreversible,
+            seal_refusals: true,
+            refusal_window_secs: 10,
+            refusal_burst: 60,
+            refusal_records_per_hour: 20,
         }
     }
 }
@@ -445,6 +511,11 @@ pub struct AverinClient {
     /// FEI-33: individual records of Observe receipts that were not sealed, drained by the server
     /// into `evidence.receipt_gap` outbox events. Shared across clones.
     pending_gaps: Arc<Mutex<std::collections::VecDeque<ReceiptGap>>>,
+    /// feir-ops#1: noted gateway refusals waiting to be sealed. Shared across clones.
+    refusals: Arc<crate::refusal::RefusalRecorder>,
+    /// feir-ops#1: the refusal drain's own permit pool, separate from `seal_permits`, so a refusal
+    /// storm cannot starve use receipts and the reverse.
+    refusal_permits: Arc<Semaphore>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -592,6 +663,25 @@ impl AverinClient {
         // At least one permit — a zero cap would drop every seal (misconfig, not
         // intent). The fan-out bound is `max(1, configured)`.
         let permits = cfg.max_inflight_seals.max(1);
+        let refusal_defaults = crate::refusal::RefusalSettings::default();
+        let refusal_settings = crate::refusal::RefusalSettings {
+            enabled: cfg.seal_refusals,
+            window: if cfg.refusal_window_secs > 0 {
+                Duration::from_secs(cfg.refusal_window_secs)
+            } else {
+                refusal_defaults.window
+            },
+            burst: if cfg.refusal_burst > 0 {
+                cfg.refusal_burst
+            } else {
+                refusal_defaults.burst
+            },
+            per_hour: if cfg.refusal_records_per_hour > 0 {
+                cfg.refusal_records_per_hour
+            } else {
+                refusal_defaults.per_hour
+            },
+        };
         Ok(Some(Self {
             http,
             cfg: Arc::new(cfg),
@@ -600,6 +690,8 @@ impl AverinClient {
             metrics: Arc::new(SealMetrics::default()),
             since: std::time::Instant::now(),
             pending_gaps: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            refusals: Arc::new(crate::refusal::RefusalRecorder::new(refusal_settings)),
+            refusal_permits: Arc::new(Semaphore::new(REFUSAL_DRAIN_PERMITS)),
         }))
     }
 
@@ -640,17 +732,36 @@ impl AverinClient {
         reason: &'static str,
         detail: &str,
     ) {
-        self.metrics.receipt_gaps.fetch_add(1, Ordering::Relaxed);
-        let detail: String = detail.chars().take(MAX_GAP_DETAIL_CHARS).collect();
-        let gap = ReceiptGap {
+        self.enqueue_gap(ReceiptGap {
+            kind: GapKind::Receipt,
             token_id: token_id.to_string(),
             project_id: self.cfg.project_id.clone(),
             request_id: request_id.map(str::to_string),
             use_sequence_number,
             reason,
-            detail,
+            detail: detail.chars().take(MAX_GAP_DETAIL_CHARS).collect(),
             at: chrono::Utc::now(),
-        };
+        });
+    }
+
+    /// feir-ops#1: record one gateway refusal that was not sealed (`refusal_seal_failed` or
+    /// `refusal_budget_overflow`). The same pending buffer, outbox event and counters as a receipt
+    /// gap, marked `kind = refusal` so it can never read as an action that ran.
+    pub(crate) fn record_refusal_gap(&self, agent: &str, reason: &'static str, detail: &str) {
+        self.enqueue_gap(ReceiptGap {
+            kind: GapKind::Refusal,
+            token_id: agent.to_string(),
+            project_id: self.cfg.project_id.clone(),
+            request_id: None,
+            use_sequence_number: None,
+            reason,
+            detail: detail.chars().take(MAX_GAP_DETAIL_CHARS).collect(),
+            at: chrono::Utc::now(),
+        });
+    }
+
+    fn enqueue_gap(&self, gap: ReceiptGap) {
+        self.metrics.receipt_gaps.fetch_add(1, Ordering::Relaxed);
         let mut q = self.pending_gaps.lock();
         if q.len() >= MAX_PENDING_RECEIPT_GAPS {
             drop(q);
@@ -662,9 +773,9 @@ impl AverinClient {
             if let Some(_logged) = self.claim_drop_log() {
                 tracing::error!(
                     target: "averin_seal",
-                    token_id,
+                    token_id = %gap.token_id,
                     project_id = %self.cfg.project_id,
-                    reason,
+                    reason = gap.reason,
                     overflowed_total = total,
                     "AVERIN-RECEIPT-GAP-OVERFLOW the pending gap buffer is full; this gap is counted \
                      (receipt_gaps) but its individual record was not queued"
@@ -721,6 +832,149 @@ impl AverinClient {
     /// Snapshot the fail-open seal counters (for `GET /api/v1/metrics` + tests).
     pub fn metrics(&self) -> SealMetricsSnapshot {
         self.metrics.snapshot()
+    }
+
+    // ---- gateway refusals (feir-ops#1) ------------------------------------
+
+    /// Note one gateway refusal for sealing. Synchronous and O(1) (see
+    /// [`crate::refusal::RefusalRecorder::note`]): no await, no I/O, cannot fail, so it cannot
+    /// slow or change the refusal the caller is about to return. The record is sealed later by
+    /// [`Self::drain_refusals_once`].
+    pub(crate) fn note_refusal(
+        &self,
+        ctx: &crate::refusal::RefusalCtx,
+        class: crate::refusal::RefusalClass,
+    ) {
+        self.refusals.note(ctx, class);
+    }
+
+    /// Snapshot of the refusal counters (`noted`, `sealed`, `coalesced`, `summarized`,
+    /// `unsealed`), for `GET /api/v1/metrics` and tests.
+    pub fn refusal_counters(&self) -> crate::refusal::RefusalCounters {
+        self.refusals.counters()
+    }
+
+    /// Seal every refusal record that is due. Called by the background loop every
+    /// [`REFUSAL_DRAIN_SECS`] seconds, never from a request. Posts with the client timeout on the
+    /// refusal permit pool. A record that fails for a transient reason (unreachable, 5xx, 429) is
+    /// retried on the next tick, up to [`REFUSAL_MAX_TRIES`] ticks; any other failure, and the last
+    /// transient one, becomes an individual `evidence.receipt_gap` of kind `refusal`
+    /// (`refusal_seal_failed`). The refusal itself was returned long before. Returns the number of
+    /// records sealed.
+    pub async fn drain_refusals_once(&self) -> usize {
+        let (batch, overflow) = self.refusals.take_due(REFUSAL_BATCH);
+        for (class, attempts, agent) in overflow {
+            self.refusals.count_unsealed();
+            self.record_refusal_gap(
+                &agent,
+                "refusal_budget_overflow",
+                &format!("class={} attempts={attempts}", class.as_str()),
+            );
+        }
+        if batch.is_empty() {
+            return 0;
+        }
+        let mut set = tokio::task::JoinSet::new();
+        for rec in batch {
+            let me = self.clone();
+            set.spawn(async move {
+                // The pool is never closed, so acquisition only waits.
+                let _permit = me.refusal_permits.clone().acquire_owned().await;
+                let res = me.seal_refusal(&rec).await;
+                (rec, res)
+            });
+        }
+        let mut sealed = 0usize;
+        let mut retry = Vec::new();
+        while let Some(joined) = set.join_next().await {
+            match joined {
+                Ok((_, Ok(_))) => {
+                    self.refusals.count_sealed();
+                    sealed += 1;
+                }
+                Ok((mut rec, Err(e))) => {
+                    if e.is_unavailable() && rec.tries + 1 < REFUSAL_MAX_TRIES {
+                        rec.tries += 1;
+                        retry.push(rec);
+                    } else {
+                        self.refusal_unsealed(&rec, &e);
+                    }
+                }
+                Err(_) => {
+                    // The task panicked or was cancelled: the record is lost, so say so.
+                    self.refusals.count_unsealed();
+                    self.record_refusal_gap(
+                        "vultrino:multiple",
+                        "refusal_seal_failed",
+                        "the refusal seal task panicked or was cancelled",
+                    );
+                }
+            }
+        }
+        if !retry.is_empty() {
+            for rec in self.refusals.requeue(retry) {
+                self.refusal_unsealed_overflow(&rec);
+            }
+        }
+        sealed
+    }
+
+    async fn seal_refusal(
+        &self,
+        rec: &crate::refusal::Outgoing,
+    ) -> Result<serde_json::Value, AverinError> {
+        let mut body = serde_json::json!({
+            "project_id": self.cfg.project_id,
+            "session_id": self.cfg.session_id,
+            "idempotency_key": rec.idem,
+            "agent_id": rec.agent,
+            "action": rec.action,
+            "attempts": rec.attempts,
+            "first_at": rec.first_at.to_rfc3339(),
+            "last_at": rec.last_at.to_rfc3339(),
+        });
+        if let Some(entry) = rec.entry {
+            body["entry_point"] = serde_json::json!(entry.as_str());
+        }
+        if let Some(class) = rec.class {
+            body["reason_class"] = serde_json::json!(class.as_str());
+        }
+        if let Some(credential) = &rec.credential {
+            body["credential"] = serde_json::json!(credential);
+        }
+        if let Some(by_class) = &rec.by_class {
+            body["summary"] = serde_json::json!(true);
+            body["by_class"] = serde_json::json!(by_class);
+        }
+        self.post("/v2/refusals", &body).await
+    }
+
+    fn refusal_unsealed(&self, rec: &crate::refusal::Outgoing, error: &AverinError) {
+        self.refusals.count_unsealed();
+        let why = match error {
+            AverinError::Request(_) => "averin unreachable".to_string(),
+            other => other.to_string(),
+        };
+        self.record_refusal_gap(
+            &rec.agent,
+            "refusal_seal_failed",
+            &format!("{}: {why}", refusal_detail(rec)),
+        );
+        if let Some(total) = self.claim_drop_log() {
+            tracing::warn!(
+                target: "averin_seal",
+                agent = %rec.agent,
+                project_id = %self.cfg.project_id,
+                dropped_total = total,
+                "AVERIN-REFUSAL-UNSEALED a gateway refusal record could not be sealed; the refusal \
+                 stood and an evidence.receipt_gap of kind refusal is recorded"
+            );
+        }
+    }
+
+    fn refusal_unsealed_overflow(&self, rec: &crate::refusal::Outgoing) {
+        self.refusals.count_unsealed();
+        self.record_refusal_gap(&rec.agent, "refusal_budget_overflow", &refusal_detail(rec));
     }
 
     /// VUL-38 — count a reversible action that ran without two-phase D8 evidence.

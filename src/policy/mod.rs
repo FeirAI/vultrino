@@ -12,6 +12,9 @@ mod precedence;
 mod types;
 mod url_canon;
 
+#[cfg(test)]
+mod deny_cause_tests;
+
 pub use kill_fence::{
     dead_kill_marks, kill_fence_verdict, KillFenceQuery, KillFenceState, KillFenceVerdict,
     KillMark, KILL_MARK_GC_GRACE_SECS,
@@ -62,6 +65,38 @@ pub enum PolicyDecision {
     Deny(String),
     /// Request requires user prompt (future feature)
     Prompt,
+}
+
+/// Why a policy evaluation denied, as a typed fact set where the precedence decides (never read
+/// back from the message text). It maps to the refusal record's reason class
+/// ([`crate::refusal::RefusalClass`]) and to nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DenyCause {
+    /// A deny rule matched.
+    Rule,
+    /// A kill switch (V6 halt) matched.
+    Halt,
+    /// The Allow tier did not match because a rate-limit guard had no room.
+    RateLimit,
+    /// The Allow tier did not match because a spend cap was exceeded.
+    SpendCap,
+    /// The URL could not be canonicalised under a URL-sensitive deny or prompt rule.
+    UrlUncanonical,
+    /// No rule matched and a policy or the engine default denies.
+    Default,
+}
+
+impl DenyCause {
+    /// The refusal reason class this cause is reported as.
+    pub(crate) fn refusal_class(self) -> crate::refusal::RefusalClass {
+        use crate::refusal::RefusalClass;
+        match self {
+            Self::Halt => RefusalClass::KillFence,
+            Self::RateLimit => RefusalClass::RateLimit,
+            Self::SpendCap => RefusalClass::SpendCap,
+            Self::Rule | Self::UrlUncanonical | Self::Default => RefusalClass::PolicyDeny,
+        }
+    }
 }
 
 /// Which components of an `eval_pair` result the caller reads.
@@ -132,9 +167,16 @@ pub(crate) struct Evaluation {
     decision: PolicyDecision,
     observe_downgrade: bool,
     subject: Option<crate::formal_kernel::JudgedSubject>,
+    /// Typed reason of a Deny (None for Allow and Prompt).
+    deny_cause: Option<DenyCause>,
 }
 
 impl Evaluation {
+    /// Why this evaluation denied, when it did.
+    pub(crate) fn deny_cause(&self) -> Option<DenyCause> {
+        self.deny_cause
+    }
+
     pub(crate) fn decision(&self) -> &PolicyDecision {
         &self.decision
     }
@@ -473,13 +515,13 @@ impl PolicyEngine {
             principal: principal.as_ref(),
             spend: None,
         };
-        self.evaluate_inner(&input, true)
+        self.evaluate_inner(&input, true).0
     }
 
     /// Side-effecting evaluation against the full [`EvalInput`] (principal +
     /// spend). Used by the live execute path (V3/V4).
     pub fn evaluate_full(&self, input: &EvalInput) -> PolicyDecision {
-        self.evaluate_inner(input, true)
+        self.evaluate_inner(input, true).0
     }
 
     /// Whether an authoritative **kill switch** (V6) matches this input — i.e. the
@@ -561,13 +603,13 @@ impl PolicyEngine {
             principal: None,
             spend: None,
         };
-        self.evaluate_inner(&input, false)
+        self.evaluate_inner(&input, false).0
     }
 
     /// No-side-effect evaluation against the full [`EvalInput`], for the deferred
     /// post-approval resume (same semantics as [`Self::evaluate_readonly`]).
     pub fn evaluate_readonly_full(&self, input: &EvalInput) -> PolicyDecision {
-        self.evaluate_inner(input, false)
+        self.evaluate_inner(input, false).0
     }
 
     /// Evaluate one execute request for the permit kernel (VUL-05), counting
@@ -585,7 +627,7 @@ impl PolicyEngine {
     ) -> Evaluation {
         let url = policy_url(query.params);
         let input = query.eval_input(url.as_deref());
-        let decision = self.evaluate_full(&input);
+        let (decision, deny_cause) = self.evaluate_inner(&input, true);
         let observe_downgrade = matches!(decision, PolicyDecision::Deny(_))
             && observe_tenant
             && !self.is_halted(&input)
@@ -594,6 +636,7 @@ impl PolicyEngine {
             decision,
             observe_downgrade,
             subject: query.subject(),
+            deny_cause,
         }
     }
 
@@ -603,14 +646,21 @@ impl PolicyEngine {
     pub(crate) fn evaluate_readonly_for_admission(&self, query: &AdmissionQuery<'_>) -> Evaluation {
         let url = policy_url(query.params);
         let input = query.eval_input(url.as_deref());
+        let (decision, deny_cause) = self.evaluate_inner(&input, false);
         Evaluation {
-            decision: self.evaluate_readonly_full(&input),
+            decision,
             observe_downgrade: false,
             subject: query.subject(),
+            deny_cause,
         }
     }
 
-    fn evaluate_inner(&self, input: &EvalInput, record: bool) -> PolicyDecision {
+    /// The decision and, for a Deny, its typed cause (feir-ops#1).
+    fn evaluate_inner(
+        &self,
+        input: &EvalInput,
+        record: bool,
+    ) -> (PolicyDecision, Option<DenyCause>) {
         let policies = self.policies.read();
 
         // Find policies matching BOTH the credential and (V4) the principal.
@@ -636,10 +686,13 @@ impl PolicyEngine {
                             || contains_negated_url_match(&r.condition, false)
                     })
                 }) {
-                    return PolicyDecision::Deny(format!(
-                        "policy '{}': request URL cannot be canonicalised and the policy has a URL deny or prompt rule",
-                        p.name
-                    ));
+                    return (
+                        PolicyDecision::Deny(format!(
+                            "policy '{}': request URL cannot be canonicalised and the policy has a URL deny or prompt rule",
+                            p.name
+                        )),
+                        Some(DenyCause::UrlUncanonical),
+                    );
                 }
             }
         }
@@ -669,6 +722,9 @@ impl PolicyEngine {
         // the storage order. A `RateLimit` nested under `or`/`not` keeps its inline
         // evaluation (see `allow_tier_matches`).
         let mut deny_policy: Option<&str> = None;
+        // Set by the Allow tier when a guard (a rate limit or a spend cap) is what kept it from
+        // matching, so a Deny that falls through to a default is attributed to that guard.
+        let guard_hint: std::cell::Cell<Option<DenyCause>> = std::cell::Cell::new(None);
         let broadened_prompt = std::cell::Cell::new(false);
         let policy_defaults: Vec<PolicyAction> =
             matching_policies.iter().map(|p| p.default_action).collect();
@@ -683,7 +739,7 @@ impl PolicyEngine {
                     RuleOutcome::Kill | RuleOutcome::NoMatch => return false,
                 };
                 if tier == RuleOutcome::Allow {
-                    return self.allow_tier_matches(&matching_policies, input, record);
+                    return self.allow_tier_matches(&matching_policies, input, record, &guard_hint);
                 }
                 for policy in &matching_policies {
                     for rule in &policy.rules {
@@ -764,10 +820,21 @@ impl PolicyEngine {
             .find(|p| p.default_action == PolicyAction::Deny)
             .map(|p| p.name.as_str())
             .unwrap_or_default();
-        decision_for(
-            verdict,
-            deny_policy.unwrap_or_default(),
-            default_deny_policy,
+        let cause = match verdict {
+            Verdict::Kill => Some(DenyCause::Halt),
+            Verdict::Deny => Some(DenyCause::Rule),
+            Verdict::PolicyDefaultDeny | Verdict::EngineDefaultDeny | Verdict::FailClosedTail => {
+                Some(guard_hint.get().unwrap_or(DenyCause::Default))
+            }
+            _ => None,
+        };
+        (
+            decision_for(
+                verdict,
+                deny_policy.unwrap_or_default(),
+                default_deny_policy,
+            ),
+            cause,
         )
     }
 
@@ -786,7 +853,13 @@ impl PolicyEngine {
     ///
     /// `record == false` (the post-approval resume) charges and checks nothing: the slot
     /// was taken when the request opened.
-    fn allow_tier_matches(&self, policies: &[&Policy], input: &EvalInput, record: bool) -> bool {
+    fn allow_tier_matches(
+        &self,
+        policies: &[&Policy],
+        input: &EvalInput,
+        record: bool,
+        guard_hint: &std::cell::Cell<Option<DenyCause>>,
+    ) -> bool {
         let mut matched = false;
         let mut guards: Vec<(u32, u64)> = Vec::new();
         for policy in policies {
@@ -801,6 +874,8 @@ impl PolicyEngine {
                 {
                     if self.spend_within_cap(input.spend, asset, *per_action_max, record) {
                         matched = true;
+                    } else {
+                        guard_hint.set(Some(DenyCause::SpendCap));
                     }
                     continue;
                 }
@@ -826,11 +901,15 @@ impl PolicyEngine {
         if guards.is_empty() || !record {
             return true;
         }
-        self.charge_rate_limits(
+        let admitted = self.charge_rate_limits(
             input.credential_alias,
             input.principal.map(rate_limit_principal),
             &guards,
-        )
+        );
+        if !admitted && guard_hint.get().is_none() {
+            guard_hint.set(Some(DenyCause::RateLimit));
+        }
+        admitted
     }
 
     /// Check that every `(max, window_secs)` counter has room and, only if all do, charge

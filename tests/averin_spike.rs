@@ -112,6 +112,7 @@ fn client(base_url: &str, mode: AverinMode) -> AverinClient {
         durable: false,
         d8_complete_evidence: false,
         d8_evidence_floor: vultrino::averin::D8EvidenceFloor::default(),
+        ..AverinConfig::default()
     })
     .expect("client builds")
     .expect("client is Some when enabled")

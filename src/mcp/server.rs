@@ -204,6 +204,38 @@ impl McpServer {
         Ok(AuthResult { api_key: key, role })
     }
 
+    /// Note a refusal of an authenticated principal on the MCP entry point (feir-ops#1). The
+    /// refusal the caller returns is untouched; this only notes it for sealing. `action` is the
+    /// presented tool name and is sanitized before it is sealed.
+    fn note_refusal(&self, auth: &AuthResult, class: crate::refusal::RefusalClass, action: &str) {
+        let ctx = crate::refusal::RefusalCtx::new(
+            crate::refusal::RefusalEntry::Mcp,
+            Some((
+                auth.api_key.id.as_str(),
+                auth.api_key.agent_label.as_deref(),
+            )),
+            action,
+        );
+        self.vultrino.note_gateway_refusal(&ctx, class);
+    }
+
+    /// As [`Self::note_refusal`] for a refusal that happens before the principal is resolved:
+    /// resolve it from the presented `api_key` argument first. A secret that does not resolve to a
+    /// usable principal is an unauthenticated attempt: metrics only, nothing is noted.
+    async fn note_refusal_for_args(
+        &self,
+        args: &serde_json::Value,
+        class: crate::refusal::RefusalClass,
+        action: &str,
+    ) {
+        let Some(secret) = args.get("api_key").and_then(|v| v.as_str()) else {
+            return;
+        };
+        if let Ok(principal) = self.resolve_principal(secret).await {
+            self.note_refusal(principal.auth(), class, action);
+        }
+    }
+
     /// Check permission for a validated auth
     fn check_permission(auth: &AuthResult, permission: Permission) -> Result<(), String> {
         if !auth.has_permission(permission) {
@@ -813,6 +845,12 @@ impl McpServer {
                 .await
                 .is_some();
             if params.name != "check_approval" && !is_named_capability {
+                self.note_refusal_for_args(
+                    &params.arguments,
+                    crate::refusal::RefusalClass::NotGranted,
+                    &params.name,
+                )
+                .await;
                 return Err((
                     INVALID_PARAMS,
                     format!(
@@ -841,10 +879,20 @@ impl McpServer {
                 if let Some(capability) = capability {
                     self.tool_call_capability(&capability, params.arguments)
                         .await
-                } else if let Some(result) = self.try_plugin_tool(tool, params.arguments).await {
+                } else if let Some(result) =
+                    self.try_plugin_tool(tool, params.arguments.clone()).await
+                {
                     // Otherwise check if it's a plugin tool (format: plugin_tool).
                     result
                 } else {
+                    // An authenticated agent asked for a tool that does not exist: a refusal of
+                    // that agent (the name is sanitized before it is sealed).
+                    self.note_refusal_for_args(
+                        &params.arguments,
+                        crate::refusal::RefusalClass::NotGranted,
+                        tool,
+                    )
+                    .await;
                     return Err((INVALID_PARAMS, format!("Unknown tool: {}", tool)));
                 }
             }
@@ -934,7 +982,10 @@ impl McpServer {
             };
 
             let vultrino = &self.vultrino;
-            let response = match vultrino.execute_gated(request, exec_auth).await {
+            let response = match vultrino
+                .execute_gated_via(crate::refusal::RefusalEntry::Mcp, request, exec_auth)
+                .await
+            {
                 Ok(ExecutionOutcome::Completed(resp)) => resp,
                 Ok(ExecutionOutcome::Pending(approval)) => {
                     return Some(Ok(vec![ToolContent::Text {
@@ -977,6 +1028,12 @@ impl McpServer {
         // an LLM-callable tool — it is hidden from tools/list, and a guessed/forged
         // tools/call against its name is rejected here (defense in depth).
         if capability.is_llm_proxy() {
+            self.note_refusal_for_args(
+                &args,
+                crate::refusal::RefusalClass::NotGranted,
+                &capability.tool_name,
+            )
+            .await;
             return Err(format!("Unknown tool: {}", capability.tool_name));
         }
 
@@ -1030,7 +1087,10 @@ impl McpServer {
         };
 
         let vultrino = &self.vultrino;
-        let response = match vultrino.execute_gated(request, exec_auth).await {
+        let response = match vultrino
+            .execute_gated_via(crate::refusal::RefusalEntry::Mcp, request, exec_auth)
+            .await
+        {
             Ok(ExecutionOutcome::Completed(resp)) => resp,
             Ok(ExecutionOutcome::Pending(approval)) => {
                 return Ok(vec![ToolContent::Text {
@@ -1134,7 +1194,13 @@ impl McpServer {
         // Authenticate (API key or use token) and check permission.
         let principal = self.resolve_principal(&args.api_key).await?;
         let auth = principal.auth();
-        Self::check_permission(auth, Permission::Read)?;
+        Self::check_permission(auth, Permission::Read).inspect_err(|_| {
+            self.note_refusal(
+                auth,
+                crate::refusal::RefusalClass::NotGranted,
+                "list_credentials",
+            )
+        })?;
 
         let vultrino = &self.vultrino;
         let credentials = vultrino
@@ -1207,7 +1273,7 @@ impl McpServer {
         // Execute through Vultrino, gating on approval when required.
         let vultrino = &self.vultrino;
         let response = match vultrino
-            .execute_gated(request, exec_auth)
+            .execute_gated_via(crate::refusal::RefusalEntry::Mcp, request, exec_auth)
             .await
             .map_err(|e| format!("Request failed: {}", e))?
         {
@@ -1249,8 +1315,15 @@ impl McpServer {
         // Authenticate (API key or use token) and check permissions.
         let principal = self.resolve_principal(&args.api_key).await?;
         let auth = principal.auth();
-        Self::check_permission(auth, Permission::Read)?;
-        Self::check_credential_access(auth, &args.credential)?;
+        Self::check_permission(auth, Permission::Read)
+            .and_then(|()| Self::check_credential_access(auth, &args.credential))
+            .inspect_err(|_| {
+                self.note_refusal(
+                    auth,
+                    crate::refusal::RefusalClass::NotGranted,
+                    "get_credential_info",
+                )
+            })?;
 
         let vultrino = &self.vultrino;
 

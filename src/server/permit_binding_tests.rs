@@ -71,6 +71,11 @@ fn direct_payload(params: serde_json::Value) -> ActionPayload {
         evidence_required: false,
         d8_fallback_ok: false,
         kill_fence: Default::default(),
+        refusal: crate::refusal::RefusalCtx::new(
+            crate::refusal::RefusalEntry::Execute,
+            None,
+            "mock.echo",
+        ),
     }
 }
 
@@ -353,6 +358,11 @@ fn approved_payload(
         evidence_required: false,
         d8_fallback_ok: false,
         kill_fence: Default::default(),
+        refusal: crate::refusal::RefusalCtx::new(
+            crate::refusal::RefusalEntry::Execute,
+            None,
+            "mock.echo",
+        ),
     }
 }
 

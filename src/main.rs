@@ -1360,12 +1360,18 @@ async fn run_mcp_server(config: Config) -> Result<(), Box<dyn std::error::Error>
     // default OFF, byte-identical to every build before this plan.
     let _ = spawn_averin_worker_if_enabled(&server, averin_enabled, averin_durable);
     if let Some(av) = server.averin() {
+        let av_for_refusals = av.clone();
         // FEI-33: every Observe receipt that did not reach Averin becomes an individual
         // `evidence.receipt_gap` event on the signed outbox.
         tokio::spawn(vultrino::server::flush_receipt_gaps_periodically(
             server.storage().clone(),
             av,
             std::time::Duration::from_secs(vultrino::server::RECEIPT_GAP_FLUSH_SECS),
+        ));
+        // feir-ops#1: gateway refusals noted on the hot path are sealed here, never in a request.
+        tokio::spawn(vultrino::server::drain_refusals_periodically(
+            av_for_refusals,
+            std::time::Duration::from_secs(vultrino::averin::REFUSAL_DRAIN_SECS),
         ));
     }
     // Reconcile any intent-staged events an inline drain left behind (D1 safety net) so a committed
@@ -1463,11 +1469,17 @@ async fn run_web_server(
     let _ =
         spawn_averin_worker_if_enabled(&exec_server, config.averin.enabled, config.averin.durable);
     if let Some(av) = exec_server.averin() {
+        let av_for_refusals = av.clone();
         // FEI-33: see the other call site.
         tokio::spawn(vultrino::server::flush_receipt_gaps_periodically(
             exec_server.storage().clone(),
             av,
             std::time::Duration::from_secs(vultrino::server::RECEIPT_GAP_FLUSH_SECS),
+        ));
+        // feir-ops#1: gateway refusals noted on the hot path are sealed here, never in a request.
+        tokio::spawn(vultrino::server::drain_refusals_periodically(
+            av_for_refusals,
+            std::time::Duration::from_secs(vultrino::averin::REFUSAL_DRAIN_SECS),
         ));
     }
     // Reconcile any intent-staged events an inline drain left behind (D1 safety net).
