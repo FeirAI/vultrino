@@ -321,8 +321,12 @@ use Kind::{Betas, ConverseToolConfig, GeminiToolConfig, LegacyFunctions, Plain, 
 
 // ---------------------------------------------------------------------------------------
 // THE ALLOWLIST. Every top-level request field the proxy admits, per protocol, and nothing
-// else. A field on one of these tables is one whose presence cannot change what a token
-// costs (the rate card holds one input and one output price per model). ADDING A FIELD TO A
+// else. A field on one of these tables is one whose top-level presence cannot change what a
+// token costs (the rate card holds one input and one output price per model), with one
+// bounded exception: the gate also inspects the nested modality markers in
+// `modality_marker` (Gemini audio/video parts and non-TEXT response modalities, OpenAI
+// `input_audio` parts), because those bill above the token rate inside an admitted field.
+// Other nested options are NOT inspected (bounded). ADDING A FIELD TO A
 // TABLE IS A PRICING DECISION: do it only after reading the provider's price list for what
 // the field switches on, and add a test that fails without it. A field not listed here
 // (compaction, context_management, fallbacks, speed, inference_geo, any service tier in any
@@ -717,6 +721,85 @@ fn field_is_priced(kind: Kind, dialect: Dialect, value: &serde_json::Value) -> b
     }
 }
 
+/// Whether a media type names audio or video content (case-insensitive).
+fn is_av_mime(v: &serde_json::Value) -> bool {
+    v.as_str().is_some_and(|m| {
+        let m = m.trim().to_ascii_lowercase();
+        m.starts_with("audio/") || m.starts_with("video/")
+    })
+}
+
+/// A nested modality marker that bills above the base token rate inside an otherwise
+/// admitted field: a Gemini part with audio or video media (inline or by file reference), a
+/// Gemini `responseModalities` that names anything but TEXT, or an OpenAI `input_audio`
+/// content part. Only these markers are inspected; other nested options are not (bounded).
+fn modality_marker(
+    dialect: Dialect,
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Option<String> {
+    use serde_json::Value;
+    match dialect {
+        Dialect::Gemini => {
+            if let Some(Value::Array(contents)) = obj.get("contents") {
+                for part in contents
+                    .iter()
+                    .filter_map(|c| c.get("parts").and_then(Value::as_array))
+                    .flatten()
+                {
+                    for key in ["inlineData", "inline_data", "fileData", "file_data"] {
+                        let Some(media) = part.get(key) else { continue };
+                        if ["mimeType", "mime_type"]
+                            .iter()
+                            .any(|k| media.get(k).is_some_and(is_av_mime))
+                        {
+                            return Some(format!(
+                                "a `{key}` part with audio or video content bills above the token rate"
+                            ));
+                        }
+                    }
+                }
+            }
+            for cfg in ["generationConfig", "generation_config"] {
+                for key in ["responseModalities", "response_modalities"] {
+                    match obj.get(cfg).and_then(|c| c.get(key)) {
+                        None => {}
+                        Some(Value::Array(list))
+                            if list.iter().all(|m| {
+                                m.as_str().is_some_and(|m| m.eq_ignore_ascii_case("text"))
+                            }) => {}
+                        Some(_) => {
+                            return Some(format!(
+                                "`{cfg}.{key}` names an output modality other than TEXT, which bills above the token rate"
+                            ))
+                        }
+                    }
+                }
+            }
+            None
+        }
+        Dialect::OpenAiChat | Dialect::OpenAiResponses | Dialect::Azure => {
+            for key in ["messages", "input"] {
+                let Some(Value::Array(items)) = obj.get(key) else {
+                    continue;
+                };
+                let has_audio = items
+                    .iter()
+                    .filter_map(|m| m.get("content").and_then(Value::as_array))
+                    .flatten()
+                    .chain(items.iter())
+                    .any(|part| part.get("type").and_then(Value::as_str) == Some("input_audio"));
+                if has_audio {
+                    return Some(
+                        "an `input_audio` content part bills above the token rate".to_string(),
+                    );
+                }
+            }
+            None
+        }
+        Dialect::Anthropic | Dialect::Converse => None,
+    }
+}
+
 /// A request that the proxy cannot show to bill tokens alone: any top-level field that is
 /// not on the protocol's allowlist table (see the comment above the tables), or a field on
 /// it whose value is not the plain shape (a tool that is not a plain client tool, a beta
@@ -750,7 +833,9 @@ fn unpriced_modifier(protocol: &str, upstream: &str, body: &serde_json::Value) -
             Some(_) => {}
         }
     }
-    None
+    modality_marker(dialect, obj).map(|m| {
+        format!("{m} for {protocol} (unpriced modalities are refused until the card prices them)")
+    })
 }
 
 /// The first `anthropic-beta` header value that is not on [`PRICED_BETAS`] (every header

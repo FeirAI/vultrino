@@ -3872,3 +3872,163 @@ async fn v2_a_metered_call_during_an_outbox_outage_is_counted_announced_and_mark
         serde_json::json!(["meter.observed"])
     );
 }
+
+// ---- V2b round 4: modality markers inside admitted fields -------------------------------
+
+#[tokio::test]
+async fn v2b_gemini_audio_video_parts_and_non_text_output_modalities_are_refused() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().to_path_buf();
+    std::mem::forget(dir);
+    let (router, _storage, token, calls) = proto_stack_models(
+        config_with_policies(vec![allow_policy("cred-*")]),
+        "gemini-2.5-flash",
+        &path,
+        "gemini",
+        GEMINI_BASE,
+        "VULTRINO_PROVIDER_GEMINI_ENABLED",
+        Vec::new(),
+    )
+    .await;
+    let part =
+        |p: serde_json::Value| serde_json::json!({"contents": [{"role": "user", "parts": [p]}]});
+    let bodies = vec![
+        (
+            "inlineData audio",
+            part(serde_json::json!({"inlineData": {"mimeType": "audio/wav", "data": "AA=="}})),
+        ),
+        (
+            "inline_data audio",
+            part(serde_json::json!({"inline_data": {"mime_type": "audio/mp3", "data": "AA=="}})),
+        ),
+        (
+            "fileData audio",
+            part(
+                serde_json::json!({"fileData": {"mimeType": "audio/mpeg", "fileUri": "gs://b/a"}}),
+            ),
+        ),
+        (
+            "file_data video",
+            part(
+                serde_json::json!({"file_data": {"mime_type": "video/mp4", "file_uri": "gs://b/v"}}),
+            ),
+        ),
+        (
+            "inlineData video upper",
+            part(serde_json::json!({"inlineData": {"mimeType": "VIDEO/mp4", "data": "AA=="}})),
+        ),
+        (
+            "responseModalities AUDIO",
+            serde_json::json!({"contents": [], "generationConfig": {"responseModalities": ["TEXT", "AUDIO"]}}),
+        ),
+        (
+            "response_modalities IMAGE",
+            serde_json::json!({"contents": [], "generation_config": {"response_modalities": ["IMAGE"]}}),
+        ),
+        (
+            "responseModalities lowercase text plus audio",
+            serde_json::json!({"contents": [], "generationConfig": {"responseModalities": ["text", "audio"]}}),
+        ),
+    ];
+    for route in [
+        "v1beta/models/gemini-2.5-flash:generateContent",
+        "v1beta/models/gemini-2.5-flash:streamGenerateContent",
+    ] {
+        for (name, body) in &bodies {
+            let resp = router
+                .clone()
+                .oneshot(llm_req(Some(&token), route, body.clone()))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{route} {name}");
+            assert_eq!(
+                error_type(resp).await,
+                "modifier_unpriced",
+                "{route} {name}"
+            );
+        }
+    }
+    assert_eq!(calls_of(&calls), 0, "the upstream must not be called");
+    // Plain text, an image part and TEXT-only output modalities are still admitted.
+    for body in [
+        serde_json::json!({"contents": [{"role": "user", "parts": [{"text": "hi"}]}]}),
+        part(serde_json::json!({"inlineData": {"mimeType": "image/png", "data": "AA=="}})),
+        serde_json::json!({"contents": [], "generationConfig": {"responseModalities": ["TEXT"]}}),
+    ] {
+        let resp = router
+            .clone()
+            .oneshot(llm_req(
+                Some(&token),
+                "v1beta/models/gemini-2.5-flash:generateContent",
+                body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+    assert_eq!(calls_of(&calls), 3);
+}
+
+#[tokio::test]
+async fn v2b_openai_input_audio_and_audio_output_requests_are_refused() {
+    let mut config = config_with_policies(vec![allow_policy("cred-*")]);
+    config
+        .llm_proxy
+        .azure_deployments
+        .insert("prod-4o".to_string(), "gpt-4o".to_string());
+    let (router, _storage, token, calls) = proto_stack(
+        config,
+        "gpt-4o",
+        "azure-openai",
+        "https://acme.openai.azure.com/openai",
+        "VULTRINO_PROVIDER_AZURE_OPENAI_ENABLED",
+    )
+    .await;
+    let route = "deployments/prod-4o/chat/completions";
+    let bodies = vec![
+        (
+            "input_audio part",
+            serde_json::json!({"messages": [{"role": "user", "content": [
+                {"type": "text", "text": "hi"},
+                {"type": "input_audio", "input_audio": {"data": "AA==", "format": "wav"}}]}]}),
+        ),
+        (
+            "input_audio part streamed",
+            serde_json::json!({"stream": true, "messages": [{"role": "user", "content": [
+                {"type": "input_audio", "input_audio": {"data": "AA==", "format": "wav"}}]}]}),
+        ),
+        (
+            "modalities audio",
+            serde_json::json!({"messages": [], "modalities": ["text", "audio"]}),
+        ),
+        (
+            "audio output field",
+            serde_json::json!({"messages": [], "audio": {"voice": "alloy", "format": "wav"}}),
+        ),
+        (
+            "audio output field streamed",
+            serde_json::json!({"stream": true, "messages": [], "audio": {"voice": "alloy", "format": "pcm16"}}),
+        ),
+    ];
+    for (name, body) in bodies {
+        let resp = router
+            .clone()
+            .oneshot(llm_req(Some(&token), route, body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{name}");
+        assert_eq!(error_type(resp).await, "modifier_unpriced", "{name}");
+    }
+    assert_eq!(calls_of(&calls), 0, "the upstream must not be called");
+    let resp = router
+        .clone()
+        .oneshot(llm_req(
+            Some(&token),
+            route,
+            serde_json::json!({"messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(calls_of(&calls), 1);
+}
