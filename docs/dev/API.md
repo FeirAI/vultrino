@@ -626,7 +626,7 @@ mint failure revokes every token already minted.
 | `403` | `identity_binding_mismatch` | `iss`/`sub`/`aud`/`tenant`/`agent_label` do not match the stored template. |
 | `409` | `assertion_replay` | The `jti` was already exchanged (durable, cross-process, fd-locked). |
 | `503` | `grant_store_unavailable` / `replay_store_unavailable` | Grant/replay store I/O failure. |
-| `429` | `live_generation_cap` | The agent already has `max_live_generations` live (unrevoked, unexpired) token generations (an optional template field, default 4). Expired generations do not count, so it clears within one token TTL. |
+| `429` | `live_generation_cap` | At least `max_live_generations` (an optional template field, default 4, minimum 1) live (unrevoked, unexpired) use tokens are already bound to this `(tenant, agent_label)`. The cap counts tokens, not exchanges: each model-channel token counts separately, so a template with model channels reaches it after fewer exchanges. Expired tokens do not count, so it clears as they expire (within one TTL for exchange-minted tokens). |
 | `500` | `invalid_stored_grant` | The stored template for `(tenant, agent_label)` could not be parsed. |
 | `500` | `storage_error` | A minted token could not be stored (tokens already minted in this exchange are revoked, best-effort). |
 

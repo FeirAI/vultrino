@@ -63,7 +63,7 @@ kebab-case enum values):
 | `cost_source` | Constant `gateway-observed` (Vultrino's tier). |
 | `confidence` | Constant `low` (the gateway-observed data-quality band). |
 | `occurred_at` | The action's request timestamp. |
-| `dims` | `tenant` (V11) + `credential` alias, plus `provider`, `region` and `channel` when the call carried them (LLM-proxy calls do); absent keys omitted (no phantom dims). `model` is **always omitted** for V13a — it does not parse the body. |
+| `dims` | `tenant` (V11) + `credential` alias, plus `provider`, `region` and `channel` when the call carried them (LLM-proxy calls always carry `provider` and `channel`, and `region` when the capability sets `llm.region`); absent keys omitted (no phantom dims). `model` is **always omitted** for V13a — it does not parse the body. |
 
 V13a reads **no body bytes** (a count of 1), so it emits *after* `scrub_response`
 safely.

@@ -87,7 +87,7 @@ upstream.
    `DELETE /api/v1/capabilities` carry no tenant check, so a tenant-scoped admin key
    can create, replace or delete a capability for any credential, including another
    tenant's, and `GET /api/v1/capabilities` and `GET /api/v1/sessions` list every
-   tenant's entries. Treat a tenant-scoped admin key as operator-trusted for those
+   tenant's entries; `GET /api/v1/tokens` and `GET /api/v1/policies` need only `read` and are not tenant-filtered either (so the policy read is not operator-only). Treat a tenant-scoped admin key as operator-trusted for those
    routes. The partitioned surfaces are:
    - **Operator-only surfaces** — resources with no tenant field (policy CRUD,
      role CRUD, the shared signed event outbox: list/dead-letters/replay) and the
