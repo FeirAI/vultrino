@@ -9,7 +9,10 @@ vultrino [OPTIONS] <COMMAND>
 
 Options:
   -c, --config <FILE>    Path to config file
-  -v, --verbose          Enable verbose output
+  -v, --verbose          Increase verbosity (-v, -vv, -vvv)
+  -k, --key <KEY>        API key for scoped access (only `request` uses it: it then
+                         calls the web API at VULTRINO_API_URL, default
+                         http://127.0.0.1:7879, instead of opening the vault)
   -h, --help             Print help
   -V, --version          Print version
 ```
@@ -19,8 +22,11 @@ Options:
 | Variable | Description |
 |----------|-------------|
 | `VULTRINO_PASSWORD` | Storage encryption password (required) |
-| `VULTRINO_CONFIG` | Path to config file |
+| `VULTRINO_POLICY_HASH_SECRET` | Required by `vultrino web`; a stable random secret |
 | `RUST_LOG` | Log level (trace, debug, info, warn, error) |
+
+There is no `VULTRINO_CONFIG` variable: use `-c, --config <FILE>`; otherwise the OS
+config directory is used (`~/.config/vultrino/config.toml` on Linux).
 
 ## Commands
 
@@ -36,9 +42,11 @@ Options:
 ```
 
 This command:
-1. Creates the credentials storage file
-2. Prompts for admin username and password
-3. Sets up initial configuration
+1. Writes a default `config.toml` (default-deny enforcement) to the OS config directory
+2. Prompts for the web UI admin username and password and saves them to `admin.json` next to it
+
+It always uses the OS config directory and ignores `--config`. The credential vault is
+created on first use, not by `init`.
 
 **Example:**
 ```bash
@@ -60,17 +68,17 @@ vultrino add [OPTIONS]
 Options:
   -a, --alias <ALIAS>         Human-readable name (required)
   -t, --type <TYPE>           Credential type [default: api_key]
-  -k, --key <KEY>             API key or secret value
-  -u, --username <USERNAME>   Username (for basic auth)
-  -p, --password <PASSWORD>   Password (for basic auth)
-  --description <DESC>        Optional description
+  --key <KEY>                 API key value (api_key type)
+  --username <USERNAME>       Username (basic_auth type)
+  --password <PASSWORD>       Password (basic_auth type; prompts if omitted)
+  -d, --description <DESC>    Optional description
 ```
 
 **Credential Types:**
 - `api_key` — API key or token
 - `basic_auth` — Username and password
 - `oauth2` — OAuth2 credentials (client ID, secret, tokens)
-- `private_key` — SSH or signing key
+- `hmac_api_key`, `ecdsa_key`, `ssh_password`, `postgres` (see `vultrino add --help` for their options)
 
 **Examples:**
 ```bash
@@ -96,15 +104,19 @@ List all stored credentials.
 vultrino list [OPTIONS]
 
 Options:
-  --json    Output as JSON
+  -f, --format <FORMAT>    Output format: table (default) or json
 ```
+
+`--format json` currently fails with a serialization error once any credential is
+stored; use the table output or `GET /api/v1/credentials`.
 
 **Example:**
 ```bash
 vultrino list
-# ID                                    Alias         Type      Created
-# 550e8400-e29b-41d4-a716-446655440000  github-api    api_key   2024-01-15
-# 6ba7b810-9dad-11d1-80b4-00c04fd430c8  stripe-api    api_key   2024-01-16
+# ALIAS                TYPE            ID                                   DESCRIPTION
+# --------------------------------------------------------------------------------
+# github-api           api_key         550e8400-e29b-41d4-a716-446655440000 -
+# stripe-api           api_key         6ba7b810-9dad-11d1-80b4-00c04fd430c8 -
 ```
 
 ---
@@ -143,7 +155,7 @@ Accepts a credential alias or id.
 **Example:**
 ```bash
 vultrino remove old-api-key
-# Deleted credential: old-api-key
+# Credential 'old-api-key' removed
 ```
 
 ---
@@ -239,7 +251,7 @@ vultrino role <SUBCOMMAND>
 Subcommands:
   create    Create a new role
   list      List all roles
-  get       Get role details
+  info      Show role details
   delete    Delete a role
 ```
 
@@ -292,7 +304,8 @@ vultrino key create <NAME> [OPTIONS]
 
 Options:
   -r, --role <ROLE>           Role to assign (required)
-  -e, --expires <DURATION>    Expiration (e.g., "30d", "1y")
+  -e, --expires <DURATION>    Expiration: a number with h, d, w or m (m = 30 days),
+                              e.g. "24h", "30d"; or "never" (default)
 ```
 
 **Examples:**
@@ -314,39 +327,17 @@ vultrino key revoke vk_a1b2c3d4
 
 ---
 
-### `completions`
-
-Generate shell completions.
-
-```bash
-vultrino completions <SHELL>
-
-Shells:
-  bash, zsh, fish, powershell
-```
-
-**Examples:**
-```bash
-# Bash
-vultrino completions bash > /etc/bash_completion.d/vultrino
-
-# Zsh
-vultrino completions zsh > ~/.zfunc/_vultrino
-
-# Fish
-vultrino completions fish > ~/.config/fish/completions/vultrino.fish
-```
+The CLI has no `completions` subcommand; shell completions are not generated.
 
 ## Exit Codes
 
 | Code | Meaning |
 |------|---------|
 | 0 | Success |
-| 1 | General error |
-| 2 | Invalid arguments |
-| 3 | Credential not found |
-| 4 | Permission denied |
-| 5 | Storage error |
+| 1 | Any error (the CLI does not use separate codes for a missing credential, a denied request or a storage error) |
+| 2 | Invalid arguments, or `vault check` (without `--truncate-final`) found only the final `.wal` record damaged |
+
+`policy check` also exits 1 when it finds a stored policy the servers refuse to load.
 
 ## Tips
 

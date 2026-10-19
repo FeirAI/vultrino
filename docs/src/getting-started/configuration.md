@@ -42,18 +42,18 @@ mode = "local"            # "local" or "server"
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `bind` | Listen address for the `serve` subcommand. **`vultrino web` (the HTTP JSON API + admin UI) defaults to `127.0.0.1:7879`** and the `--bind` flag overrides per process. | `127.0.0.1:7878` |
+| `bind` | Parsed but not used by any command. The listen address is set with `vultrino web --bind` (default `127.0.0.1:7879`). | `127.0.0.1:7878` |
 | `mode` | Deployment mode: `server` sets `require_auth = true` on the in-process default (`local` otherwise). | `local` |
 
 > The JSON API and admin UI are served by **`vultrino web`** on `7879`, not by
-> this `[server].bind`. `vultrino serve` (which this key configures) no longer
-> starts an API server on its own — see the [CLI reference](../components/cli.md#serve).
+> this `[server].bind`. `vultrino serve` without `--mcp` exits with an error that
+> points you to `vultrino web` (see the [CLI reference](../components/cli.md#serve)).
 
 ### Storage Section
 
 ```toml
 [storage]
-backend = "file"  # Storage backend: "file", "keychain", or "vault"
+backend = "file"  # only "file" is implemented; "keychain" and "vault" parse but fail with "not yet implemented" when storage is opened
 
 [storage.file]
 path = "~/.local/share/vultrino/credentials.enc"
@@ -68,14 +68,14 @@ path = "~/.local/share/vultrino/credentials.enc"
 
 ```toml
 [logging]
-level = "info"  # Log level: error, warn, info, debug, trace
-# audit_file = "~/.local/share/vultrino/audit.log"  # Optional audit log
+level = "info"  # parsed but not used; set verbosity with -v / -vv or RUST_LOG
+# audit_file = "~/.local/share/vultrino/audit.log"  # parsed but not used: no audit log is written
 ```
 
 | Option | Description | Default |
 |--------|-------------|---------|
-| `level` | Logging verbosity | `info` |
-| `audit_file` | Path to audit log (optional) | disabled |
+| `level` | Parsed but not used. Set verbosity with `-v` / `-vv` or `RUST_LOG`. | `info` |
+| `audit_file` | Parsed but not used: no audit log file is written. Credential use and admin changes are recorded as events in the event outbox (`GET /api/v1/events`) and in structured logs. | none |
 
 ### MCP Section
 
@@ -85,10 +85,12 @@ enabled = true
 transport = "stdio"  # "stdio" or "http"
 ```
 
+The `[mcp]` keys are parsed but not used: `vultrino mcp` always serves MCP over stdio, and `vultrino web` always serves the networked `/mcp` route.
+
 | Option | Description | Default |
 |--------|-------------|---------|
-| `enabled` | Enable MCP server | `true` |
-| `transport` | Transport method | `stdio` |
+| `enabled` | Parsed but not used | `true` |
+| `transport` | Parsed but not used | `stdio` |
 
 ### Enforcement Section
 
@@ -182,16 +184,21 @@ redact_patterns = ['"token":\s*"[^"]+"', "AKIA[0-9A-Z]{16}"]  # extra regexes to
 ```
 
 The first matching rule applies. `block = true` replaces the body with a marker
-and drops the headers; otherwise any `redact_patterns` (regexes) are scrubbed
-from the body (on top of the always-on redaction).
+and drops the headers; otherwise any `redact_patterns` (regexes) are replaced
+with `[REDACTED:egress]` in the body and in header values (on top of the
+always-on redaction). A body that is not UTF-8 is not scanned by
+`redact_patterns` (a warning is logged), so use `block` for such endpoints. A
+rule with neither `block = true` nor `redact_patterns` is rejected at load.
 
 > **Downstream credentials.** Blocking/redacting prevents an agent from reading
 > a downstream secret out of a response. Deleting an OAuth2 credential that
-> carries a **`revocation_url`** metadata key now **propagates the revoke to the
-> provider** (R5/V7): Vultrino calls the RFC 7009 revocation endpoint for the
-> credential's issued access **and** refresh tokens before removing it locally,
-> so an already-issued downstream secret is actively revoked rather than left to
-> expire, and a `credential.revoked` event is emitted to the signed outbox. Set
+> carries a **`revocation_url`** metadata key also **attempts to revoke its tokens
+> at the provider** (R5/V7): Vultrino calls the RFC 7009 revocation endpoint for the
+> credential's issued access and refresh tokens before removing it locally. This is
+> best-effort: a failed call is only logged and does not stop the delete, so a token
+> the provider did not revoke stays valid until it expires. A `credential.revoked`
+> event is emitted to the signed outbox only when at least one token was revoked.
+> Other credential types are not revoked at the provider. Set
 > it with `vultrino meta set <oauth-cred> revocation_url https://idp/oauth/revoke`
 > (HTTPS required). Prefer credential types that mint short-lived, revocable
 > downstream credentials (OAuth2 client-credentials, STS, SVIDs) so a revoke maps
@@ -235,13 +242,14 @@ enforce-mode denial — a **DETECT** signal whose `created_at` is a per-incident
 url = "https://govder.example.com/vultrino/events"  # delivery endpoint
 hmac_secret = "shared-signing-secret"                # required to push (deliveries are signed)
 max_attempts = 8                                      # retries before dead-lettering (default 8)
-retention_secs = 604800                               # replay window, default 7 days
+retention_secs = 172800                               # replay window, default 2 days
 max_retained_events = 2000                            # hard cap on retained events (100 to 100000, default 2000)
 ```
 
-- **Ordered + monotonic.** Every event gets a process-global, gap-free
+- **Ordered + monotonic.** Every stored event gets a process-global, increasing
   `sequence`. Events for the same `subject` (e.g. an approval id) are delivered
-  in order.
+  in order. An event whose append failed (disk full, I/O error) gets no sequence
+  and is missing from the feed; a later `meter.lost` marker announces the loss.
 - **Signed.** Each delivery carries `Govder-Signature: sha256=<hex>` =
   `HMAC-SHA256(hmac_secret, body)`. A consumer recomputes it over the raw body
   to verify authenticity. Enabling the outbox **requires** both `url` and
@@ -252,9 +260,14 @@ max_retained_events = 2000                            # hard cap on retained eve
   off the retry queue) before re-attempting, and a crashed deliverer's lease is
   reclaimed once stale.
 - **Replayable.** A consumer that drops offline replays from its last-seen
-  sequence: `GET /api/v1/events?after=<cursor>` returns the next events — each as
-  `{ "body": …, "signature": "sha256=…" }`, the same body a push carries plus its
-  signature — with no gaps and no dupes, within the retention window.
+  sequence: `GET /api/v1/events?after=<cursor>` (global admin API key; a
+  tenant-scoped key is refused) returns the next events, each as
+  `{ "body": … }` (the same body a push carries) plus `"signature": "sha256=…"`
+  when `hmac_secret` is configured. Replay is not proof of completeness: a poller
+  that falls behind retention or the `max_retained_events` cap sees a sequence
+  hole, and a non-zero `meter_gap_pending` in the response means appends failed
+  that no `meter.lost` marker has announced yet. Treat either as lost events, not
+  as caught up.
 - **Dead-letter queue.** An event that fails `max_attempts` deliveries is parked
   (`GET /api/v1/events/dead`) and re-queued with
   `POST /api/v1/events/{sequence}/replay` — it stops blocking its subject.
@@ -267,9 +280,15 @@ max_retained_events = 2000                            # hard cap on retained eve
 
 Resolve the principal vultrino evaluates from an inbound SPIFFE SVID or OIDC
 claims document instead of only the static `vk_`/`vut_` id. A request carrying
-the configured `header` (an **already transport-verified** document — terminate
+the configured `header` (an **already transport-verified** document: terminate
 mTLS / verify the token at the edge) has its principal resolved before policy
-evaluation.
+evaluation, but only when it also carries `<header>-signature`, an HMAC-SHA-256
+the edge computes with the shared key in `VULTRINO_IDENTITY_SECRET` (or
+`VULTRINO_IDENTITY_SECRET_FILE`) over the document, an expiry at most 300 s
+ahead and the SHA-256 of the request's bearer. A missing, wrong, expired or
+other-bearer signature makes Vultrino ignore the document (the static principal
+stands). With `[identity]` set, `vultrino web` refuses to start if that key is
+missing or shorter than 32 bytes.
 
 ```toml
 [identity]
@@ -288,8 +307,15 @@ malformed/untrusted document is ignored (the static principal stands). See
 | Variable | Description |
 |----------|-------------|
 | `VULTRINO_PASSWORD` | Storage encryption password (avoids prompts) |
-| `VULTRINO_CONFIG` | Path to config file |
+| `VULTRINO_POLICY_HASH_SECRET` | Required by `vultrino web`, which refuses to start without it. Use a random value and keep it the same across restarts. |
 | `RUST_LOG` | Override log level (e.g., `vultrino=debug`) |
+
+There is no `VULTRINO_CONFIG` variable. Pass the global `--config <path>` flag;
+otherwise the OS default path above is used. `vultrino init` and the web UI's
+`admin.json` always use the OS default config directory, whatever `--config`
+says. A config at the default path that fails to parse is ignored and the
+built-in defaults are used instead (a file passed with `--config` that fails to
+parse is an error).
 
 ## Policy Configuration
 

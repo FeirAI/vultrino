@@ -58,10 +58,18 @@ sudo mv vultrino /usr/local/bin/
 
 ```bash
 docker pull ghcr.io/feirai/vultrino:latest
-docker run --rm -p 7879:7879 \
+docker run --rm -p 127.0.0.1:7879:7879 \
   -e VULTRINO_PASSWORD=your-secure-password \
+  -e VULTRINO_POLICY_HASH_SECRET=a-stable-random-secret \
+  -e VULTRINO_ADMIN_USERNAME=admin \
+  -e VULTRINO_ADMIN_PASSWORD=your-admin-password \
   ghcr.io/feirai/vultrino:latest
 ```
+
+`vultrino web` (the image's default command) refuses to start without
+`VULTRINO_POLICY_HASH_SECRET` and an admin login. This throwaway container keeps its
+vault inside the container. Vultrino has no built-in TLS, so keep the port on
+localhost or behind a TLS-terminating proxy.
 
 See [Docker deployment](../deployment/docker.md) for compose and volume layout.
 

@@ -43,6 +43,10 @@ The module must export:
 - optionally `vultrino_validate_params(action_ptr, action_len, params_ptr,
   params_len) -> i32`.
 
+The module must also export its linear memory as `memory`, or every call fails. Each
+instance may grow to at most 64 MiB of linear memory, and a response larger than 8 MiB
+fails the call.
+
 The execute request is JSON:
 
 ```json

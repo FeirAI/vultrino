@@ -5,7 +5,8 @@ When an agent misbehaves you need to **stop it now**, not at the end of its run.
 ## Halting an agent
 
 ```bash
-# Admin API (Permission::Admin). Convergent: a repeat under the same
+# Admin API: requires a global (operator) admin key; a tenant-scoped admin
+# key is refused, for halt and for lifting a halt. Convergent: a repeat under the same
 # Idempotency-Key RE-ASSERTS the halt rather than replaying it.
 curl -XPOST https://vultrino.example.com/api/v1/agents/bot-7/halt \
   -H "Authorization: Bearer vk_admin_..."
@@ -20,9 +21,12 @@ The response summarizes the three legs:
   "deny_policy_id": "halt:bot-7",
   "policy_active": true,
   "in_flight": [ { "session_id": "...", "credential": "...", "action": "...", "started_at": "..." } ],
-  "callbacks_fired": 1
+  "callbacks_fired": 1,
+  "kill_fence": { "live": true, "epoch": 1 }
 }
 ```
+
+`kill_fence.live` is `true` only when the stored kill policy was read back from the vault under its lock (`epoch` is then at least 1); govder confirms the kill leg only on that.
 
 Lift a halt with `DELETE /api/v1/agents/{label}/halt` (the kill policy is removed; **already-revoked tokens stay revoked** — revocation is permanent, so mint fresh tokens to resume the agent).
 

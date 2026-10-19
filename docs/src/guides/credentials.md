@@ -11,7 +11,7 @@ Vultrino supports several credential types:
 | `api_key` | API tokens, bearer tokens | `Authorization: Bearer <key>` |
 | `basic_auth` | Username/password auth | `Authorization: Basic <base64>` |
 | `oauth2` | OAuth2 flows | `Authorization: Bearer <access_token>` |
-| `private_key` | SSH keys, signing keys | (used for signing, not HTTP) |
+| `private_key` | Stored only through the admin API (`POST /api/v1/credentials`); `vultrino add` does not accept it and no built-in plugin uses it yet | (not used for HTTP) |
 
 ## Adding Credentials
 
@@ -101,16 +101,18 @@ vultrino role create github-readonly --scopes "github-*" --permissions read,exec
 vultrino list
 
 # Output:
-# ID                                    Alias           Type        Created
-# 550e8400-e29b-41d4-a716-446655440000  github-api      api_key     2024-01-15
-# 6ba7b810-9dad-11d1-80b4-00c04fd430c8  stripe-live     api_key     2024-01-16
+# ALIAS                TYPE            ID                                   DESCRIPTION
+# --------------------------------------------------------------------------------
+# github-api           api_key         550e8400-e29b-41d4-a716-446655440000 -
+# stripe-live          api_key         6ba7b810-9dad-11d1-80b4-00c04fd430c8 -
 ```
 
 ### JSON Output
 
-```bash
-vultrino list --json | jq '.[] | select(.type == "api_key")'
-```
+There is no `--json` flag. `vultrino list --format json` exists, but in this build it
+fails with a serialization error once any credential is stored (secret fields can only
+be serialized inside the vault). For machine-readable metadata use the JSON API,
+`GET /api/v1/credentials`.
 
 ### Via Web UI
 
@@ -163,7 +165,7 @@ Future versions will support in-place updates.
 
 ```bash
 vultrino remove old-api-key
-# Deleted credential: old-api-key
+# Credential 'old-api-key' removed
 ```
 
 ### Web UI
@@ -217,11 +219,9 @@ Set up a rotation schedule:
 
 ### 5. Audit Usage
 
-Check what's using each credential:
-```bash
-# View audit logs
-tail -f /var/log/vultrino/audit.log | grep github-api
-```
+There is no audit log file. Credential use and admin changes are recorded as events in
+the event outbox; read them with `GET /api/v1/events?after=<cursor>` (global admin
+key).
 
 ## Backup and Recovery
 
@@ -235,15 +235,23 @@ including kill switches. Stop every vultrino process first, then copy both files
 ```bash
 d=~/backup/vultrino-$(date +%Y%m%d)
 mkdir -p "$d"
-cp ~/.vultrino/credentials.enc ~/.vultrino/credentials.wal "$d"/
+# default vault location on Linux; use your [storage.file] path if you set one
+cp ~/.local/share/vultrino/credentials.enc ~/.local/share/vultrino/credentials.wal "$d"/
 ```
+
+This copies only the vault. `vultrino vault backup <dir>` also copies the outbox and
+the averin stores and checks them against a manifest, so prefer it.
 
 ### Recovery
 
-To restore, stop every vultrino process, then put back both files from the same backup:
+To restore, stop every vultrino process, then put back both files from the same backup
+(or use `vultrino vault restore <dir>` for a `vault backup` copy):
 ```bash
-cp ~/backup/vultrino-20240115/credentials.enc ~/backup/vultrino-20240115/credentials.wal ~/.vultrino/
+cp ~/backup/vultrino-20240115/credentials.enc ~/backup/vultrino-20240115/credentials.wal ~/.local/share/vultrino/
 ```
+A restore does not detect a rollback: restoring an older backup undoes every kill,
+revocation and approval made after it, so re-apply those (and check Govder's kill
+state) before starting the service again.
 A vault file restored without its `.wal` is refused at start. A `.wal` from a different
 moment than the vault file fails the start or silently drops the records written in between.
 

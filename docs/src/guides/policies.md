@@ -53,7 +53,7 @@ action = "allow"
 | `name` | string | Unique policy name |
 | `credential_pattern` | string | Glob pattern for credentials this policy applies to |
 | `principal_pattern` | string (optional) | Glob over the presenting principal (key/token id or its `agent_label`). When set, the policy applies **only** to matching principals (V4). |
-| `default_action` | string | Action when no rules match: `allow`, `deny` |
+| `default_action` | string | Action when no rules match: `allow`, `deny` or `prompt` (default `deny` when omitted) |
 | `rules` | array | List of policy rules |
 
 ### Per-agent policies (`principal_pattern`)
@@ -79,7 +79,7 @@ A request that carries **no** principal never matches a policy that sets
 | Field | Type | Description |
 |-------|------|-------------|
 | `condition` | object | Condition to evaluate |
-| `action` | string | Action if condition matches: `allow`, `deny` |
+| `action` | string | Action if condition matches: `allow`, `deny` or `prompt` |
 
 ## Conditions
 
@@ -144,15 +144,12 @@ condition = { method_match = ["POST", "PUT", "PATCH", "DELETE"] }
 
 ### Time Window
 
-Restrict to specific hours:
-
-```toml
-# Business hours only (9 AM - 5 PM)
-condition = { time_window = { start = "09:00", end = "17:00" } }
-
-# Night shift (11 PM - 7 AM)
-condition = { time_window = { start = "23:00", end = "07:00" } }
-```
+A time window is **not** accepted in `config.toml` `[[policies]]`: a rule that uses
+`time_window` fails to parse, so the config does not load. It can be set only on a
+policy written through the admin API (`POST /api/v1/policies`,
+`PUT /api/v1/policies/{id}`). It is evaluated against the server's local clock and
+timezone; a window whose `start` is later than its `end` wraps past midnight, and
+`start` equal to `end` is refused.
 
 ### Rate Limit
 
@@ -276,17 +273,10 @@ action = "allow"
 
 ### Business Hours Only
 
-```toml
-[[policies]]
-name = "sensitive-data-access"
-credential_pattern = "database-*"
-default_action = "deny"
-
-# Only during business hours
-[[policies.rules]]
-condition = { time_window = { start = "09:00", end = "18:00" } }
-action = "allow"
-```
+This pattern cannot be written in `config.toml`: `time_window` is accepted only on a
+policy written through the admin API (see [Time Window](#time-window)). Push a policy
+with `default_action` `deny` and an `allow` rule whose condition is a `time_window`
+through `POST /api/v1/policies`.
 
 ### Multi-Service Policy
 
@@ -370,27 +360,15 @@ the decision for later requests).
 
 ### Verbose Logging
 
-Enable debug logging to see policy evaluation:
-
-```bash
-RUST_LOG=vultrino=debug vultrino web
-```
-
-Output:
-```
-DEBUG vultrino::policy: Evaluating policy "github-readonly" for credential "github-api"
-DEBUG vultrino::policy: Rule 1 url_match: matched
-DEBUG vultrino::policy: Rule 2 method_match: GET in [GET, HEAD] = true
-DEBUG vultrino::policy: Result: allow
-```
+The policy engine does not log a per-rule evaluation trace, even at
+`RUST_LOG=vultrino=debug`. A denial returns its reason to the caller and, in enforce
+mode, emits a `policy.denied` event to the event outbox.
 
 ### Audit Log
 
-Check why requests were denied:
-
-```bash
-grep "policy_denied" /var/log/vultrino/audit.log
-```
+There is no audit log file. Enforce-mode denials are emitted as `policy.denied` events
+in the event outbox; read them with `GET /api/v1/events?after=<cursor>` (global admin
+key).
 
 ## Common Patterns
 
@@ -491,6 +469,6 @@ credential_pattern = "ai-*"
 
 ### 5. Verify Before Deploying
 
-Confirm a policy behaves as intended before relying on it in production: enable
-debug logging (`RUST_LOG=vultrino=debug`) and exercise the credential, then check
-the evaluation trace and the `policy_denied` events in the audit trail.
+Confirm a policy behaves as intended before relying on it in production: exercise
+the credential, then check the denial reasons returned to the caller and the
+`policy.denied` events in the event outbox (there is no per-rule evaluation trace).

@@ -22,28 +22,28 @@ Vultrino is distributed as a single binary with no external dependencies. This i
 
 ### Storage
 Credentials are stored encrypted using AES-256-GCM. Storage options:
-- **File** (default) — Encrypted JSON file on disk
+- **File** (default): an encrypted vault snapshot plus its write-ahead log on disk
 - **Keychain** — OS keychain integration (coming soon)
 - **Vault** — HashiCorp Vault integration (coming soon)
 
 ### Network Security
 
 **Local Mode (default):**
-- Binds to `127.0.0.1` only
-- No external access
+- `vultrino web` listens on `127.0.0.1:7879` unless you pass `--bind`; the mode itself does not restrict the listen address
+- The session cookie has no Secure flag, so plain-HTTP login on localhost works
 - Suitable for single-machine use
 
-**Server Mode:**
-- Can bind to all interfaces (`0.0.0.0`)
+**Server Mode (`[server] mode = "server"`):**
+- Turns on the Secure session cookie and HSTS, assuming a TLS-terminating reverse proxy (nginx, Caddy) in front
+- Does not change the listen address; Vultrino has no built-in TLS and serves plain HTTP
 - Requires additional security measures
-- Use with TLS termination proxy (nginx, Caddy)
 
 ## Security Recommendations
 
 1. **Always use HTTPS in production** — Use a reverse proxy with TLS
 2. **Restrict network access** — Firewall rules, VPN, or private network
 3. **Use strong passwords** — Both storage and admin passwords
-4. **Enable audit logging** — Track credential usage
+4. **Retain the event outbox** outside Vultrino (push it to `[outbox] url` or poll `GET /api/v1/events`); there is no audit log file to enable
 5. **Rotate API keys** — Set expiration on Vultrino API keys
 6. **Principle of least privilege** — Create scoped roles for each application
 

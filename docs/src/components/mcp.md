@@ -7,7 +7,7 @@ The Model Context Protocol (MCP) server allows AI agents to make authenticated A
 MCP is a protocol for AI assistants to interact with external tools and services. Vultrino's MCP server provides tools for:
 - Listing available credentials (by alias only)
 - Making authenticated HTTP requests
-- Managing credentials (with proper permissions)
+- Inspecting credential metadata and polling approvals (adding or deleting credentials is not an MCP tool)
 
 ```
 ┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐
@@ -127,7 +127,7 @@ await client.callTool("list_credentials", {
 
 List all available credential aliases.
 
-**Input:** None
+**Input:** `api_key` (required), `pattern` (optional glob filter on aliases)
 
 **Output:**
 ```json
@@ -233,10 +233,10 @@ If RBAC is enabled, the MCP server checks:
 
 ### Audit Trail
 
-All MCP tool calls are logged:
-```
-2024-01-15T10:30:00Z MCP http_request credential=github-api url=https://api.github.com/user
-```
+There is no audit log file (`[logging] audit_file` is parsed but not used). The stdio
+MCP server writes requests and responses to the process log only at debug verbosity
+(`-v` or `RUST_LOG=debug`), in sanitized form. Policy denials, approvals and metered calls
+are recorded as events in the event outbox (`GET /api/v1/events`).
 
 ## Tool Descriptions
 
@@ -352,5 +352,5 @@ The MCP server provides rich tool descriptions to help AI agents understand capa
 
 1. **Use short-lived credentials** — Rotate frequently
 2. **Scope credentials narrowly** — Each credential should do one thing
-3. **Enable audit logging** — Track all credential usage
+3. **Retain the event outbox** (push it to `[outbox] url` or poll `GET /api/v1/events`); there is no audit log file
 4. **Review agent behavior** — Periodically check what the AI is doing

@@ -36,7 +36,7 @@ List all credentials available to the current session.
 }
 ```
 
-**Input:** None
+**Input:** `api_key` (required), `pattern` (optional)
 
 **Output:**
 ```json
@@ -144,12 +144,7 @@ Make an authenticated HTTP request using a stored credential.
 
 **Error Responses:**
 
-| Error | Description |
-|-------|-------------|
-| `credential_not_found` | The specified credential alias doesn't exist |
-| `permission_denied` | No permission to use this credential |
-| `policy_denied` | Request blocked by policy rules |
-| `upstream_error` | Failed to connect to target server |
+Errors (credential not found, permission or policy denied, upstream failure) come back as a free-text message in a tool result with `isError: true`. There are no machine-readable error codes on this transport; match on the text only for display, not for logic.
 
 **Example Usage:**
 ```
@@ -263,16 +258,16 @@ If the API key's role has credential scopes, tools are further restricted:
 
 ## Error Format
 
-All MCP tool errors follow this format:
+A failed tool call returns a normal MCP tool result with `isError: true` and a single text content item holding the message:
 
 ```json
 {
-  "error": {
-    "code": "error_code",
-    "message": "Human-readable error message"
-  }
+  "content": [{ "type": "text", "text": "Human-readable error message" }],
+  "isError": true
 }
 ```
+
+Protocol-level problems (an unknown tool, malformed params) are JSON-RPC errors instead.
 
 ## Usage Patterns
 
@@ -379,7 +374,7 @@ The `body` field is a string. Parse it as appropriate:
 ## Security Notes
 
 1. **Alias-only schema** — Raw credential fields are not present in MCP tool input/output
-2. **All requests are logged** — Audit trail of all tool usage
+2. **Events are recorded** (policy denials, approvals and metered calls go to the event outbox; there is no audit log file)
 3. **Policies are enforced** — URL and method restrictions apply
 4. **Rate limits apply** — Prevent abuse
 5. **Scopes restrict access** — Roles limit which credentials are visible

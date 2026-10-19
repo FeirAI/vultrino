@@ -14,7 +14,7 @@ Vultrino solves this by:
 1. Storing credentials securely (encrypted at rest)
 2. Exposing only aliases to agents
 3. Injecting auth automatically
-4. Logging all usage
+4. Recording credential use as events in the event outbox
 
 ## Integration Options
 
@@ -61,16 +61,17 @@ Content-Type: application/json
 
 ### 3. CLI Tool Calls
 
-For agents that can execute shell commands:
+For agents that can execute shell commands, use a scoped API key against a running `vultrino web`:
 
 ```bash
-vultrino request github-api https://api.github.com/user
+vultrino --key vk_your_api_key request github-api https://api.github.com/user
 ```
+
+Do not give an agent `VULTRINO_PASSWORD`: without `--key`, `vultrino request` opens the vault directly with the master password, and anything holding that password can decrypt every stored credential.
 
 **Pros:**
 - Simplest integration
 - Works with function calling
-- Easy to audit
 
 ## Setting Up for AI Agents
 
@@ -216,14 +217,13 @@ vultrino key create ai-key --role ai-agent --expires 7d
 
 ### 4. Monitor Usage
 
-Check what the AI is doing:
+There is no audit log file. Check what the AI is doing through the event outbox
+(global admin API key):
 
 ```bash
-# Watch audit log
-tail -f /var/log/vultrino/audit.log
-
-# Filter by credential
-grep "github-api" /var/log/vultrino/audit.log
+# Policy denials, approvals, halts, admin changes and metered calls after a cursor
+curl -s "http://127.0.0.1:7879/api/v1/events?after=0" \
+  -H "Authorization: Bearer vk_admin_..."
 ```
 
 ### 5. Restrict Scopes
@@ -337,32 +337,12 @@ If a credential is not available or access is denied:
 - Check Vultrino binary path is correct
 - Review stderr for error messages
 
-### Audit Log Not Showing Requests
-
-- Audit logging may be disabled
-- Check config: `logging.audit_file`
-- Verify file permissions
-
 ## Monitoring AI Usage
 
-### Real-time Monitoring
-
-```bash
-# Watch all AI requests
-tail -f /var/log/vultrino/audit.log | grep ai-agent-key
-
-# Count requests per credential
-awk '{print $4}' /var/log/vultrino/audit.log | sort | uniq -c
-```
-
-### Usage Reports
-
-Generate daily summaries:
-```bash
-# Requests per credential today
-grep $(date +%Y-%m-%d) /var/log/vultrino/audit.log | \
-  awk '{print $4}' | sort | uniq -c | sort -rn
-```
+There is no audit log file (`[logging] audit_file` is parsed but not used). Read the
+event outbox with `GET /api/v1/events?after=<cursor>` (global admin key) for policy
+denials, approvals, halts, admin changes and metered calls, and the process logs for
+the rest.
 
 ### Alerting
 

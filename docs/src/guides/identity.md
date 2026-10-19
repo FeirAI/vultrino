@@ -15,9 +15,11 @@ header = "x-spiffe-verified"    # inbound header carrying the verified document
 allowed = ["example.org"]       # SPIFFE trust domains (or OIDC issuers); empty = any
 ```
 
+The edge must also sign the document: send `<header>-signature` with the value `v1.<exp>.<base64url MAC>`, an HMAC-SHA-256 under the shared key in `VULTRINO_IDENTITY_SECRET` (or `VULTRINO_IDENTITY_SECRET_FILE`) over the document, an expiry at most 300 s ahead and the SHA-256 of the bearer the request authenticates with. A missing, wrong, expired or other-bearer signature makes Vultrino ignore the document (the static `vk_`/`vut_` principal stays). With `[identity]` set, `vultrino web` refuses to start if the key is missing or shorter than 32 bytes.
+
 So a `principal_pattern` Deny on `spiffe://example.org/*` blocks any request whose presented SVID is in that trust domain, regardless of which `vk_`/`vut_` carried it. A malformed or untrusted document is logged and **ignored** (the request falls back to its static `vk_`/`vut_` principal) — a bad document can only fail to refine the principal, never elevate it.
 
-> **The resolved subject is an _additional_ match dimension, never a replacement.** The principal's stable `vk_`/`vut_` id remains the **halt / ownership anchor**, so a [halt](./kill-halt.md) keyed on the credential always holds even when a workload identity is presented (it can't be escaped by waving an SVID). To **halt by a resolved workload identity** itself, push a kill/Deny policy with `principal_pattern = <the SVID/OIDC subject>` through the [admin write API](./policies.md) — `vultrino agent halt` targets agent labels / credential ids (which exclude the `:`/`/` in SVID strings), whereas a policy `principal_pattern` matches the resolved subject directly.
+> **The resolved subject is an _additional_ match dimension, never a replacement.** The principal's stable `vk_`/`vut_` id remains the **halt / ownership anchor**, so a [halt](./kill-halt.md) keyed on the credential always holds even when a workload identity is presented (it can't be escaped by waving an SVID). To **halt by a resolved workload identity** itself, push a kill/Deny policy with `principal_pattern = <the SVID/OIDC subject>` through the [admin write API](./policies.md); the halt endpoint (`POST /api/v1/agents/{label}/halt`) targets agent labels / credential ids (which exclude the `:`/`/` in SVID strings), whereas a policy `principal_pattern` matches the resolved subject directly.
 
 ## Resolving a workload identity
 
