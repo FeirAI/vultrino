@@ -83,14 +83,14 @@ upstream.
 9. **A tenant-scoped admin key is partitioned on the surfaces listed below, not on all of them.**
    An admin key is either **global** (operator/root, `tenant == None`) or
    **tenant-scoped** (`tenant == Some(t)`; e.g. a product aggregator like
-   feir-os). It is **not** confined on the capability catalog: `POST`, `PUT` and
-   `DELETE /api/v1/capabilities` carry no tenant check, so a tenant-scoped admin key
-   can create, replace or delete a capability for any credential, including another
-   tenant's, and `GET /api/v1/capabilities` and `GET /api/v1/sessions` list every
+   feir-os). Capability writes
+   (`POST`, `PUT` and `DELETE /api/v1/capabilities`) are operator-only: a tenant-scoped
+   key gets `403 operator_key_required`. The list routes are not partitioned:
+   `GET /api/v1/capabilities` and `GET /api/v1/sessions` list every
    tenant's entries; `GET /api/v1/tokens` and `GET /api/v1/policies` need only `read` and are not tenant-filtered either (so the policy read is not operator-only). Treat a tenant-scoped admin key as operator-trusted for those
-   routes. The partitioned surfaces are:
+   read routes. The partitioned surfaces are:
    - **Operator-only surfaces** — resources with no tenant field (policy CRUD,
-     role CRUD, the shared signed event outbox: list/dead-letters/replay) and the
+     capability writes, role CRUD, the shared signed event outbox: list/dead-letters/replay) and the
      label-addressed kill switch (agent `halt`/`unhalt`) — reject a tenant-scoped
      key with `403 operator_key_required`. They require the global operator key.
    - **Tenant-scoped surfaces** — resources that carry a tenant (use-token revoke,

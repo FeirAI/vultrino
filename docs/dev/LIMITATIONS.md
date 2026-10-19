@@ -849,3 +849,11 @@ miss a change. Deny rules and the unparseable
 pre-check run before the kill tier, so a halted principal with an unparseable
 URL gets the unparseable reason instead of the halt reason; the outcome is still
 Deny.
+
+## Workload-exchange generation cap counts tokens
+
+`max_live_generations` (default 4) counts live use TOKENS, not exchanges. One
+exchange keeps 1 MCP token plus 1 per model channel (mint-then-retire keeps only
+the newest generation), so with the default a template with 3 or more model
+channels is refused (`429 live_generation_cap`) on every re-exchange until the
+previous tokens expire. Raise `max_live_generations` for such templates.
