@@ -10,7 +10,7 @@ index c8e8ec6..228e388 100644
 +            .into_iter()
 +            .filter(|rec| self.in_flight.lock().remove(&rec.idem).is_some())
 +            .collect();
-+        std::thread::yield_now();
++        std::thread::sleep(std::time::Duration::from_millis(2));
          let mut st = self.state.lock();
 -        let mut flight = self.in_flight.lock();
          let mut dropped = Vec::new();
