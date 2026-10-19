@@ -107,8 +107,9 @@ Options:
   -f, --format <FORMAT>    Output format: table (default) or json
 ```
 
-`--format json` currently fails with a serialization error once any credential is
-stored; use the table output or `GET /api/v1/credentials`.
+`--format json` prints credential metadata only (`id`, `alias`, `credential_type`,
+`metadata`, `created_at`, `updated_at`), never secret fields. With no credentials stored
+it prints `No credentials stored` instead of `[]`.
 
 **Example:**
 ```bash

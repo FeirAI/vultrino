@@ -235,7 +235,7 @@ If RBAC is enabled, the MCP server checks:
 
 There is no audit log file (`[logging] audit_file` is parsed but not used). The stdio
 MCP server writes requests and responses to the process log only at debug verbosity
-(`-v` or `RUST_LOG=debug`), in sanitized form. Policy denials, approvals and metered calls
+(`-v` or `RUST_LOG=debug`), in sanitized form. Policy denials (coalesced per subject), approvals and metered calls
 are recorded as events in the event outbox (`GET /api/v1/events`).
 
 ## Tool Descriptions

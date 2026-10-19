@@ -374,7 +374,7 @@ The `body` field is a string. Parse it as appropriate:
 ## Security Notes
 
 1. **Alias-only schema** — Raw credential fields are not present in MCP tool input/output
-2. **Events are recorded** (policy denials, approvals and metered calls go to the event outbox; there is no audit log file)
+2. **Events are recorded** (policy denials (coalesced per subject), approvals and metered calls go to the event outbox; there is no audit log file)
 3. **Policies are enforced** — URL and method restrictions apply
 4. **Rate limits apply** — Prevent abuse
 5. **Scopes restrict access** — Roles limit which credentials are visible

@@ -361,13 +361,11 @@ the decision for later requests).
 ### Verbose Logging
 
 The policy engine does not log a per-rule evaluation trace, even at
-`RUST_LOG=vultrino=debug`. A denial returns its reason to the caller and, in enforce
-mode, emits a `policy.denied` event to the event outbox.
+`RUST_LOG=vultrino=debug`. A denial returns its reason to the caller. In enforce mode a policy denial emits a `policy.denied` event to the event outbox, coalesced to at most one event per subject (agent label, else principal id, else credential) every 10 seconds per process, so the feed is a detection signal, not a count of denied calls. The per-process count of denied attempts is `unauthorized_attempts` in `GET /api/v1/metrics`.
 
 ### Audit Log
 
-There is no audit log file. Enforce-mode denials are emitted as `policy.denied` events
-in the event outbox; read them with `GET /api/v1/events?after=<cursor>` (global admin
+There is no audit log file. In enforce mode a policy denial emits a `policy.denied` event to the event outbox, coalesced to at most one event per subject (agent label, else principal id, else credential) every 10 seconds per process, so the feed is a detection signal, not a count of denied calls. The per-process count of denied attempts is `unauthorized_attempts` in `GET /api/v1/metrics`. Read the events with `GET /api/v1/events?after=<cursor>` (global admin
 key).
 
 ## Common Patterns
@@ -471,4 +469,4 @@ credential_pattern = "ai-*"
 
 Confirm a policy behaves as intended before relying on it in production: exercise
 the credential, then check the denial reasons returned to the caller and the
-`policy.denied` events in the event outbox (there is no per-rule evaluation trace).
+`policy.denied` events in the event outbox (coalesced per subject, so do not count events to count denials; there is no per-rule evaluation trace).

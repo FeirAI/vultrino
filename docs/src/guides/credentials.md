@@ -109,10 +109,14 @@ vultrino list
 
 ### JSON Output
 
-There is no `--json` flag. `vultrino list --format json` exists, but in this build it
-fails with a serialization error once any credential is stored (secret fields can only
-be serialized inside the vault). For machine-readable metadata use the JSON API,
-`GET /api/v1/credentials`.
+There is no `--json` flag. `vultrino list --format json` prints each credential's
+metadata (`id`, `alias`, `credential_type`, `metadata`, `created_at`, `updated_at`) and
+never secret fields. With no credentials stored it prints `No credentials stored`
+instead of `[]`.
+
+```bash
+vultrino list --format json | jq '.[] | select(.credential_type == "api_key")'
+```
 
 ### Via Web UI
 
