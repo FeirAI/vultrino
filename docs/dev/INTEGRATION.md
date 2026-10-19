@@ -15,7 +15,8 @@ Run `vultrino web` (the JSON API server), then provision via the admin API or CL
   write-only.
 - Author allow policies (default-deny means a credential is blocked until you
   allow it) via `POST /api/v1/policies` or `[[policies]]` in `config.toml`.
-- Mint either a long-lived **API key** (`POST /api/v1/keys` via the web UI / CLI)
+- Mint either a long-lived **API key** (`vultrino key create`, or the `/keys` page of the
+  web UI; there is no JSON `/api/v1/keys` route)
   or a narrow **use token** (`POST /api/v1/tokens`) for the agent.
 
 Full details in [QUICKSTART.md](QUICKSTART.md), [API.md](API.md), and
@@ -42,8 +43,9 @@ response. This is the entire integration surface for "use a credential safely".
 - **`200`** — the action ran; use `status`/`headers`/`body`.
 - **`202` `pending_approval`** — the action is gated on a human; poll
   `GET /api/v1/approvals/{id}` with the **same** bearer until `status` is
-  `Approved` (then `result` is present), `Denied`, or `Expired`. Run **at most
-  once** — don't resubmit on `Approved`.
+  `approved` with `executed: true` (then `result` is present, or `error` if the
+  action failed), `denied`, or `expired` (the values are lowercase). Run **at most
+  once**: don't resubmit on `approved`.
 - **`4xx`** — denied/invalid; the `code`/`error` carry the reason. Do not retry a
   policy denial.
 
@@ -61,8 +63,11 @@ Enable the `[outbox]`. Your own consumer can then:
 
 - **Receive push deliveries** at `[outbox] url`, verifying `Govder-Signature`
   (`sha256=HMAC-SHA256(hmac_secret, body)`) on each.
-- **Poll** `GET /api/v1/events?after=N` (admin key) to replay the ordered,
-  gap-free event stream — approvals, halts, policy changes, credential rotation,
+- **Poll** `GET /api/v1/events?after=N` (admin key) to replay the ordered
+  event stream (gap-free only within the retained window: the `max_retained_events` cap
+  prunes the oldest events whether or not anyone read them, and a failed append is
+  reported only by a later `meter.lost` marker; check `oldest_sequence` and
+  `meter_gap_pending` on each page) — approvals, halts, policy changes, credential rotation,
   and per-call `meter.observed` usage. See [METERING.md](METERING.md).
 
 ### 6. Runtime control (optional, standalone)
@@ -117,7 +122,8 @@ mints/revokes use tokens, and halts agents. Two contract details:
 - **Principal targeting (V4):** bind an `agent_label` to a use token (or set it on
   a kill policy's `principal_pattern`) so a policy targets one agent.
 - **Propagation timing:** an admin policy push is synchronous on the web process
-  but bounded-staleness (`POLICY_REFRESH_SECS = 5`) on other processes. For an
+  but bounded-staleness (default 5 s, settable from 1 to 86400 s with
+  `VULTRINO_POLICY_REFRESH_SECS`) on other processes. For an
   immediate kill, revoke the token (storage-authoritative). See
   [ARCHITECTURE.md](ARCHITECTURE.md).
 
@@ -150,7 +156,9 @@ in [METERING.md](METERING.md). Wire-contract specifics:
 
 Vultrino's signed event outbox is the authentic, ordered record a proof plane can
 ingest and attest over. Vultrino itself does not produce cryptographic proofs; it
-produces the HMAC-signed, gap-free event stream that a proof plane elevates.
+produces an event stream, HMAC-signed when `[outbox] hmac_secret` is set and
+sequence-numbered (gap-free only within the retained window; see section 5), that a
+proof plane can ingest.
 
 ### Shared-secret alignment
 

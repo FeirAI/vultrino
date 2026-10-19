@@ -14,7 +14,7 @@ that *run a process* are:
 |------------|--------------|-----------------------|
 | `vultrino web` | `127.0.0.1:7879` | The **HTTP server**: admin panel (HTML) **and** the JSON API under `/api/v1/`. This is the process that serves `/api/v1/execute`, the admin/kill/policy surface, and the signed-outbox replay endpoints. It also runs the background outbox-delivery, policy-refresh, and approval-sweep loops. |
 | `vultrino mcp` (or `vultrino serve --mcp`) | n/a (stdio) | The **MCP server** for LLM tool integration over stdio. Also runs the policy-refresh, approval-sweep, and outbox-delivery loops. |
-| `vultrino serve` (bare, no `--mcp`) | n/a | **Refuses to start.** The former fail-open stub (`run_server` printed "server running" and bound nothing — a footgun: an operator could point agents at a port that silently refused everything) was removed. Bare `serve` now exits immediately with an error naming `serve --mcp` (MCP stdio) and `vultrino web` (JSON API) as the real surfaces; `--bind` is rejected as inapplicable outside `web`. |
+| `vultrino serve` (bare, no `--mcp`) | n/a | **Refuses to start.** The former fail-open stub (`run_server` printed "server running" and bound nothing — a footgun: an operator could point agents at a port that silently refused everything) was removed. Bare `serve` now exits immediately with an error naming `serve --mcp` (MCP stdio) and `vultrino web` (JSON API) as the real surfaces; the error notes that `--bind` applies only to `web` (`serve --mcp` accepts `--bind` and ignores it). |
 
 > **Accuracy note.** Older guide docs (`docs/src/components/proxy.md`,
 > `docs/src/api/http.md`) describe a header-driven proxy on port 7878 served by
@@ -23,9 +23,11 @@ that *run a process* are:
 > by `vultrino web` on 7879 (routes in `src/web/server.rs::build_router`). This
 > dev set documents the shipped routes — see [API.md](API.md).
 
-All other subcommands (`add`, `list`, `key`, `role`, `token`, `approval`,
-`plugin`, `meta`, `init`, `request`, `action`) are one-shot CLI operations that
-open the encrypted vault directly (they require the storage password) and exit.
+All other subcommands (`add`, `list`, `remove`, `info`, `key`, `role`, `token`,
+`approval`, `plugin`, `meta`, `init`, `rekey`, `vault` (`backup`/`restore`/`check`),
+`policy`, `request`, `action`; `vultrino --help` has the current list) are one-shot CLI
+operations; most open the encrypted vault directly (they require the storage password)
+and exit (`init` writes only the config and the web login).
 
 ## Component model
 
@@ -174,8 +176,11 @@ worker can never overwrite the re-taker's outcome.
    request charges none).
 
 Conditions: `UrlMatch` (glob; a trailing `*` is a prefix match), `MethodMatch`
-(case-insensitive), `RateLimit { max, window_secs }` (in-memory, per-process,
-per-credential sliding window), `SpendCap { asset, per_action_max }`
+(case-insensitive), `RateLimit { max, window_secs }` (in-memory and
+per-process, so lost on restart; a fixed window, not a sliding one, so a burst that
+straddles a window boundary can reach twice `max`; one counter per credential alias,
+per agent (its `agent_label`, else its key or token id) and per `(max, window_secs)`
+rule, so agents sharing a credential each get their own `max`), `SpendCap { asset, per_action_max }`
 (**per-action, stateless** — no cumulative ledger), `TimeWindow`, `And`/`Or`/`Not`,
 `Always`. **SpendCap fails closed:** a missing/unparseable amount or a mismatched
 asset → deny. A `SpendCap` must be a rule's top-level condition (not nested) and

@@ -1,7 +1,12 @@
 # Configuration Reference
 
-Every environment variable and `config.toml` key the `vultrino` binary reads,
-with defaults, required-ness, and fail-closed behavior. Verified against
+Most environment variables and `config.toml` keys the `vultrino` binary reads,
+with defaults, required-ness, and fail-closed behavior. Not yet covered here:
+`VULTRINO_ADMIN_USERNAME`, `VULTRINO_ADMIN_PASSWORD` and `VULTRINO_ADMIN_PASSWORD_HASH`
+(each with a `_FILE` form; the headless web login used when `admin.json` is absent),
+`VULTRINO_PLUGIN_DIR` (the plugin directory; must be absolute), and the
+`[[internal_destinations]]` and `[[buffer_pins]]` tables; see `src/main.rs` and
+`src/config/types.rs` for these. Verified against
 `src/main.rs` (env), `src/config/types.rs` (raw TOML parse), and
 `src/config/mod.rs` (validation + defaults).
 
@@ -68,7 +73,7 @@ mode = "local"            # "local" | "server"
 |-----|---------|-------|
 | `bind` | `127.0.0.1:7878` | **Parsed but not wired to any run mode.** `vultrino web` binds its own `--bind` CLI flag (default `127.0.0.1:7879`), not this key; `mcp` is stdio; bare `vultrino serve` (no `--mcp`) refuses to start rather than binding anything (see [ARCHITECTURE.md](ARCHITECTURE.md)). Set `--bind` on `vultrino web` directly to change its listen address. |
 | `mode` | `local` | `server` sets `require_auth = true` on the PEP (JSON API auth is always enforced regardless; `mode` controls the in-process default). Any value other than `"server"` parses as `local`. |
-| `[server.tls]` | none | `cert_path` + `key_path`. Parsed into config; TLS termination is expected at the edge (see [SECURITY.md](SECURITY.md)). |
+| `[server.tls]` | none | **Not supported:** a config that sets it fails to load ("[server.tls] is not supported"); Vultrino has no TLS listener and serves plaintext HTTP. Terminate TLS at a reverse proxy and set `mode = "server"`, which turns on Secure cookies and HSTS on the assumption that the proxy terminates TLS (see [SECURITY.md](SECURITY.md)). |
 
 ### `[storage]`
 
