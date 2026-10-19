@@ -673,7 +673,11 @@ CONFIGURATION, `[averin]`). What that does and does not give you:
   stdio MCP session, SIGTERM or Ctrl+C on the web server) first closes every open window and seals what
   is waiting for up to five seconds; what averin did not take in that time becomes a refusal gap, including a record whose seal was
   still in flight when the five seconds ran out (such a record may also have reached averin, so it can be
-  both sealed there and a gap here, never neither). A
+  both sealed there and a gap here, never neither). While the periodic drain runs beside it, the recorder
+  hands records over atomically (a taken batch is registered in flight under the recorder's lock, and a retry
+  rejoins the queue in one locked step), so every record is queued, in flight, sealed or gapped at every
+  moment; the stop paths also abort the periodic drain first. A refusal noted after the stop's collection is
+  neither sealed nor gapped. A
   process killed in that time loses what it had not sealed, with no gap record (the `policy.denied` outbox events written at
   refusal time still exist for policy, kill and cross-tenant refusals). A record that averin does not
   accept (unreachable, 5xx or 429 for three drain ticks, or any other error status at once) becomes an

@@ -1,0 +1,24 @@
+diff --git a/src/refusal.rs b/src/refusal.rs
+index c8e8ec6..228e388 100644
+--- a/src/refusal.rs
++++ b/src/refusal.rs
+@@ -700,13 +700,14 @@ impl RefusalRecorder {
+     /// every moment. A record already claimed by the shutdown collection is skipped. Past
+     /// [`MAX_READY`] the removed records are returned as dropped (the caller records their gaps).
+     pub(crate) fn requeue_in_flight(&self, recs: Vec<Outgoing>) -> Vec<Outgoing> {
++        let owned: Vec<Outgoing> = recs
++            .into_iter()
++            .filter(|rec| self.in_flight.lock().remove(&rec.idem).is_some())
++            .collect();
++        std::thread::yield_now();
+         let mut st = self.state.lock();
+-        let mut flight = self.in_flight.lock();
+         let mut dropped = Vec::new();
+-        for rec in recs.into_iter().rev() {
+-            if flight.remove(&rec.idem).is_none() {
+-                continue;
+-            }
++        for rec in owned.into_iter().rev() {
+             if st.ready.len() >= MAX_READY {
+                 dropped.push(rec);
+             } else {

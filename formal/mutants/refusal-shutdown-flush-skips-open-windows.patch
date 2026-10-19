@@ -1,12 +1,12 @@
 diff --git a/src/averin/mod.rs b/src/averin/mod.rs
-index 00e8eb4..f39ba9b 100644
+index 3fc41ea..5c6420d 100644
 --- a/src/averin/mod.rs
 +++ b/src/averin/mod.rs
-@@ -934,7 +934,6 @@ impl AverinClient {
+@@ -954,7 +954,6 @@ impl AverinClient {
      /// first refusals still waiting for the next drain and the tails of open windows. Returns
      /// the number of records sealed.
      pub async fn flush_refusals_on_shutdown(&self, budget: Duration) -> usize {
 -        self.refusals.close_all_windows();
-         let sealed = tokio::time::timeout(budget, async {
-             let mut sealed = 0usize;
-             for _ in 0..REFUSAL_MAX_TRIES {
+         // Shared with the drain so records sealed before the budget expired still count.
+         let sealed = AtomicUsize::new(0);
+         let _ = tokio::time::timeout(budget, async {
