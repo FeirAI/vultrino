@@ -112,8 +112,10 @@ jobs:
     runs-on: ubuntu-latest
     # 42 to 56 minutes on main at 105 fast mutants; about 60 at 110 (measured). A cold
     # dependency build (a Cargo.lock change, or a new cache key) adds several
-    # minutes. 30 and then 60 were hit (issue #47, PR #74 runs).
-    timeout-minutes: 90
+    # minutes. 30 and then 60 were hit (issue #47, PR #74 runs). On 2026-10-19 it took 60 to 81
+    # minutes when it finished, and 4 of 10 runs (main twice) were cancelled at 90. vultrino is
+    # public, so hosted minutes are free.
+    timeout-minutes: 150
     env:
       # One target dir under the workspace so rust-cache keeps the dependency
       # build; the mutant scratch worktree reuses it through --cargo-target-dir
