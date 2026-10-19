@@ -1,0 +1,17 @@
+diff --git a/src/averin/mod.rs b/src/averin/mod.rs
+index f2e4984..799346f 100644
+--- a/src/averin/mod.rs
++++ b/src/averin/mod.rs
+@@ -955,11 +955,7 @@ impl AverinClient {
+             AverinError::Request(_) => "averin unreachable".to_string(),
+             other => other.to_string(),
+         };
+-        self.record_refusal_gap(
+-            &rec.agent,
+-            "refusal_seal_failed",
+-            &format!("{}: {why}", refusal_detail(rec)),
+-        );
++        let _ = why;
+         if let Some(total) = self.claim_drop_log() {
+             tracing::warn!(
+                 target: "averin_seal",

@@ -1,10 +1,10 @@
 diff --git a/src/server/mod.rs b/src/server/mod.rs
-index a6b7ef8..c2c261a 100644
+index 9aead1e..51e42a5 100644
 --- a/src/server/mod.rs
 +++ b/src/server/mod.rs
-@@ -1568,6 +1568,20 @@ impl VultrinoServer {
-         let (plugin_name, action_name) = parse_action(&canonical_action)?;
+@@ -1766,6 +1766,20 @@ impl VultrinoServer {
          let full_action = format!("{}.{}", plugin_name, action_name);
+         rctx = rctx.resolved(&credential.alias, &full_action);
  
 +        // LLM credentials are /llm-only. A credential that backs an LLM-proxy
 +        // capability carries model spend; the generic dispatch paths (`/api/v1/execute`,
@@ -16,14 +16,14 @@ index a6b7ef8..c2c261a 100644
 +        // credential; still before policy evaluation, approval, use-token consumption,
 +        // evidence or any upstream call. An unreadable catalog or resolver refuses.
 +        if !via_llm_channel {
-+            self.refuse_llm_credential_off_channel(&credential, &request.credential)
++            self.refuse_llm_credential_off_channel(&credential, &request.credential, &rctx)
 +                .await?;
 +        }
 +
          // Authoritative use-token scope enforcement at the seam where the token
          // is actually spent — both credential and action scope, so the token's
          // single-action restriction is defended in depth rather than only at the
-@@ -1634,20 +1648,6 @@ impl VultrinoServer {
+@@ -1844,20 +1858,6 @@ impl VultrinoServer {
              }
          }
  
@@ -37,7 +37,7 @@ index a6b7ef8..c2c261a 100644
 -        // credential; still before policy evaluation, approval, use-token consumption,
 -        // evidence or any upstream call. An unreadable catalog or resolver refuses.
 -        if !via_llm_channel {
--            self.refuse_llm_credential_off_channel(&credential, &request.credential)
+-            self.refuse_llm_credential_off_channel(&credential, &request.credential, &rctx)
 -                .await?;
 -        }
 -

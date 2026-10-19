@@ -1,0 +1,16 @@
+diff --git a/src/refusal.rs b/src/refusal.rs
+index c8e8ec6..82a07f6 100644
+--- a/src/refusal.rs
++++ b/src/refusal.rs
+@@ -684,10 +684,7 @@ impl RefusalRecorder {
+         // order: state, then in_flight, as in `take_all_pending`), so a concurrent
+         // `take_all_pending` always finds each record in `ready` or in `in_flight`, never neither.
+         {
+-            let mut flight = self.in_flight.lock();
+-            for rec in &batch {
+-                flight.insert(rec.idem.clone(), rec.clone());
+-            }
++            let _ = self.in_flight.lock();
+         }
+         let overflow = std::mem::take(&mut st.overflow);
+         (batch, overflow)

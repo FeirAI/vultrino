@@ -1,9 +1,9 @@
 diff --git a/src/policy/mod.rs b/src/policy/mod.rs
-index 9196e29..b42538a 100644
+index 9f13158..1d924e8 100644
 --- a/src/policy/mod.rs
 +++ b/src/policy/mod.rs
-@@ -549,7 +549,6 @@ impl PolicyEngine {
-         let decision = self.evaluate_full(&input);
+@@ -630,7 +630,6 @@ impl PolicyEngine {
+         let (decision, deny_cause) = self.evaluate_inner(&input, true);
          let observe_downgrade = matches!(decision, PolicyDecision::Deny(_))
              && observe_tenant
 -            && !self.is_halted(&input)

@@ -105,6 +105,12 @@ pub(crate) fn build_posture(
                 crate::averin::AverinMode::RequireEvidence => "require_evidence",
             },
             "d8_complete_evidence": config.averin.d8_complete_evidence,
+            // feir-ops#1: every gateway refusal is sealed as a refusal record while the seal client
+            // is on. `seal_refusals` is the configured switch; the three numbers bound the volume.
+            "seal_refusals": config.averin.seal_refusals,
+            "refusal_window_secs": config.averin.refusal_window_secs,
+            "refusal_burst": config.averin.refusal_burst,
+            "refusal_records_per_hour": config.averin.refusal_records_per_hour,
             // FEI-40 relationship I: the seal client is on and a non-empty key is set, the same
             // condition as the averin-api-key fingerprint (the key is read but never sent while
             // the client is off). feir-os's verifier reads this beside the fingerprint.

@@ -1,0 +1,23 @@
+diff --git a/src/server/mod.rs b/src/server/mod.rs
+index 9aead1e..0a91317 100644
+--- a/src/server/mod.rs
++++ b/src/server/mod.rs
+@@ -1790,14 +1790,10 @@ impl VultrinoServer {
+                 } else {
+                     format!("'{}'", full_action)
+                 };
+-                return Err(self.refuse(
+-                    &rctx,
+-                    RefusalClass::NotGranted,
+-                    VultrinoError::PolicyDenied(format!(
+-                        "Use token is not scoped to action {}",
+-                        shown
+-                    )),
+-                ));
++                return Err(VultrinoError::PolicyDenied(format!(
++                    "Use token is not scoped to action {}",
++                    shown
++                )));
+             }
+         }
+ 

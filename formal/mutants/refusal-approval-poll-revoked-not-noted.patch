@@ -1,0 +1,14 @@
+diff --git a/src/web/api.rs b/src/web/api.rs
+index 7d26188..6b9e80d 100644
+--- a/src/web/api.rs
++++ b/src/web/api.rs
+@@ -216,6 +216,9 @@ fn resolve_inbound_principal(
+ /// a refusal of the agent it belongs to, noted from the stored row as `token_unusable` on the
+ /// `approval_resume` entry. Synchronous and O(1): the 403 is returned as before.
+ fn note_revoked_token_poll(state: &AppState, token: &UseToken, action: &str) {
++    if true {
++        return;
++    }
+     state.server.note_gateway_refusal(
+         &crate::refusal::RefusalCtx::new(
+             crate::refusal::RefusalEntry::ApprovalResume,

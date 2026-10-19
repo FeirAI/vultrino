@@ -592,6 +592,30 @@ differently. The running mode is reported in `GET /api/v1/posture` under `averin
 partially-reversible action is refused on resume (its recorded authority class no longer
 matches) and must be requested again.
 
+### `[averin]` gateway refusal records (feir-ops#1)
+
+```toml
+[averin]
+enabled = true
+seal_refusals = true            # default true; false counts refusals in metrics only
+refusal_window_secs = 10        # coalescing window (default 10)
+refusal_burst = 60              # record budget burst (default 60)
+refusal_records_per_hour = 20   # record budget refill per hour (default 20)
+```
+
+While the seal client is enabled and `seal_refusals` is on, each refusal of an authenticated agent is
+noted when it happens and sealed later as a refusal record (averin `POST /v2/refusals`, role `write`).
+Sealing is never on the request path: the refusal's status and body do not depend on averin. The
+first refusal of an agent, action, reason class and entry point in a window is sealed at the next drain
+(every two seconds); later ones in the same window are sealed together when it closes, with an exact
+attempt count. Past the budget (`refusal_burst` records, refilled at `refusal_records_per_hour`) refusals
+merge into one summary record carrying exact per-class counts and no per-action detail. A `0` for a
+number falls back to its default, and a number above its ceiling (`refusal_burst` 240,
+`refusal_records_per_hour` 60, `refusal_window_secs` 300) is clamped to it; the budget is per process.
+On a normal stop the process seals what it still holds before exiting. The settings are reported in `GET /api/v1/posture` under `averin`.
+The record uses the same `[averin]` project and session as use receipts, and the same
+`AVERIN_API_KEY`, so any holder of that key can also submit a refusal to averin.
+
 ### `[identity]` — inbound workload-identity resolution (V10/R6)
 
 ```toml

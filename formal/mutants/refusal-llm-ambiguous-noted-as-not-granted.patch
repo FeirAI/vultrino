@@ -1,0 +1,13 @@
+diff --git a/src/server/mod.rs b/src/server/mod.rs
+index 53c153b..d203817 100644
+--- a/src/server/mod.rs
++++ b/src/server/mod.rs
+@@ -5379,7 +5379,7 @@ impl VultrinoServer {
+             None => Err(LlmChannelRefusal {
+                 message: "Multiple model channels are granted; use /llm/channels/{channel}"
+                     .to_string(),
+-                class: None,
++                class: Some(RefusalClass::NotGranted),
+             }),
+         }
+     }

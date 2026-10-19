@@ -1,0 +1,13 @@
+diff --git a/src/mcp/server.rs b/src/mcp/server.rs
+index e21cb22..8c7d50a 100644
+--- a/src/mcp/server.rs
++++ b/src/mcp/server.rs
+@@ -331,7 +331,7 @@ impl McpServer {
+                     .map(|e| format!("Use token cannot be used: {}", e))
+             };
+             if let Some(message) = refused {
+-                if let Some((entry, action)) = note {
++                if let Some((entry, action)) = note.filter(|_| false) {
+                     self.vultrino.note_gateway_refusal(
+                         &crate::refusal::RefusalCtx::new(
+                             entry,

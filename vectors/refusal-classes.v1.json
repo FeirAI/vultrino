@@ -1,0 +1,21 @@
+{
+  "$comment": "Closed vocabularies of the gateway refusal record (record_kind gateway-refusal, feir-ops#1). Mirrored by core/src/refusal.rs and server/internal/api/refusals.go; a test in each pins the copies to this file. vultrino and feir-os vendor this file and the nightly vector-copy check compares the copies.",
+  "version": 1,
+  "reason_classes": [
+    "not_granted",
+    "policy_deny",
+    "kill_fence",
+    "rate_limit",
+    "spend_cap",
+    "cross_tenant",
+    "token_unusable",
+    "llm_channel_only",
+    "model_unpriced",
+    "modifier_unpriced",
+    "provider_disabled",
+    "capability_undeclared",
+    "approval_unavailable",
+    "decision_unavailable"
+  ],
+  "entry_points": ["mcp", "execute", "llm", "approval_resume"]
+}

@@ -17,7 +17,7 @@
 pub mod pop;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -235,6 +235,11 @@ pub struct SealMetricsSnapshot {
 /// Carries ids and a short error class only: never params, never a PoP seed or token secret.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ReceiptGap {
+    /// `receipt` (an action ran and its use receipt was not sealed) or `refusal` (a gateway
+    /// refusal was returned and its record was not sealed). A refusal gap is never an action
+    /// that ran: the outbox outcome is `refused_not_sealed`.
+    pub kind: GapKind,
+    /// For a `receipt` gap the use token id; for a `refusal` gap the refused agent.
     pub token_id: String,
     pub project_id: String,
     pub request_id: Option<String>,
@@ -246,11 +251,61 @@ pub struct ReceiptGap {
     pub at: chrono::DateTime<chrono::Utc>,
 }
 
+/// What a [`ReceiptGap`] is a gap in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GapKind {
+    /// An Observe-mode use receipt that was not sealed.
+    Receipt,
+    /// A gateway refusal record that was not sealed.
+    Refusal,
+}
+
+impl GapKind {
+    /// The outbox spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Receipt => "receipt",
+            Self::Refusal => "refusal",
+        }
+    }
+    /// The outbox `outcome`: what happened to the thing the gap is about.
+    pub fn outcome(self) -> &'static str {
+        match self {
+            Self::Receipt => "action_ran_without_receipt",
+            Self::Refusal => "refused_not_sealed",
+        }
+    }
+}
+
 /// Cap on pending, not yet drained gap records. A sustained Averin outage under load produces one
 /// per action; the server drains every couple of seconds, so this only overflows if the outbox
 /// itself is unwritable. Overflow is counted and logged, never silent.
 const MAX_PENDING_RECEIPT_GAPS: usize = 4096;
 const MAX_GAP_DETAIL_CHARS: usize = 200;
+
+/// feir-ops#1: how often due gateway refusals are sealed (a background drain, never a request).
+pub const REFUSAL_DRAIN_SECS: u64 = 2;
+
+/// How long the shutdown flush may spend sealing waiting refusals before it records the rest as
+/// gaps (a stopping process must not hang on a slow averin).
+pub const REFUSAL_SHUTDOWN_FLUSH_SECS: u64 = 5;
+/// Concurrent refusal posts (its own pool, separate from the use-seal fan-out).
+const REFUSAL_DRAIN_PERMITS: usize = 4;
+/// Records taken per drain tick.
+const REFUSAL_BATCH: usize = 64;
+/// Drain ticks a refusal record may fail transiently before it becomes a gap.
+const REFUSAL_MAX_TRIES: u32 = 3;
+
+/// The bounded, secret-free description of a refusal record for a gap detail.
+fn refusal_detail(rec: &crate::refusal::Outgoing) -> String {
+    format!(
+        "class={} entry={} attempts={}",
+        rec.class.map_or("summary", |c| c.as_str()),
+        rec.entry.map_or("-", |e| e.as_str()),
+        rec.attempts
+    )
+}
 
 /// Fail-mode on `/execute` when the synchronous seal fails or averin is
 /// unreachable. Mint is always fail-open (a token must not depend on averin).
@@ -331,6 +386,17 @@ pub struct AverinConfig {
     /// VUL-38 evidence floor while Averin cannot begin two-phase evidence. See
     /// [`D8EvidenceFloor`]. Default [`D8EvidenceFloor::MoneyAndIrreversible`].
     pub d8_evidence_floor: D8EvidenceFloor,
+    /// feir-ops#1: seal every gateway refusal as a `gateway-refusal` record
+    /// (`POST /v2/refusals`). Default true; only has an effect while the client is enabled.
+    /// A refusal is never delayed or changed by sealing: it is noted synchronously and sealed by a
+    /// background drain, and one that cannot be sealed becomes an `evidence.receipt_gap`.
+    pub seal_refusals: bool,
+    /// Coalescing window for refusals (seconds). Default 10; `0` falls back to the default.
+    pub refusal_window_secs: u64,
+    /// Refusal record burst (token bucket). Default 60; `0` falls back to the default.
+    pub refusal_burst: u32,
+    /// Refusal record refill, records per hour. Default 20; `0` falls back to the default.
+    pub refusal_records_per_hour: u32,
 }
 
 /// VUL-38: which declared-non-reversible actions are refused while Averin cannot begin the
@@ -392,6 +458,10 @@ impl Default for AverinConfig {
             durable: false,
             d8_complete_evidence: false,
             d8_evidence_floor: D8EvidenceFloor::MoneyAndIrreversible,
+            seal_refusals: true,
+            refusal_window_secs: 10,
+            refusal_burst: 60,
+            refusal_records_per_hour: 20,
         }
     }
 }
@@ -445,6 +515,11 @@ pub struct AverinClient {
     /// FEI-33: individual records of Observe receipts that were not sealed, drained by the server
     /// into `evidence.receipt_gap` outbox events. Shared across clones.
     pending_gaps: Arc<Mutex<std::collections::VecDeque<ReceiptGap>>>,
+    /// feir-ops#1: noted gateway refusals waiting to be sealed. Shared across clones.
+    refusals: Arc<crate::refusal::RefusalRecorder>,
+    /// feir-ops#1: the refusal drain's own permit pool, separate from `seal_permits`, so a refusal
+    /// storm cannot starve use receipts and the reverse.
+    refusal_permits: Arc<Semaphore>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -592,6 +667,29 @@ impl AverinClient {
         // At least one permit — a zero cap would drop every seal (misconfig, not
         // intent). The fan-out bound is `max(1, configured)`.
         let permits = cfg.max_inflight_seals.max(1);
+        let refusal_defaults = crate::refusal::RefusalSettings::default();
+        let refusal_settings = crate::refusal::RefusalSettings {
+            enabled: cfg.seal_refusals,
+            window: if cfg.refusal_window_secs > 0 {
+                Duration::from_secs(
+                    cfg.refusal_window_secs
+                        .min(crate::refusal::MAX_REFUSAL_WINDOW_SECS),
+                )
+            } else {
+                refusal_defaults.window
+            },
+            burst: if cfg.refusal_burst > 0 {
+                cfg.refusal_burst.min(crate::refusal::MAX_REFUSAL_BURST)
+            } else {
+                refusal_defaults.burst
+            },
+            per_hour: if cfg.refusal_records_per_hour > 0 {
+                cfg.refusal_records_per_hour
+                    .min(crate::refusal::MAX_REFUSAL_RECORDS_PER_HOUR)
+            } else {
+                refusal_defaults.per_hour
+            },
+        };
         Ok(Some(Self {
             http,
             cfg: Arc::new(cfg),
@@ -600,6 +698,8 @@ impl AverinClient {
             metrics: Arc::new(SealMetrics::default()),
             since: std::time::Instant::now(),
             pending_gaps: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            refusals: Arc::new(crate::refusal::RefusalRecorder::new(refusal_settings)),
+            refusal_permits: Arc::new(Semaphore::new(REFUSAL_DRAIN_PERMITS)),
         }))
     }
 
@@ -640,17 +740,36 @@ impl AverinClient {
         reason: &'static str,
         detail: &str,
     ) {
-        self.metrics.receipt_gaps.fetch_add(1, Ordering::Relaxed);
-        let detail: String = detail.chars().take(MAX_GAP_DETAIL_CHARS).collect();
-        let gap = ReceiptGap {
+        self.enqueue_gap(ReceiptGap {
+            kind: GapKind::Receipt,
             token_id: token_id.to_string(),
             project_id: self.cfg.project_id.clone(),
             request_id: request_id.map(str::to_string),
             use_sequence_number,
             reason,
-            detail,
+            detail: detail.chars().take(MAX_GAP_DETAIL_CHARS).collect(),
             at: chrono::Utc::now(),
-        };
+        });
+    }
+
+    /// feir-ops#1: record one gateway refusal that was not sealed (`refusal_seal_failed` or
+    /// `refusal_budget_overflow`). The same pending buffer, outbox event and counters as a receipt
+    /// gap, marked `kind = refusal` so it can never read as an action that ran.
+    pub(crate) fn record_refusal_gap(&self, agent: &str, reason: &'static str, detail: &str) {
+        self.enqueue_gap(ReceiptGap {
+            kind: GapKind::Refusal,
+            token_id: agent.to_string(),
+            project_id: self.cfg.project_id.clone(),
+            request_id: None,
+            use_sequence_number: None,
+            reason,
+            detail: detail.chars().take(MAX_GAP_DETAIL_CHARS).collect(),
+            at: chrono::Utc::now(),
+        });
+    }
+
+    fn enqueue_gap(&self, gap: ReceiptGap) {
+        self.metrics.receipt_gaps.fetch_add(1, Ordering::Relaxed);
         let mut q = self.pending_gaps.lock();
         if q.len() >= MAX_PENDING_RECEIPT_GAPS {
             drop(q);
@@ -662,9 +781,9 @@ impl AverinClient {
             if let Some(_logged) = self.claim_drop_log() {
                 tracing::error!(
                     target: "averin_seal",
-                    token_id,
+                    token_id = %gap.token_id,
                     project_id = %self.cfg.project_id,
-                    reason,
+                    reason = gap.reason,
                     overflowed_total = total,
                     "AVERIN-RECEIPT-GAP-OVERFLOW the pending gap buffer is full; this gap is counted \
                      (receipt_gaps) but its individual record was not queued"
@@ -721,6 +840,202 @@ impl AverinClient {
     /// Snapshot the fail-open seal counters (for `GET /api/v1/metrics` + tests).
     pub fn metrics(&self) -> SealMetricsSnapshot {
         self.metrics.snapshot()
+    }
+
+    // ---- gateway refusals (feir-ops#1) ------------------------------------
+
+    /// Note one gateway refusal for sealing. Synchronous and O(1) (see
+    /// [`crate::refusal::RefusalRecorder::note`]): no await, no I/O, cannot fail, so it cannot
+    /// slow or change the refusal the caller is about to return. The record is sealed later by
+    /// [`Self::drain_refusals_once`].
+    pub(crate) fn note_refusal(
+        &self,
+        ctx: &crate::refusal::RefusalCtx,
+        class: crate::refusal::RefusalClass,
+    ) {
+        self.refusals.note(ctx, class);
+    }
+
+    /// Snapshot of the refusal counters (`noted`, `sealed`, `coalesced`, `summarized`,
+    /// `unsealed`), for `GET /api/v1/metrics` and tests.
+    pub fn refusal_counters(&self) -> crate::refusal::RefusalCounters {
+        self.refusals.counters()
+    }
+
+    /// Seal every refusal record that is due. Called by the background loop every
+    /// [`REFUSAL_DRAIN_SECS`] seconds, never from a request. Posts with the client timeout on the
+    /// refusal permit pool. A record that fails for a transient reason (unreachable, 5xx, 429) is
+    /// retried on the next tick, up to [`REFUSAL_MAX_TRIES`] ticks; any other failure, and the last
+    /// transient one, becomes an individual `evidence.receipt_gap` of kind `refusal`
+    /// (`refusal_seal_failed`). The refusal itself was returned long before. Returns the number of
+    /// records sealed.
+    pub async fn drain_refusals_once(&self) -> usize {
+        let sealed = AtomicUsize::new(0);
+        self.drain_refusals_counted(&sealed).await;
+        sealed.load(Ordering::Relaxed)
+    }
+
+    /// [`Self::drain_refusals_once`] counting each sealed record into `sealed` as it happens, so
+    /// the count survives the drain being cancelled (the shutdown budget).
+    async fn drain_refusals_counted(&self, sealed: &AtomicUsize) {
+        let (batch, overflow) = self.refusals.take_due(REFUSAL_BATCH);
+        for (class, attempts, agent) in overflow {
+            self.refusals.count_unsealed();
+            self.record_refusal_gap(
+                &agent,
+                "refusal_budget_overflow",
+                &format!("class={} attempts={attempts}", class.as_str()),
+            );
+        }
+        if batch.is_empty() {
+            return;
+        }
+        let mut set = tokio::task::JoinSet::new();
+        let mut task_idem = std::collections::HashMap::new();
+        for rec in batch {
+            // `take_due` already registered the record in flight under the recorder's lock: a
+            // cancelled drain (the shutdown budget) leaves it there for `take_all_pending`.
+            let idem = rec.idem.clone();
+            let me = self.clone();
+            let handle = set.spawn(async move {
+                // The pool is never closed, so acquisition only waits.
+                let _permit = me.refusal_permits.clone().acquire_owned().await;
+                let res = me.seal_refusal(&rec).await;
+                (rec, res)
+            });
+            task_idem.insert(handle.id(), idem);
+        }
+        let mut retry = Vec::new();
+        while let Some(joined) = set.join_next().await {
+            match joined {
+                Ok((rec, Ok(_))) => {
+                    if self.refusals.finish_flight(&rec.idem) {
+                        self.refusals.count_sealed();
+                        sealed.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                Ok((mut rec, Err(e))) => {
+                    if e.is_unavailable() && rec.tries + 1 < REFUSAL_MAX_TRIES {
+                        rec.tries += 1;
+                        retry.push(rec);
+                    } else if self.refusals.finish_flight(&rec.idem) {
+                        self.refusal_unsealed(&rec, &e);
+                    }
+                }
+                Err(e) => {
+                    // The task panicked or was cancelled: the record is lost, so say so.
+                    let claimed = task_idem
+                        .get(&e.id())
+                        .is_none_or(|idem| self.refusals.finish_flight(idem));
+                    if claimed {
+                        self.refusals.count_unsealed();
+                        self.record_refusal_gap(
+                            "vultrino:multiple",
+                            "refusal_seal_failed",
+                            "the refusal seal task panicked or was cancelled",
+                        );
+                    }
+                }
+            }
+        }
+        // One atomic recorder step (no await): each retry record leaves the in-flight map and
+        // re-enters the queue together, so the shutdown collection never sees it in neither.
+        if !retry.is_empty() {
+            for rec in self.refusals.requeue_in_flight(retry) {
+                self.refusal_unsealed_overflow(&rec);
+            }
+        }
+    }
+
+    /// The process is stopping (feir-ops#1): close every open window so each tail is a record,
+    /// seal what is waiting within `budget`, and turn whatever could not be sealed in time into a
+    /// counted `evidence.receipt_gap` of kind `refusal` (it is then flushed to the outbox by the
+    /// caller). Without this a session that ends, or a SIGTERM restart, silently drops the
+    /// first refusals still waiting for the next drain and the tails of open windows. Returns
+    /// the number of records sealed.
+    pub async fn flush_refusals_on_shutdown(&self, budget: Duration) -> usize {
+        self.refusals.close_all_windows();
+        // Shared with the drain so records sealed before the budget expired still count.
+        let sealed = AtomicUsize::new(0);
+        let _ = tokio::time::timeout(budget, async {
+            for _ in 0..REFUSAL_MAX_TRIES {
+                self.drain_refusals_counted(&sealed).await;
+                if !self.refusals.has_pending() {
+                    break;
+                }
+            }
+        })
+        .await;
+        for rec in self.refusals.take_all_pending() {
+            self.refusals.count_unsealed();
+            self.record_refusal_gap(
+                &rec.agent,
+                "refusal_seal_failed",
+                &format!(
+                    "{}: the process stopped before the record could be sealed",
+                    refusal_detail(&rec)
+                ),
+            );
+        }
+        sealed.load(Ordering::Relaxed)
+    }
+
+    async fn seal_refusal(
+        &self,
+        rec: &crate::refusal::Outgoing,
+    ) -> Result<serde_json::Value, AverinError> {
+        let mut body = serde_json::json!({
+            "project_id": self.cfg.project_id,
+            "session_id": self.cfg.session_id,
+            "idempotency_key": rec.idem,
+            "agent_id": rec.agent,
+            "action": rec.action,
+            "attempts": rec.attempts,
+            "first_at": rec.first_at.to_rfc3339(),
+            "last_at": rec.last_at.to_rfc3339(),
+        });
+        if let Some(entry) = rec.entry {
+            body["entry_point"] = serde_json::json!(entry.as_str());
+        }
+        if let Some(class) = rec.class {
+            body["reason_class"] = serde_json::json!(class.as_str());
+        }
+        if let Some(credential) = &rec.credential {
+            body["credential"] = serde_json::json!(credential);
+        }
+        if let Some(by_class) = &rec.by_class {
+            body["summary"] = serde_json::json!(true);
+            body["by_class"] = serde_json::json!(by_class);
+        }
+        self.post("/v2/refusals", &body).await
+    }
+
+    fn refusal_unsealed(&self, rec: &crate::refusal::Outgoing, error: &AverinError) {
+        self.refusals.count_unsealed();
+        let why = match error {
+            AverinError::Request(_) => "averin unreachable".to_string(),
+            other => other.to_string(),
+        };
+        self.record_refusal_gap(
+            &rec.agent,
+            "refusal_seal_failed",
+            &format!("{}: {why}", refusal_detail(rec)),
+        );
+        if let Some(total) = self.claim_drop_log() {
+            tracing::warn!(
+                target: "averin_seal",
+                agent = %rec.agent,
+                project_id = %self.cfg.project_id,
+                dropped_total = total,
+                "AVERIN-REFUSAL-UNSEALED a gateway refusal record could not be sealed; the refusal \
+                 stood and an evidence.receipt_gap of kind refusal is recorded"
+            );
+        }
+    }
+
+    fn refusal_unsealed_overflow(&self, rec: &crate::refusal::Outgoing) {
+        self.refusals.count_unsealed();
+        self.record_refusal_gap(&rec.agent, "refusal_budget_overflow", &refusal_detail(rec));
     }
 
     /// VUL-38 — count a reversible action that ran without two-phase D8 evidence.
@@ -1593,6 +1908,135 @@ mod tests {
         })
         .expect("client builds")
         .expect("client is Some when enabled")
+    }
+
+    /// Final round: a shutdown flush whose budget is shorter than the client timeout cancels the
+    /// seal tasks, and every record it had taken out of the recorder must still end as a gap.
+    /// Invariant: noted == sealed + unsealed (each refusal here is its own record), and one gap
+    /// per record, whatever averin does (here: accepts TCP and never answers).
+    #[tokio::test]
+    async fn refusal_shutdown_flush_budget_expiry_loses_no_taken_record() {
+        let base = blocked_averin().await;
+        let client = client_with(&base, 256, Duration::from_secs(30));
+        for i in 0..10 {
+            let ctx = crate::refusal::RefusalCtx::new(
+                crate::refusal::RefusalEntry::Execute,
+                Some((&format!("agent-{i}"), None)),
+                "act",
+            );
+            client.note_refusal(&ctx, crate::refusal::RefusalClass::NotGranted);
+        }
+        let t0 = Instant::now();
+        let sealed = client
+            .flush_refusals_on_shutdown(Duration::from_millis(300))
+            .await;
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "the flush honours its budget"
+        );
+        let c = client.refusal_counters();
+        assert_eq!(sealed, 0);
+        assert_eq!(c.noted, 10);
+        assert_eq!(c.noted, c.sealed + c.unsealed, "no refusal vanished: {c:?}");
+        let gaps = client.take_receipt_gaps();
+        assert_eq!(gaps.len(), 10, "every taken record became a gap");
+        assert!(gaps.iter().all(|g| g.kind == GapKind::Refusal));
+        let mut agents: Vec<_> = gaps.iter().map(|g| g.token_id.clone()).collect();
+        agents.sort();
+        agents.dedup();
+        assert_eq!(agents.len(), 10, "one gap per distinct record");
+        assert!(
+            client.refusals.take_all_pending().is_empty(),
+            "nothing left in flight"
+        );
+    }
+
+    /// An averin that answers every request 503 (a transient failure, so records are retried).
+    async fn unavailable_averin() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 8192];
+                    loop {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => {}
+                        }
+                        let resp = "HTTP/1.1 503 X\r\nContent-Length: 2\r\n\r\n{}";
+                        if stream.write_all(resp.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// The periodic drain runs on another thread while the shutdown flush runs. Every record must
+    /// be in exactly one place at every moment (ready, in flight, sealed or gapped), so after the
+    /// flush `noted == sealed + unsealed`, one gap per unsealed record, and nothing is left in
+    /// the queue or in flight. Pre-fix, a record taken but not yet registered in flight, or
+    /// removed from flight but not yet requeued, was missed by the shutdown collection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn refusal_shutdown_flush_concurrent_with_periodic_drain_loses_nothing() {
+        let rounds = 600usize;
+        let down_503 = unavailable_averin().await;
+        let refused = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = l.local_addr().unwrap();
+            drop(l);
+            format!("http://{addr}")
+        };
+        let (mut lost_rounds, mut lost_total) = (0u64, 0u64);
+        for i in 0..rounds {
+            let base = if i % 2 == 0 { &down_503 } else { &refused };
+            let client = Arc::new(client_with(base, 256, Duration::from_secs(30)));
+            for n in 0..10 {
+                let ctx = crate::refusal::RefusalCtx::new(
+                    crate::refusal::RefusalEntry::Execute,
+                    Some((&format!("pc{i}-{n}"), None)),
+                    "act",
+                );
+                client.note_refusal(&ctx, crate::refusal::RefusalClass::NotGranted);
+            }
+            let periodic = {
+                let c = client.clone();
+                tokio::spawn(async move {
+                    loop {
+                        c.drain_refusals_once().await;
+                        tokio::task::yield_now().await;
+                    }
+                })
+            };
+            tokio::time::sleep(Duration::from_micros((i as u64 % 7) * 150)).await;
+            client
+                .flush_refusals_on_shutdown(Duration::from_secs(2))
+                .await;
+            periodic.abort();
+            let _ = periodic.await;
+            let c = client.refusal_counters();
+            let gaps = client.take_receipt_gaps().len() as u64;
+            let left = client.refusals.take_all_pending().len();
+            let in_flight = client.refusals.in_flight_len();
+            let lost = c.noted.saturating_sub(c.sealed + c.unsealed);
+            if lost > 0 || left > 0 || in_flight > 0 || gaps != c.unsealed {
+                lost_rounds += 1;
+                lost_total += lost;
+                println!(
+                    "round {i}: noted={} sealed={} unsealed={} gaps={gaps} left={left} in_flight={in_flight}",
+                    c.noted, c.sealed, c.unsealed
+                );
+            }
+        }
+        println!("rounds={rounds} rounds_with_loss={lost_rounds} records_lost={lost_total}");
+        assert_eq!(
+            lost_rounds, 0,
+            "records lost in {lost_rounds} of {rounds} rounds ({lost_total} records)"
+        );
     }
 
     /// Step 1: in Observe mode the `/execute` seal is fire-and-forget — the hot

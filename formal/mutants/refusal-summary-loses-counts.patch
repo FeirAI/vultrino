@@ -1,0 +1,13 @@
+diff --git a/src/refusal.rs b/src/refusal.rs
+index 27406d2..0310117 100644
+--- a/src/refusal.rs
++++ b/src/refusal.rs
+@@ -320,7 +320,7 @@ impl Summary {
+         last: DateTime<Utc>,
+     ) {
+         *self.by_class.entry(class.as_str()).or_insert(0) += attempts;
+-        self.attempts += attempts;
++        self.attempts += 1;
+         // Two distinct agents are enough to say "multiple"; no need to remember more.
+         if self.agents.len() < 2 && !self.agents.iter().any(|a| a == agent) {
+             self.agents.push(agent.to_string());

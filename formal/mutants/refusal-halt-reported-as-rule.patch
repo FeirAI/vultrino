@@ -1,0 +1,13 @@
+diff --git a/src/policy/mod.rs b/src/policy/mod.rs
+index 9f13158..3e86d8f 100644
+--- a/src/policy/mod.rs
++++ b/src/policy/mod.rs
+@@ -821,7 +821,7 @@ impl PolicyEngine {
+             .map(|p| p.name.as_str())
+             .unwrap_or_default();
+         let cause = match verdict {
+-            Verdict::Kill => Some(DenyCause::Halt),
++            Verdict::Kill => Some(DenyCause::Rule),
+             Verdict::Deny => Some(DenyCause::Rule),
+             Verdict::PolicyDefaultDeny | Verdict::EngineDefaultDeny | Verdict::FailClosedTail => {
+                 Some(guard_hint.get().unwrap_or(DenyCause::Default))

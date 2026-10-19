@@ -10,6 +10,7 @@ use crate::auth::{AuthManager, AuthResult, Permission, UseToken};
 use crate::config::Config;
 use crate::plugins::PluginRegistry;
 use crate::policy::PolicyEngine;
+use crate::refusal::{RefusalClass, RefusalCtx, RefusalEntry};
 use crate::router::CredentialResolver;
 use crate::storage::StorageBackend;
 use crate::{
@@ -433,6 +434,14 @@ impl ExecAuth {
     }
 }
 
+/// Why [`VultrinoServer::resolve_llm_proxy_channel_for`] resolved no model channel, and the
+/// refusal class to seal for it (`None`: a request-shape error, nothing to seal).
+#[derive(Debug, Clone)]
+pub struct LlmChannelRefusal {
+    pub message: String,
+    pub class: Option<RefusalClass>,
+}
+
 /// The authenticated caller of an approval poll, for the ownership check in
 /// [`VultrinoServer::check_and_resume_approval`].
 ///
@@ -544,6 +553,10 @@ struct RunError {
     /// Keep this bit until persistence so every user-facing surface can warn
     /// against a blind retry.
     committed: bool,
+    /// feir-ops#1: set when this error is a gateway refusal (nothing ran) and names its reason
+    /// class. The boundary that knows the principal ([`VultrinoServer::note_run_refusal`]) notes it
+    /// once and clears it, so a refusal is never noted twice.
+    class: Option<RefusalClass>,
     error: VultrinoError,
 }
 
@@ -553,6 +566,25 @@ impl RunError {
         Self {
             retryable: true,
             committed: false,
+            class: None,
+            error,
+        }
+    }
+    /// A permanent preflight refusal that is also a gateway refusal of class `class`.
+    fn refused(class: RefusalClass, error: VultrinoError) -> Self {
+        Self {
+            retryable: false,
+            committed: false,
+            class: Some(class),
+            error,
+        }
+    }
+    /// A transient preflight refusal that is also a gateway refusal of class `class`.
+    fn refused_retryable(class: RefusalClass, error: VultrinoError) -> Self {
+        Self {
+            retryable: true,
+            committed: false,
+            class: Some(class),
             error,
         }
     }
@@ -562,6 +594,7 @@ impl RunError {
         Self {
             retryable: false,
             committed: false,
+            class: None,
             error,
         }
     }
@@ -571,6 +604,7 @@ impl RunError {
         Self {
             retryable: false,
             committed: true,
+            class: None,
             error,
         }
     }
@@ -643,6 +677,9 @@ struct ActionPayload {
     /// The kill fence subject (P3-KILL), checked against the vault immediately
     /// before the plugin call. Not part of the permit binding: it can only refuse.
     kill_fence: KillFenceSubject,
+    /// Who is refused if a dispatch-time check refuses this payload (feir-ops#1). Not part of the
+    /// permit binding: it can only describe a refusal.
+    refusal: RefusalCtx,
 }
 
 impl crate::formal_kernel::Dispatch for ActionPayload {
@@ -1405,6 +1442,13 @@ impl VultrinoServer {
         self.averin.clone()
     }
 
+    /// Whether a gateway refusal can be noted at all (an averin seal client exists). A refusal
+    /// path that must look up the refused principal first (a storage reload and a token lookup)
+    /// checks this, so it does no extra I/O when nothing can be noted.
+    pub fn refusal_noting_enabled(&self) -> bool {
+        self.averin.is_some()
+    }
+
     /// Plan 087 FIX 2 — the SINGLE grant-before-issue seal for EVERY in-process mint
     /// surface (JSON admin API, web console, workload exchange). Centralizing it here
     /// means the token→PoP grant is recorded for a token minted on ANY of them, so its
@@ -1689,23 +1733,41 @@ impl VultrinoServer {
         request: ExecuteRequest,
         exec_auth: ExecAuth,
         via_llm_channel: bool,
+        entry: RefusalEntry,
     ) -> Result<PreparedAction, VultrinoError> {
         let mut context = RequestContext::new();
+        // feir-ops#1: who is refused if a gate below refuses. Built from the stored principal row
+        // (never request input) and the presented action name, which is sanitized before it is
+        // sealed; the credential and canonical action are filled in once resolved.
+        let mut rctx = RefusalCtx::new(
+            entry,
+            exec_auth
+                .auth
+                .as_ref()
+                .map(|a| (a.api_key.id.as_str(), a.api_key.agent_label.as_deref())),
+            &request.action,
+        );
 
         // Permission + scope checks (only when authenticated).
         if let Some(auth_result) = &exec_auth.auth {
             context = context.with_auth(auth_result);
 
             if !auth_result.has_permission(Permission::Execute) {
-                return Err(VultrinoError::PolicyDenied(
-                    "Missing 'execute' permission".to_string(),
+                return Err(self.refuse(
+                    &rctx,
+                    RefusalClass::NotGranted,
+                    VultrinoError::PolicyDenied("Missing 'execute' permission".to_string()),
                 ));
             }
             if !auth_result.can_access_credential(&request.credential) {
-                return Err(VultrinoError::PolicyDenied(format!(
-                    "Access denied to credential: {}",
-                    request.credential
-                )));
+                return Err(self.refuse(
+                    &rctx,
+                    RefusalClass::NotGranted,
+                    VultrinoError::PolicyDenied(format!(
+                        "Access denied to credential: {}",
+                        request.credential
+                    )),
+                ));
             }
         }
 
@@ -1717,6 +1779,7 @@ impl VultrinoServer {
         let (canonical_action, action_label) = self.config.resolve_action(&request.action);
         let (plugin_name, action_name) = parse_action(&canonical_action)?;
         let full_action = format!("{}.{}", plugin_name, action_name);
+        rctx = rctx.resolved(&credential.alias, &full_action);
 
         // Authoritative use-token scope enforcement at the seam where the token
         // is actually spent — both credential and action scope, so the token's
@@ -1725,10 +1788,14 @@ impl VultrinoServer {
         // form (which may be a govder label) or the resolved canonical action.
         if let Some(token) = &exec_auth.use_token {
             if !token.allows_credential(&credential.alias) {
-                return Err(VultrinoError::PolicyDenied(format!(
-                    "Use token is not scoped to credential '{}'",
-                    credential.alias
-                )));
+                return Err(self.refuse(
+                    &rctx,
+                    RefusalClass::NotGranted,
+                    VultrinoError::PolicyDenied(format!(
+                        "Use token is not scoped to credential '{}'",
+                        credential.alias
+                    )),
+                ));
             }
             if !token.allows_action(&request.action) && !token.allows_action(&full_action) {
                 // Surface both forms when the presented action was a label, so
@@ -1738,10 +1805,14 @@ impl VultrinoServer {
                 } else {
                     format!("'{}'", full_action)
                 };
-                return Err(VultrinoError::PolicyDenied(format!(
-                    "Use token is not scoped to action {}",
-                    shown
-                )));
+                return Err(self.refuse(
+                    &rctx,
+                    RefusalClass::NotGranted,
+                    VultrinoError::PolicyDenied(format!(
+                        "Use token is not scoped to action {}",
+                        shown
+                    )),
+                ));
             }
         }
 
@@ -1780,7 +1851,11 @@ impl VultrinoServer {
                     "cross_tenant_isolation",
                 )
                 .await;
-                return Err(VultrinoError::PolicyDenied(reason));
+                return Err(self.refuse(
+                    &rctx,
+                    RefusalClass::CrossTenant,
+                    VultrinoError::PolicyDenied(reason),
+                ));
             }
         }
 
@@ -1794,7 +1869,7 @@ impl VultrinoServer {
         // credential; still before policy evaluation, approval, use-token consumption,
         // evidence or any upstream call. An unreadable catalog or resolver refuses.
         if !via_llm_channel {
-            self.refuse_llm_credential_off_channel(&credential, &request.credential)
+            self.refuse_llm_credential_off_channel(&credential, &request.credential, &rctx)
                 .await?;
         }
 
@@ -1919,7 +1994,15 @@ impl VultrinoServer {
                         "policy",
                     )
                     .await;
-                    return Err(VultrinoError::PolicyDenied(reason.clone()));
+                    // The class is the engine's typed cause, never read back from `reason`.
+                    let class = evaluation
+                        .deny_cause()
+                        .map_or(RefusalClass::PolicyDeny, |c| c.refusal_class());
+                    return Err(self.refuse(
+                        &rctx,
+                        class,
+                        VultrinoError::PolicyDenied(reason.clone()),
+                    ));
                 }
             }
             crate::policy::PolicyDecision::Prompt => {
@@ -1950,19 +2033,27 @@ impl VultrinoServer {
             )
             .await;
         if matches!(irreversibility, IrreversibilityResolution::Unavailable) {
-            return Err(VultrinoError::PolicyUnavailable(
-                "the capability catalog is unavailable, so Vultrino cannot establish this \
-                 action's approval requirement; nothing was executed"
-                    .to_string(),
+            return Err(self.refuse(
+                &rctx,
+                RefusalClass::DecisionUnavailable,
+                VultrinoError::PolicyUnavailable(
+                    "the capability catalog is unavailable, so Vultrino cannot establish this \
+                     action's approval requirement; nothing was executed"
+                        .to_string(),
+                ),
             ));
         }
         if self.config.enforcement.require_declared_capabilities
             && matches!(irreversibility, IrreversibilityResolution::Undeclared)
         {
-            return Err(VultrinoError::PolicyDenied(
-                "strict capability enforcement requires an exact stored declaration for this \
-                 action; nothing was executed"
-                    .to_string(),
+            return Err(self.refuse(
+                &rctx,
+                RefusalClass::CapabilityUndeclared,
+                VultrinoError::PolicyDenied(
+                    "strict capability enforcement requires an exact stored declaration for this \
+                     action; nothing was executed"
+                        .to_string(),
+                ),
             ));
         }
         if irreversibility.automatically_requires_approval() {
@@ -1995,10 +2086,14 @@ impl VultrinoServer {
             Err(crate::formal_kernel::PermitError::ApprovalRequired)
         ) {
             if !self.approval_config.enabled {
-                return Err(VultrinoError::PolicyDenied(
-                    "This action requires human approval, but approvals are not enabled on this \
-                     Vultrino instance"
-                        .to_string(),
+                return Err(self.refuse(
+                    &rctx,
+                    RefusalClass::ApprovalUnavailable,
+                    VultrinoError::PolicyDenied(
+                        "This action requires human approval, but approvals are not enabled on \
+                         this Vultrino instance"
+                            .to_string(),
+                    ),
                 ));
             }
 
@@ -2089,7 +2184,8 @@ impl VultrinoServer {
                     &full_action,
                     action_label.as_deref(),
                 )
-                .await?
+                .await
+                .map_err(|e| self.refuse(&rctx, RefusalClass::DecisionUnavailable, e))?
             {
                 crate::govder::GateRuleAnswer::Rule(fetched) => (
                     Some(fetched.rule),
@@ -2121,12 +2217,16 @@ impl VultrinoServer {
                             "REFUSING an action whose approval recipe could not be confirmed: \
                              production strict posture (or the human-floor class) forbids \
                              falling back to weaker numeric oversight");
-                        return Err(VultrinoError::PolicyUnavailable(format!(
-                            "this action may only open under a confirmed approval requirement: \
-                             {reason}. Production strict posture requires confirmation for every \
-                             gated action, and human-floor actions always require it. Nothing was \
-                             executed and no approval was opened."
-                        )));
+                        return Err(self.refuse(
+                            &rctx,
+                            RefusalClass::DecisionUnavailable,
+                            VultrinoError::PolicyUnavailable(format!(
+                                "this action may only open under a confirmed approval requirement: \
+                                 {reason}. Production strict posture requires confirmation for \
+                                 every gated action, and human-floor actions always require it. \
+                                 Nothing was executed and no approval was opened."
+                            )),
+                        ));
                     }
                     tracing::warn!(%reason, %full_action,
                         agent_id = agent_id_for_rule.as_deref().unwrap_or("<none>"),
@@ -2210,6 +2310,7 @@ impl VultrinoServer {
                 principal.as_ref(),
                 principal_tenant.as_deref(),
                 admitted_epoch,
+                &rctx,
             )
             .await?;
             approval.kill_epoch_at_open = Some(admitted_epoch);
@@ -2226,9 +2327,13 @@ impl VultrinoServer {
                     .consume_use_token(&token.id)
                     .await
                     .map_err(|error| {
-                        VultrinoError::PolicyDenied(format!(
-                            "Use token could not reserve this approval: {error}"
-                        ))
+                        self.refuse(
+                            &rctx,
+                            RefusalClass::TokenUnusable,
+                            VultrinoError::PolicyDenied(format!(
+                                "Use token could not reserve this approval: {error}"
+                            )),
+                        )
                     })?;
             }
             self.storage.store_approval(&approval).await?;
@@ -2268,7 +2373,8 @@ impl VultrinoServer {
         // NOT consumed here; the tail reserves it fail-closed just before the side
         // effect, identical on both paths.
         let permit = crate::formal_kernel::ExecutionPermit::direct(
-            Self::direct_admission(admission)?,
+            Self::direct_admission(admission)
+                .map_err(|e| self.refuse(&rctx, RefusalClass::DecisionUnavailable, e))?,
             &context.request_id,
             principal_tenant.as_deref().unwrap_or_default(),
             &full_action,
@@ -2295,13 +2401,47 @@ impl VultrinoServer {
                 admitted_epoch,
                 tenant: principal_tenant.clone(),
             },
+            refusal: rctx.clone(),
         };
         let authorized = permit.authorize(payload).map_err(|_| {
-            VultrinoError::PolicyDenied(
-                "the execution payload did not match its permit; nothing ran".to_string(),
+            self.refuse(
+                &rctx,
+                RefusalClass::DecisionUnavailable,
+                VultrinoError::PolicyDenied(
+                    "the execution payload did not match its permit; nothing ran".to_string(),
+                ),
             )
         })?;
         Ok(PreparedAction::Ready(Box::new(authorized)))
+    }
+
+    /// The one seam every gateway refusal passes through (feir-ops#1). Notes the refusal for
+    /// sealing and returns `error` untouched, so the refusal the caller returns is byte-identical
+    /// with sealing on, off or broken. Synchronous and O(1): see [`crate::refusal`]. A refusal with
+    /// no authenticated principal (local use) is not noted: there is no agent to attribute it to.
+    fn refuse(&self, ctx: &RefusalCtx, class: RefusalClass, error: VultrinoError) -> VultrinoError {
+        self.note_gateway_refusal(ctx, class);
+        error
+    }
+
+    /// Note a gateway refusal for sealing without producing an error: for the refusals that are
+    /// decided at an entry point's own edge (an MCP tool that is not available, an `/llm` model
+    /// that is not granted, a token that is not usable) rather than inside the shared gate. Same
+    /// guarantees as [`Self::refuse`]: synchronous, O(1), cannot fail, changes nothing the caller
+    /// returns.
+    pub fn note_gateway_refusal(&self, ctx: &RefusalCtx, class: RefusalClass) {
+        if let Some(av) = self.averin.as_ref() {
+            av.note_refusal(ctx, class);
+        }
+    }
+
+    /// The [`RunError`] form of [`Self::refuse`]: notes the refusal the error is tagged with, once,
+    /// and clears the tag so an outer boundary does not note it again.
+    fn note_run_refusal(&self, ctx: &RefusalCtx, mut error: RunError) -> RunError {
+        if let Some(class) = error.class.take() {
+            self.note_gateway_refusal(ctx, class);
+        }
+        error
     }
 
     /// The witness for a direct permit, or the refusal. Reached only after the
@@ -2331,7 +2471,20 @@ impl VultrinoServer {
         request: ExecuteRequest,
         exec_auth: ExecAuth,
     ) -> Result<ExecutionOutcome, VultrinoError> {
-        self.execute_gated_inner(request, exec_auth, false).await
+        self.execute_gated_via(RefusalEntry::Execute, request, exec_auth)
+            .await
+    }
+
+    /// [`Self::execute_gated`] for a caller that is not `/api/v1/execute`: it names the entry point
+    /// a refusal is sealed under (`mcp` for an MCP `tools/call`). The gate is identical.
+    pub async fn execute_gated_via(
+        &self,
+        entry: RefusalEntry,
+        request: ExecuteRequest,
+        exec_auth: ExecAuth,
+    ) -> Result<ExecutionOutcome, VultrinoError> {
+        self.execute_gated_inner(request, exec_auth, false, entry)
+            .await
     }
 
     /// The `/llm` proxy's entry: identical to [`Self::execute_gated`] except that it
@@ -2342,7 +2495,8 @@ impl VultrinoServer {
         request: ExecuteRequest,
         exec_auth: ExecAuth,
     ) -> Result<ExecutionOutcome, VultrinoError> {
-        self.execute_gated_inner(request, exec_auth, true).await
+        self.execute_gated_inner(request, exec_auth, true, RefusalEntry::Llm)
+            .await
     }
 
     async fn execute_gated_inner(
@@ -2350,14 +2504,21 @@ impl VultrinoServer {
         request: ExecuteRequest,
         exec_auth: ExecAuth,
         via_llm_channel: bool,
+        entry: RefusalEntry,
     ) -> Result<ExecutionOutcome, VultrinoError> {
         match self
-            .prepare_execution(request, exec_auth, via_llm_channel)
+            .prepare_execution(request, exec_auth, via_llm_channel, entry)
             .await?
         {
             PreparedAction::Pending(approval) => Ok(ExecutionOutcome::Pending(approval)),
             PreparedAction::Ready(ready) => {
-                let response = self.run_action(*ready).await.map_err(|re| re.error)?;
+                // feir-ops#1: a dispatch-time refusal is noted here, where the payload names who
+                // it was (the error is the same one without it).
+                let rctx = ready.payload().refusal.clone();
+                let response = self
+                    .run_action(*ready)
+                    .await
+                    .map_err(|re| self.note_run_refusal(&rctx, re).error)?;
                 Ok(ExecutionOutcome::Completed(response))
             }
         }
@@ -2415,9 +2576,12 @@ impl VultrinoServer {
                 .await?;
                 Ok(None)
             }
-            Err(error) => Err(RunError::terminal(VultrinoError::PolicyDenied(format!(
-                "D8 before-act evidence failed: {error}; nothing ran"
-            )))),
+            Err(error) => Err(RunError::refused(
+                RefusalClass::DecisionUnavailable,
+                VultrinoError::PolicyDenied(format!(
+                    "D8 before-act evidence failed: {error}; nothing ran"
+                )),
+            )),
         }
     }
 
@@ -2441,35 +2605,41 @@ impl VultrinoServer {
                     && evidence_subject_id.is_some()
                     && params_len > av.config().max_seal_params_bytes
                 {
-                    return Err(RunError::terminal(VultrinoError::PolicyDenied(format!(
+                    return Err(RunError::refused(
+                        RefusalClass::DecisionUnavailable,
+                        VultrinoError::PolicyDenied(format!(
                         "D8 before-act evidence failed: parameters exceed the configured {} byte \
                          evidence bound; nothing ran",
                         av.config().max_seal_params_bytes
-                    ))));
+                    )),
+                    ));
                 }
             }
             return Ok(());
         }
         let av = self.averin.as_ref().ok_or_else(|| {
-            RunError::terminal(VultrinoError::PolicyDenied(
+            RunError::refused(RefusalClass::DecisionUnavailable, VultrinoError::PolicyDenied(
                 "trusted human-floor action requires Averin evidence, but the seal client is not \
                  available; nothing ran"
                     .to_string(),
             ))
         })?;
         let token_id = evidence_subject_id.ok_or_else(|| {
-            RunError::terminal(VultrinoError::PolicyDenied(
+            RunError::refused(RefusalClass::DecisionUnavailable, VultrinoError::PolicyDenied(
                 "trusted human-floor action requires a stable subject bound to Averin evidence; \
                  nothing ran"
                     .to_string(),
             ))
         })?;
         if params_len > av.config().max_seal_params_bytes {
-            return Err(RunError::terminal(VultrinoError::PolicyDenied(format!(
+            return Err(RunError::refused(
+                RefusalClass::DecisionUnavailable,
+                VultrinoError::PolicyDenied(format!(
                 "trusted human-floor action requires an Averin evidence seal, but its parameters \
                  exceed the configured {} byte evidence bound; nothing ran",
                 av.config().max_seal_params_bytes
-            ))));
+            )),
+            ));
         }
 
         // An approved execution is authorized by the durable exact-request grant,
@@ -2487,17 +2657,17 @@ impl VultrinoServer {
         if av.config().durable {
             if let Some(popkeys) = self.storage.averin_durable_popkeys() {
                 return match popkeys.get(token_id).await.map_err(|error| {
-                    RunError::retryable(VultrinoError::PolicyUnavailable(format!(
+                    RunError::refused_retryable(RefusalClass::DecisionUnavailable, VultrinoError::PolicyUnavailable(format!(
                         "trusted human-floor evidence grant could not be read: {error}; nothing ran"
                     )))
                 })? {
                     Some(entry) if entry.grant_id.is_some() && entry.capability.is_some() => Ok(()),
-                    Some(_) => Err(RunError::retryable(VultrinoError::PolicyUnavailable(
+                    Some(_) => Err(RunError::refused_retryable(RefusalClass::DecisionUnavailable, VultrinoError::PolicyUnavailable(
                         "trusted human-floor evidence grant is not sealed yet; nothing ran — retry \
                          after the Averin delivery worker resolves it"
                             .to_string(),
                     ))),
-                    None => Err(RunError::terminal(VultrinoError::PolicyDenied(
+                    None => Err(RunError::refused(RefusalClass::DecisionUnavailable, VultrinoError::PolicyDenied(
                         "trusted human-floor action has no durable Averin grant binding; nothing ran"
                             .to_string(),
                     ))),
@@ -2508,10 +2678,13 @@ impl VultrinoServer {
         if av.has_in_memory_grant(token_id) {
             Ok(())
         } else {
-            Err(RunError::terminal(VultrinoError::PolicyDenied(
-                "trusted human-floor action has no live Averin grant binding; nothing ran"
-                    .to_string(),
-            )))
+            Err(RunError::refused(
+                RefusalClass::DecisionUnavailable,
+                VultrinoError::PolicyDenied(
+                    "trusted human-floor action has no live Averin grant binding; nothing ran"
+                        .to_string(),
+                ),
+            ))
         }
     }
 
@@ -2599,9 +2772,12 @@ impl VultrinoServer {
                 .seal_use_required(token_id, params_bytes, use_sequence_number, request_id)
                 .await
                 .map_err(|error| {
-                    RunError::terminal(VultrinoError::PolicyDenied(format!(
-                        "trusted human-floor Averin evidence seal failed: {error}; nothing ran"
-                    )))
+                    RunError::refused(
+                        RefusalClass::DecisionUnavailable,
+                        VultrinoError::PolicyDenied(format!(
+                            "trusted human-floor Averin evidence seal failed: {error}; nothing ran"
+                        )),
+                    )
                 });
         }
 
@@ -2671,9 +2847,12 @@ impl VultrinoServer {
                 .on_execute(token_id, params_bytes, use_sequence_number, request_id)
                 .await
                 .map_err(|e| {
-                    RunError::terminal(VultrinoError::PolicyDenied(format!(
-                        "averin evidence seal required but failed (require_evidence): {e}"
-                    )))
+                    RunError::refused(
+                        RefusalClass::DecisionUnavailable,
+                        VultrinoError::PolicyDenied(format!(
+                            "averin evidence seal required but failed (require_evidence): {e}"
+                        )),
+                    )
                 }),
         }
     }
@@ -2705,17 +2884,21 @@ impl VultrinoServer {
         let sequence = run_averin_queue_blocking(|| queue.append(token_id, "averin.use", payload))
             .map_err(|error| {
                 av.record_enqueue_failed();
-                RunError::terminal(VultrinoError::PolicyDenied(format!(
+                RunError::refused(
+                    RefusalClass::DecisionUnavailable,
+                    VultrinoError::PolicyDenied(format!(
                     "trusted human-floor evidence could not be durably queued: {error}; nothing ran"
-                )))
+                )),
+                )
             })?;
-        let event = queue.get(sequence).ok_or_else(|| {
-            av.record_required_failed();
-            RunError::terminal(VultrinoError::PolicyDenied(
+        let event =
+            queue.get(sequence).ok_or_else(|| {
+                av.record_required_failed();
+                RunError::refused(RefusalClass::DecisionUnavailable, VultrinoError::PolicyDenied(
                 "trusted human-floor evidence event disappeared before delivery; nothing ran"
                     .to_string(),
             ))
-        })?;
+            })?;
 
         match deliver_averin_use(&event, popkeys, av).await {
             Ok(()) => {
@@ -2752,9 +2935,12 @@ impl VultrinoServer {
                     queue.record_delivery(sequence, false, Some(error.clone()), AVERIN_MAX_ATTEMPTS)
                 });
                 av.record_required_failed();
-                Err(RunError::terminal(VultrinoError::PolicyDenied(format!(
-                    "trusted human-floor Averin evidence seal failed: {error}; nothing ran"
-                ))))
+                Err(RunError::refused(
+                    RefusalClass::DecisionUnavailable,
+                    VultrinoError::PolicyDenied(format!(
+                        "trusted human-floor Averin evidence seal failed: {error}; nothing ran"
+                    )),
+                ))
             }
         }
     }
@@ -2828,11 +3014,16 @@ impl VultrinoServer {
         let refusal = match verdict {
             Ok(v) => match v.refusal_reason() {
                 None => return Ok(()),
-                Some(reason) => RunError::terminal(VultrinoError::PolicyDenied(reason)),
+                Some(reason) => {
+                    RunError::refused(RefusalClass::KillFence, VultrinoError::PolicyDenied(reason))
+                }
             },
-            Err(error) => RunError::retryable(VultrinoError::PolicyUnavailable(format!(
-                "the kill fence could not be read from the vault; nothing ran: {error}"
-            ))),
+            Err(error) => RunError::refused_retryable(
+                RefusalClass::DecisionUnavailable,
+                VultrinoError::PolicyUnavailable(format!(
+                    "the kill fence could not be read from the vault; nothing ran: {error}"
+                )),
+            ),
         };
         if let Some((av, evidence)) = exact_evidence {
             if let Err(seal_error) = av.complete_exact_use(evidence, "error").await {
@@ -2866,6 +3057,7 @@ impl VultrinoServer {
         principal: Option<&crate::policy::Principal>,
         tenant: Option<&str>,
         admitted_epoch: u64,
+        rctx: &RefusalCtx,
     ) -> Result<(), VultrinoError> {
         let verdict = self
             .storage
@@ -2876,9 +3068,13 @@ impl VultrinoServer {
             })
             .await
             .map_err(|error| {
-                VultrinoError::PolicyUnavailable(format!(
-                    "the kill fence could not be read from the vault; no approval was opened: {error}"
-                ))
+                self.refuse(
+                    rctx,
+                    RefusalClass::DecisionUnavailable,
+                    VultrinoError::PolicyUnavailable(format!(
+                        "the kill fence could not be read from the vault; no approval was opened: {error}"
+                    )),
+                )
             })?;
         let Some(reason) = verdict.refusal_reason() else {
             return Ok(());
@@ -2894,9 +3090,11 @@ impl VultrinoServer {
             "kill_fence",
         )
         .await;
-        Err(VultrinoError::PolicyDenied(format!(
-            "{reason}; no approval was opened"
-        )))
+        Err(self.refuse(
+            rctx,
+            RefusalClass::KillFence,
+            VultrinoError::PolicyDenied(format!("{reason}; no approval was opened")),
+        ))
     }
 
     /// Run a plugin action against a resolved credential.
@@ -2931,6 +3129,7 @@ impl VultrinoServer {
             evidence_required,
             d8_fallback_ok,
             kill_fence,
+            refusal: _,
         } = authorized.into_payload();
         let plugin_name = plugin_name.as_str();
         let action_name = action_name.as_str();
@@ -2960,17 +3159,20 @@ impl VultrinoServer {
         // Serialize once before token consumption. Trusted human-floor actions
         // fail closed here if no evidence path/grant exists; reversible actions
         // preserve the default-off and Observe behavior.
-        let evidence_params = if evidence_required
-            || (self.averin.is_some() && evidence_subject_id.is_some())
-        {
-            Some(serde_json::to_vec(&params).map_err(|_| {
-                RunError::terminal(VultrinoError::PolicyDenied(
-                    "execution parameters could not be bound to evidence; nothing ran".to_string(),
-                ))
-            })?)
-        } else {
-            None
-        };
+        let evidence_params =
+            if evidence_required || (self.averin.is_some() && evidence_subject_id.is_some()) {
+                Some(serde_json::to_vec(&params).map_err(|_| {
+                    RunError::refused(
+                        RefusalClass::DecisionUnavailable,
+                        VultrinoError::PolicyDenied(
+                            "execution parameters could not be bound to evidence; nothing ran"
+                                .to_string(),
+                        ),
+                    )
+                })?)
+            } else {
+                None
+            };
         self.validate_required_evidence_preflight(
             evidence_required,
             evidence_subject_id,
@@ -2992,10 +3194,10 @@ impl VultrinoServer {
         let mut use_sequence_number: u32 = 0;
         if let Some(tid) = use_token_id {
             let consumed = self.storage.consume_use_token(tid).await.map_err(|e| {
-                RunError::terminal(VultrinoError::PolicyDenied(format!(
-                    "Use token cannot be used: {}",
-                    e
-                )))
+                RunError::refused(
+                    RefusalClass::TokenUnusable,
+                    VultrinoError::PolicyDenied(format!("Use token cannot be used: {}", e)),
+                )
             })?;
             use_sequence_number = consumed.uses;
         }
@@ -3308,7 +3510,7 @@ impl VultrinoServer {
         request: ExecuteRequest,
         exec_auth: ExecAuth,
     ) -> Result<StreamingOutcome, VultrinoError> {
-        self.execute_gated_streaming_inner(request, exec_auth, false)
+        self.execute_gated_streaming_inner(request, exec_auth, false, RefusalEntry::Execute)
             .await
     }
 
@@ -3318,7 +3520,7 @@ impl VultrinoServer {
         request: ExecuteRequest,
         exec_auth: ExecAuth,
     ) -> Result<StreamingOutcome, VultrinoError> {
-        self.execute_gated_streaming_inner(request, exec_auth, true)
+        self.execute_gated_streaming_inner(request, exec_auth, true, RefusalEntry::Llm)
             .await
     }
 
@@ -3327,14 +3529,16 @@ impl VultrinoServer {
         request: ExecuteRequest,
         exec_auth: ExecAuth,
         via_llm_channel: bool,
+        entry: RefusalEntry,
     ) -> Result<StreamingOutcome, VultrinoError> {
         match self
-            .prepare_execution(request, exec_auth, via_llm_channel)
+            .prepare_execution(request, exec_auth, via_llm_channel, entry)
             .await?
         {
             PreparedAction::Pending(approval) => Ok(StreamingOutcome::Pending(approval)),
             PreparedAction::Ready(ready) => {
                 let payload = ready.payload();
+                let rctx = payload.refusal.clone();
                 let full_action = format!("{}.{}", payload.plugin_name, payload.action_name);
                 // An operator `block`/`redact_patterns` egress rule on this
                 // (credential, action) can't be honored incrementally, so serve
@@ -3347,13 +3551,16 @@ impl VultrinoServer {
                     &payload.credential.alias,
                     &full_action,
                 ) {
-                    let response = self.run_action(*ready).await.map_err(|re| re.error)?;
+                    let response = self
+                        .run_action(*ready)
+                        .await
+                        .map_err(|re| self.note_run_refusal(&rctx, re).error)?;
                     return Ok(StreamingOutcome::Streaming(buffered_as_stream(response)));
                 }
                 let exec = self
                     .run_action_streaming(*ready)
                     .await
-                    .map_err(|re| re.error)?;
+                    .map_err(|re| self.note_run_refusal(&rctx, re).error)?;
                 Ok(StreamingOutcome::Streaming(exec))
             }
         }
@@ -3390,6 +3597,7 @@ impl VultrinoServer {
             evidence_required,
             d8_fallback_ok,
             kill_fence,
+            refusal: _,
         } = authorized.into_payload();
         let plugin_name = plugin_name.as_str();
         let action_name = action_name.as_str();
@@ -3417,17 +3625,20 @@ impl VultrinoServer {
         // The streaming path shares the exact same pre-consume evidence
         // preflight as buffered execution. A strict failure occurs before the
         // upstream stream is opened and before the token is reserved.
-        let evidence_params = if evidence_required
-            || (self.averin.is_some() && evidence_subject_id.is_some())
-        {
-            Some(serde_json::to_vec(&params).map_err(|_| {
-                RunError::terminal(VultrinoError::PolicyDenied(
-                    "execution parameters could not be bound to evidence; nothing ran".to_string(),
-                ))
-            })?)
-        } else {
-            None
-        };
+        let evidence_params =
+            if evidence_required || (self.averin.is_some() && evidence_subject_id.is_some()) {
+                Some(serde_json::to_vec(&params).map_err(|_| {
+                    RunError::refused(
+                        RefusalClass::DecisionUnavailable,
+                        VultrinoError::PolicyDenied(
+                            "execution parameters could not be bound to evidence; nothing ran"
+                                .to_string(),
+                        ),
+                    )
+                })?)
+            } else {
+                None
+            };
         self.validate_required_evidence_preflight(
             evidence_required,
             evidence_subject_id,
@@ -3445,10 +3656,10 @@ impl VultrinoServer {
         let mut use_sequence_number: u32 = 0;
         if let Some(tid) = use_token_id {
             let consumed = self.storage.consume_use_token(tid).await.map_err(|e| {
-                RunError::terminal(VultrinoError::PolicyDenied(format!(
-                    "Use token cannot be used: {}",
-                    e
-                )))
+                RunError::refused(
+                    RefusalClass::TokenUnusable,
+                    VultrinoError::PolicyDenied(format!("Use token cannot be used: {}", e)),
+                )
             })?;
             use_sequence_number = consumed.uses;
         }
@@ -3920,11 +4131,30 @@ impl VultrinoServer {
     /// lock, so "run an approved action whose stored evidence does not satisfy its
     /// stored rule" has no expressible call. Nothing here needs to remember to
     /// check: the compiler refuses the call.
+    /// Who is refused if the resume of `approval` refuses (feir-ops#1): the principal recorded on
+    /// the approval at open, never request input, under the `approval_resume` entry point.
+    fn resume_refusal_ctx(approval: &ApprovalRequest) -> RefusalCtx {
+        let principal = match (
+            approval
+                .principal_id
+                .as_deref()
+                .or(approval.requester.principal_id.as_deref()),
+            approval.agent_label.as_deref(),
+        ) {
+            (Some(id), label) => Some((id, label)),
+            (None, Some(label)) => Some(("unknown", Some(label))),
+            (None, None) => None,
+        };
+        RefusalCtx::new(RefusalEntry::ApprovalResume, principal, &approval.action)
+            .resolved(&approval.credential, &approval.action)
+    }
+
     async fn resume_approved(
         &self,
         approval: &ApprovalRequest,
         grant: crate::approval::Granted,
     ) -> Result<ExecuteResponse, RunError> {
+        let rctx = &Self::resume_refusal_ctx(approval);
         // The V11 *observe* downgrade is an open-time/live-path concept
         // (the approval record doesn't carry the opener's tenant), so an
         // observe-tenant action that is BOTH policy-denied AND approval-gated is
@@ -3947,7 +4177,7 @@ impl VultrinoServer {
         // receive a resumed response, so an approval on an LLM credential is never
         // resumed (fail closed). This also covers approvals opened through execute before
         // the /llm-only rule existed.
-        self.refuse_llm_credential_off_channel(&credential, &approval.credential)
+        self.refuse_llm_credential_off_channel(&credential, &approval.credential, rctx)
             .await
             .map_err(RunError::terminal)?;
 
@@ -3967,11 +4197,21 @@ impl VultrinoServer {
             current_credential_authority.tenant(),
         );
         if !credential_authority_current || !tenant_still_authorized {
-            return Err(RunError::terminal(VultrinoError::PolicyDenied(
-                "the credential revision or tenant authority governing this approval changed; \
-                 nothing ran — open a new approval against the current credential"
-                    .to_string(),
-            )));
+            // A tenant that no longer may act is isolation; a changed revision is an authority
+            // that can no longer be established.
+            let class = if tenant_still_authorized {
+                RefusalClass::DecisionUnavailable
+            } else {
+                RefusalClass::CrossTenant
+            };
+            return Err(RunError::refused(
+                class,
+                VultrinoError::PolicyDenied(
+                    "the credential revision or tenant authority governing this approval \
+                     changed; nothing ran — open a new approval against the current credential"
+                        .to_string(),
+                ),
+            ));
         }
 
         // Revalidate the exact credential+action catalog authority immediately
@@ -3997,11 +4237,14 @@ impl VultrinoServer {
             None => self.config.enforcement.require_declared_capabilities,
         };
         if current_capability_authority.is_none() || catalog_authority_changed {
-            return Err(RunError::terminal(VultrinoError::PolicyDenied(
-                "the capability declaration governing this approval is unavailable or changed; \
-                 nothing ran — open a new approval against the current catalog"
-                    .to_string(),
-            )));
+            return Err(RunError::refused(
+                RefusalClass::DecisionUnavailable,
+                VultrinoError::PolicyDenied(
+                    "the capability declaration governing this approval is unavailable or \
+                     changed; nothing ran — open a new approval against the current catalog"
+                        .to_string(),
+                ),
+            ));
         }
 
         // Govder recipe authority is live configuration too. Re-fetch the exact
@@ -4018,9 +4261,13 @@ impl VultrinoServer {
             )
             .await
             .map_err(|error| {
-                RunError::terminal(VultrinoError::PolicyUnavailable(format!(
-                    "the approval recipe authority could not be revalidated; nothing ran: {error}"
-                )))
+                RunError::refused(
+                    RefusalClass::DecisionUnavailable,
+                    VultrinoError::PolicyUnavailable(format!(
+                        "the approval recipe authority could not be revalidated; nothing ran: \
+                         {error}"
+                    )),
+                )
             })?;
         let gate_rule_authority_current = match current_gate_rule {
             crate::govder::GateRuleAnswer::Rule(fetched) => {
@@ -4046,11 +4293,14 @@ impl VultrinoServer {
         let legacy_unbound_recipe = approval.gate_rule_authority().is_none()
             && !self.config.enforcement.require_declared_capabilities;
         if !legacy_unbound_recipe && !gate_rule_authority_current {
-            return Err(RunError::terminal(VultrinoError::PolicyDenied(
-                "the authoritative approval recipe is unavailable or changed since this request \
-                 opened; nothing ran — open a new approval against the current rule"
-                    .to_string(),
-            )));
+            return Err(RunError::refused(
+                RefusalClass::DecisionUnavailable,
+                VultrinoError::PolicyDenied(
+                    "the authoritative approval recipe is unavailable or changed since this \
+                     request opened; nothing ran — open a new approval against the current rule"
+                        .to_string(),
+                ),
+            ));
         }
 
         // Re-evaluate policy at execution time so the deferred path still
@@ -4152,9 +4402,13 @@ impl VultrinoServer {
                 "policy_resume",
             )
             .await;
-            return Err(RunError::terminal(VultrinoError::PolicyDenied(
-                reason.clone(),
-            )));
+            let class = resume_policy
+                .deny_cause()
+                .map_or(RefusalClass::PolicyDeny, |c| c.refusal_class());
+            return Err(RunError::refused(
+                class,
+                VultrinoError::PolicyDenied(reason.clone()),
+            ));
         }
 
         let execution_epoch = grant.binding().epoch;
@@ -4164,9 +4418,12 @@ impl VultrinoServer {
             chrono::Utc::now().timestamp(),
         )
         .map_err(|reason| {
-            RunError::terminal(VultrinoError::PolicyDenied(format!(
-                "approved execution permit refused ({reason:?}); nothing ran"
-            )))
+            RunError::refused(
+                RefusalClass::DecisionUnavailable,
+                VultrinoError::PolicyDenied(format!(
+                    "approved execution permit refused ({reason:?}); nothing ran"
+                )),
+            )
         })?;
         // Only the claimed, persisted grant may bind approval authority into
         // plugin context. Ordinary/direct execution leaves these fields empty;
@@ -4221,11 +4478,15 @@ impl VultrinoServer {
                     Some(CapabilityAuthorityClass::Reversible)
                         | Some(CapabilityAuthorityClass::PartiallyReversible)
                 ),
+            refusal: rctx.clone(),
         };
         let authorized = permit.authorize(payload).map_err(|reason| {
-            RunError::terminal(VultrinoError::PolicyDenied(format!(
-                "approved execution binding mismatch ({reason:?}); nothing ran"
-            )))
+            RunError::refused(
+                RefusalClass::DecisionUnavailable,
+                VultrinoError::PolicyDenied(format!(
+                    "approved execution binding mismatch ({reason:?}); nothing ran"
+                )),
+            )
         })?;
         self.run_action(authorized).await
     }
@@ -4260,10 +4521,22 @@ impl VultrinoServer {
         // trigger execution of someone else's approved action.
         if let Some(caller) = caller {
             if !caller.owns(&approval) {
-                return Err(VultrinoError::PolicyDenied(
-                    "This approval was requested by a different principal; you are not authorized \
-                     to access it"
-                        .to_string(),
+                // feir-ops#1: an agent reaching for another agent's approved action is a refusal
+                // at the approval door. The caller is the stored principal row, not request input.
+                let rctx = RefusalCtx::new(
+                    RefusalEntry::ApprovalResume,
+                    Some((caller.principal_id.as_str(), caller.agent_label.as_deref())),
+                    &approval.action,
+                )
+                .resolved(&approval.credential, &approval.action);
+                return Err(self.refuse(
+                    &rctx,
+                    RefusalClass::NotGranted,
+                    VultrinoError::PolicyDenied(
+                        "This approval was requested by a different principal; you are not \
+                         authorized to access it"
+                            .to_string(),
+                    ),
                 ));
             }
         }
@@ -4336,6 +4609,11 @@ impl VultrinoServer {
                         }
                     };
 
+                    // feir-ops#1: a refusal of the resume is noted once, here, under the principal
+                    // the approval recorded (a dispatch-time one inside is cleared once noted).
+                    let outcome = outcome.map_err(|re| {
+                        self.note_run_refusal(&Self::resume_refusal_ctx(&resume_input), re)
+                    });
                     match outcome {
                         Ok(resp) => {
                             claimed.result_status = Some(resp.status);
@@ -4785,12 +5063,17 @@ impl VultrinoServer {
         &self,
         credential: &Credential,
         presented: &str,
+        rctx: &RefusalCtx,
     ) -> Result<(), VultrinoError> {
         let unavailable = || {
-            VultrinoError::PolicyUnavailable(
-                "the capability catalog is unavailable, so Vultrino cannot establish whether \
-                 this credential is an LLM channel; nothing was executed"
-                    .to_string(),
+            self.refuse(
+                rctx,
+                RefusalClass::DecisionUnavailable,
+                VultrinoError::PolicyUnavailable(
+                    "the capability catalog is unavailable, so Vultrino cannot establish whether \
+                     this credential is an LLM channel; nothing was executed"
+                        .to_string(),
+                ),
             )
         };
         if let Err(error) = self.storage.reload().await {
@@ -4822,11 +5105,15 @@ impl VultrinoServer {
             }
         }
         if is_llm {
-            return Err(VultrinoError::LlmChannelOnly(format!(
-                "credential '{}' is an LLM provider credential and is usable only \
-                 through the /llm proxy; nothing was executed",
-                credential.alias
-            )));
+            return Err(self.refuse(
+                rctx,
+                RefusalClass::LlmChannelOnly,
+                VultrinoError::LlmChannelOnly(format!(
+                    "credential '{}' is an LLM provider credential and is usable only \
+                     through the /llm proxy; nothing was executed",
+                    credential.alias
+                )),
+            ));
         }
         Ok(())
     }
@@ -5047,13 +5334,29 @@ impl VultrinoServer {
 
     /// Resolve an explicit model channel by stable capability id or channel
     /// name. With no name, compatibility `/llm` is accepted only for one channel.
+    ///
+    /// The error carries the refusal class to seal (feir-ops#1): `NotGranted` when the principal
+    /// holds no such grant, `DecisionUnavailable` when the capability catalog cannot be read, and
+    /// `None` for an ambiguous request from an agent that does hold grants (a request-shape
+    /// error, not a refusal of access).
     pub async fn resolve_llm_proxy_channel_for(
         &self,
         auth: Option<&AuthResult>,
         channel: Option<&str>,
-    ) -> Result<crate::capability::Capability, String> {
+    ) -> Result<crate::capability::Capability, LlmChannelRefusal> {
+        use crate::refusal::RefusalClass;
         let _ = self.storage.reload().await;
-        let all = self.storage.list_capabilities().await.unwrap_or_default();
+        let all = match self.storage.list_capabilities().await {
+            Ok(all) => all,
+            Err(_) => {
+                return Err(LlmChannelRefusal {
+                    message: "The capability catalog could not be read; no model channel can be \
+                              resolved"
+                        .to_string(),
+                    class: Some(RefusalClass::DecisionUnavailable),
+                })
+            }
+        };
         let mut allowed = Vec::new();
         for capability in all {
             if capability.is_llm_proxy() && self.capability_allowed_for(auth, &capability).await {
@@ -5064,14 +5367,20 @@ impl VultrinoServer {
             Some(name) => allowed
                 .into_iter()
                 .find(|c| c.id == name || c.tool_name == name)
-                .ok_or_else(|| format!("Model channel '{name}' is not granted")),
+                .ok_or_else(|| LlmChannelRefusal {
+                    message: format!("Model channel '{name}' is not granted"),
+                    class: Some(RefusalClass::NotGranted),
+                }),
             None if allowed.len() == 1 => Ok(allowed.remove(0)),
-            None if allowed.is_empty() => {
-                Err("No LLM-proxy capability is provisioned for this principal".to_string())
-            }
-            None => {
-                Err("Multiple model channels are granted; use /llm/channels/{channel}".to_string())
-            }
+            None if allowed.is_empty() => Err(LlmChannelRefusal {
+                message: "No LLM-proxy capability is provisioned for this principal".to_string(),
+                class: Some(RefusalClass::NotGranted),
+            }),
+            None => Err(LlmChannelRefusal {
+                message: "Multiple model channels are granted; use /llm/channels/{channel}"
+                    .to_string(),
+                class: None,
+            }),
         }
     }
 
@@ -5498,16 +5807,34 @@ pub async fn flush_receipt_gaps_once(
     let mut recorded = 0usize;
     while !gaps.is_empty() {
         let gap = gaps.remove(0);
-        let payload = serde_json::json!({
-            "token_id": gap.token_id,
+        let mut payload = serde_json::json!({
             "project_id": gap.project_id,
             "request_id": gap.request_id,
-            "use_sequence_number": gap.use_sequence_number,
             "reason": gap.reason,
             "detail": gap.detail,
             "at": gap.at.to_rfc3339(),
-            "outcome": "action_ran_without_receipt",
+            // What the gap is about: a receipt for an action that ran, or a refusal that was
+            // returned. A refusal gap must never read as an action that ran.
+            "kind": gap.kind.as_str(),
+            "outcome": gap.kind.outcome(),
         });
+        // A receipt gap names the use token whose action ran; a refusal gap names the refused
+        // agent under its own key, never `token_id` (a consumer would read that as a token whose
+        // action ran) and carries no use counter.
+        if let Some(obj) = payload.as_object_mut() {
+            match gap.kind {
+                crate::averin::GapKind::Receipt => {
+                    obj.insert("token_id".into(), serde_json::json!(gap.token_id));
+                    obj.insert(
+                        "use_sequence_number".into(),
+                        serde_json::json!(gap.use_sequence_number),
+                    );
+                }
+                crate::averin::GapKind::Refusal => {
+                    obj.insert("agent_id".into(), serde_json::json!(gap.token_id));
+                }
+            }
+        }
         match storage
             .append_event(
                 &gap.token_id,
@@ -5532,6 +5859,32 @@ pub async fn flush_receipt_gaps_once(
         }
     }
     recorded
+}
+
+/// feir-ops#1: the background loop that seals noted gateway refusals. Runs off the request path:
+/// a refusal is returned first and sealed here, so averin being slow or down never delays or
+/// changes a refusal.
+pub async fn drain_refusals_periodically(
+    averin: Arc<crate::averin::AverinClient>,
+    interval: std::time::Duration,
+) {
+    loop {
+        tokio::time::sleep(interval).await;
+        averin.drain_refusals_once().await;
+    }
+}
+
+/// feir-ops#1: the process is stopping. Seal the refusals still waiting (first refusals not yet
+/// drained, tails of open windows) within `budget`, record the ones that could not be sealed as
+/// refusal gaps, and append those gaps to the outbox, so an ordinary session end or a SIGTERM
+/// restart does not lose a refusal silently.
+pub async fn flush_refusals_on_shutdown(
+    storage: &Arc<dyn StorageBackend>,
+    averin: &crate::averin::AverinClient,
+    budget: std::time::Duration,
+) {
+    averin.flush_refusals_on_shutdown(budget).await;
+    flush_receipt_gaps_once(storage, averin).await;
 }
 
 /// FEI-33: the background loop around [`flush_receipt_gaps_once`].
@@ -7197,7 +7550,12 @@ mod tests {
             params: serde_json::json!({"url": "https://example.com/x", "method": "GET"}),
         };
         match server
-            .prepare_execution(read_request, ExecAuth::from_use_token(token.clone()), false)
+            .prepare_execution(
+                read_request,
+                ExecAuth::from_use_token(token.clone()),
+                false,
+                RefusalEntry::Execute,
+            )
             .await
             .expect("a read must not error")
         {
@@ -7216,7 +7574,12 @@ mod tests {
             params: serde_json::json!({"url": "https://example.com/x", "method": "POST"}),
         };
         match server
-            .prepare_execution(write_request, ExecAuth::from_use_token(token), false)
+            .prepare_execution(
+                write_request,
+                ExecAuth::from_use_token(token),
+                false,
+                RefusalEntry::Execute,
+            )
             .await
             .expect("preparing a gated write must not error")
         {

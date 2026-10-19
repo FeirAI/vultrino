@@ -785,6 +785,9 @@ request id, use sequence number, reason code, clipped detail, `at`, `outcome`; n
 event it is pruned after `[outbox] retention_secs` once delivered, and by the `max_retained_events` cap
 whether or not delivered, so it survives the shorter of the two windows (about an hour at the default
 cap on a busy host) and an undelivered gap beyond the cap is dropped; a consumer must store it: govder does).
+The payload also carries `kind` (`receipt`, or `refusal` for a gateway refusal record that was not sealed,
+with the refused agent as the subject and as `agent_id` (a refusal gap carries no `token_id` or use sequence number) and reasons `refusal_seal_failed` or `refusal_budget_overflow`) and
+`outcome` (`action_ran_without_receipt` for a receipt gap, `refused_not_sealed` for a refusal gap: nothing ran).
 
 Admin audit (observability item 4 / #17) — ids-only `{actor, target_id, verb}`
 payload (see `admin_audit_payload`), emitted best-effort after a successful

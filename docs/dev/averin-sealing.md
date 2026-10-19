@@ -703,3 +703,41 @@ are lossily converted (replacement characters) before they ever reach averin. Th
 is a **pre-existing constraint of the averin-seal JSON wire format**, not something
 088 introduces or changes; a resource whose `/execute` params are not valid UTF-8
 should not expect its raw bytes to seal byte-exactly through either seal path.
+
+## Gateway refusal records (feir-ops#1)
+
+Use receipts record what ran. A refusal record says the gateway refused an authenticated agent: it
+is a different averin record kind (`record_kind` `gateway-refusal`), built by averin at
+`POST /v2/refusals` from a closed set of fields and chained into the same `[averin]` session as the
+use receipts. It is not a grant or a use, so it never enters the coverage closure or the operation
+taxonomy.
+
+How vultrino feeds it:
+
+1. Every refusal site goes through one seam (`VultrinoServer::refuse`, and `RunError::refused` for the
+   dispatch tails) with a typed reason class. The class is never read back from message text; the
+   policy engine reports why it denied as a typed cause.
+2. The seam only notes the refusal in memory (synchronous, O(1), no I/O). The refusal the caller
+   returns is the same error as without it.
+3. A background drain (every two seconds, its own small permit pool) posts due records. An
+   individual record is sealed at the next drain; the rest of a window coalesces into one tail record;
+   a token bucket bounds the record count and beyond it refusals merge into one summary record with
+   exact per-class counts.
+4. A record averin does not accept becomes an `evidence.receipt_gap` event of `kind: refusal`, outcome
+   `refused_not_sealed`, with the refused agent as `agent_id` (never `token_id`, and no use counter).
+   A refusal gap never reads as an action that ran; a consumer must key on `kind` or `outcome`
+   (govder counts it separately and logs it as a refusal).
+5. A normal stop (the end of a stdio MCP session, SIGTERM or Ctrl+C on the web server) closes every
+   open window and seals what is waiting for up to five seconds; what averin did not take is a gap.
+
+| Entry point | Refusals recorded (class) |
+|---|---|
+| `execute` | the admission gate (not_granted, policy_deny, kill_fence, rate_limit, cross_tenant, capability_undeclared, approval_unavailable, decision_unavailable) and a revoked, expired or used-up use token (token_unusable) |
+| `mcp` | the same gate through every tool, and a revoked, expired or used-up use token on a named capability, a generic tool or a plugin tool (token_unusable, under the tool called) |
+| `llm` | no channel granted, a model not permitted or unpriced, an unusable token, an unreadable capability catalog (decision_unavailable); not an ambiguous channel request |
+| `approval_resume` | a non-owner poll, a revoked token polling an approval (REST, MCP and the result feed: token_unusable), and a refusal raised while an approved action is resumed |
+
+The record names the agent (the enforcement label, else `vultrino:<principal id>`), a sanitized action,
+the resolved credential alias when there is one, the reason class, the entry point (`mcp`, `execute`,
+`llm`, `approval_resume`), the attempt count and the first and last time. See LIMITATIONS for what
+this does not cover.

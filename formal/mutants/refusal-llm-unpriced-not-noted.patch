@@ -1,0 +1,17 @@
+diff --git a/src/web/llm_proxy.rs b/src/web/llm_proxy.rs
+index 38b540d..0657658 100644
+--- a/src/web/llm_proxy.rs
++++ b/src/web/llm_proxy.rs
+@@ -1629,12 +1629,6 @@ async fn llm_proxy_impl(
+                 route_refusal = route_refusal.as_deref().unwrap_or(""),
+                 "LLM request refused: model is not priced by the rate card"
+             );
+-            note_llm_refusal(
+-                &state,
+-                &exec_auth,
+-                Some(&capability),
+-                crate::refusal::RefusalClass::ModelUnpriced,
+-            );
+             return llm_error(
+                 StatusCode::FORBIDDEN,
+                 "model_unpriced",

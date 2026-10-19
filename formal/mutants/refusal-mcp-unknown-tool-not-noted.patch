@@ -1,0 +1,17 @@
+diff --git a/src/mcp/server.rs b/src/mcp/server.rs
+index e2ce95d..1da287c 100644
+--- a/src/mcp/server.rs
++++ b/src/mcp/server.rs
+@@ -887,12 +887,6 @@ impl McpServer {
+                 } else {
+                     // An authenticated agent asked for a tool that does not exist: a refusal of
+                     // that agent (the name is sanitized before it is sealed).
+-                    self.note_refusal_for_args(
+-                        &params.arguments,
+-                        crate::refusal::RefusalClass::NotGranted,
+-                        tool,
+-                    )
+-                    .await;
+                     return Err((INVALID_PARAMS, format!("Unknown tool: {}", tool)));
+                 }
+             }

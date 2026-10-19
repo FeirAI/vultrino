@@ -1,0 +1,13 @@
+diff --git a/src/refusal.rs b/src/refusal.rs
+index 27406d2..89fc020 100644
+--- a/src/refusal.rs
++++ b/src/refusal.rs
+@@ -84,7 +84,7 @@ impl RefusalClass {
+     /// The wire spelling.
+     pub fn as_str(self) -> &'static str {
+         match self {
+-            Self::NotGranted => "not_granted",
++            Self::NotGranted => "not-granted",
+             Self::PolicyDeny => "policy_deny",
+             Self::KillFence => "kill_fence",
+             Self::RateLimit => "rate_limit",

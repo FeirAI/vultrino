@@ -1,0 +1,13 @@
+diff --git a/src/averin/mod.rs b/src/averin/mod.rs
+index f2e4984..b76950d 100644
+--- a/src/averin/mod.rs
++++ b/src/averin/mod.rs
+@@ -273,7 +273,7 @@ impl GapKind {
+     pub fn outcome(self) -> &'static str {
+         match self {
+             Self::Receipt => "action_ran_without_receipt",
+-            Self::Refusal => "refused_not_sealed",
++            Self::Refusal => "action_ran_without_receipt",
+         }
+     }
+ }

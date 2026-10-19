@@ -18,14 +18,19 @@
       "sha256": "f443a8bf5b1968c50180d724250bb7ac4c6512bb0f2f984a7e4fc9f334d7eb8b"
     },
     {
-      "file": "tenant-assertion.v1.json",
-      "owner": "govder",
-      "sha256": "3f623a4e2fa45144d0dae27265dd725769d6d9bb59122b7611ff6a3eb8193084"
+      "file": "refusal-classes.v1.json",
+      "owner": "averin",
+      "sha256": "9c6224f60deff3201e4e046087fd280221c3dd179d8d9085bfa6d55ab7281952"
     },
     {
       "file": "secret-fingerprint.v1.json",
       "owner": "feir-os",
       "sha256": "70029b247125e27494217a228c7e674cea7617e606586fa5bba0307fc51eb2fd"
+    },
+    {
+      "file": "tenant-assertion.v1.json",
+      "owner": "govder",
+      "sha256": "3f623a4e2fa45144d0dae27265dd725769d6d9bb59122b7611ff6a3eb8193084"
     }
   ]
 }

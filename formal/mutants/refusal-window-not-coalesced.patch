@@ -1,0 +1,12 @@
+diff --git a/src/refusal.rs b/src/refusal.rs
+index 27406d2..22ebb4f 100644
+--- a/src/refusal.rs
++++ b/src/refusal.rs
+@@ -480,6 +480,7 @@ impl RefusalRecorder {
+             }
+             None => false,
+         };
++        let folded = folded && false;
+         if folded {
+             drop(st);
+             self.counters.lock().coalesced += 1;

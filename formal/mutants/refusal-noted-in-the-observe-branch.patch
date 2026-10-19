@@ -1,0 +1,12 @@
+diff --git a/src/server/mod.rs b/src/server/mod.rs
+index 9aead1e..41371ec 100644
+--- a/src/server/mod.rs
++++ b/src/server/mod.rs
+@@ -1941,6 +1941,7 @@ impl VultrinoServer {
+                 // decided the downgrade; the permit kernel admits it only as the
+                 // explicit `ObservedDeny` kind.
+                 if evaluation.observe_downgrade() {
++                    self.note_gateway_refusal(&rctx, RefusalClass::PolicyDeny);
+                     warn!(
+                         tenant = ?principal_tenant,
+                         credential = %credential.alias,

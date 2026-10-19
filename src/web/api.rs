@@ -135,7 +135,11 @@ pub struct ExecuteApiResponse {
 /// [`ExecAuth`]. A use token's credential/action scope is enforced
 /// authoritatively in the server (`execute_gated`); here we only authenticate
 /// and fail fast on an unusable token.
-async fn resolve_exec_auth(state: &AppState, secret: &str) -> Result<ExecAuth, Response> {
+async fn resolve_exec_auth(
+    state: &AppState,
+    secret: &str,
+    presented_action: &str,
+) -> Result<ExecAuth, Response> {
     if UseToken::looks_like_token(secret) {
         let _ = state.storage.reload().await;
         let token = match state
@@ -153,6 +157,17 @@ async fn resolve_exec_auth(state: &AppState, secret: &str) -> Result<ExecAuth, R
             }
         };
         if let Err(e) = token.check_usable() {
+            // feir-ops#1: a valid token that is revoked, expired or used up is a refusal of the
+            // agent it belongs to (the stored row), sealed as `token_unusable`. A secret that does
+            // not resolve to a stored token is unauthenticated and noted nowhere.
+            state.server.note_gateway_refusal(
+                &crate::refusal::RefusalCtx::new(
+                    crate::refusal::RefusalEntry::Execute,
+                    Some((token.id.as_str(), token.agent_label.as_deref())),
+                    presented_action,
+                ),
+                crate::refusal::RefusalClass::TokenUnusable,
+            );
             return Err(error_response(
                 StatusCode::FORBIDDEN,
                 "token_unusable",
@@ -197,6 +212,20 @@ fn resolve_inbound_principal(
     state.server.resolve_identity(value, signature, bearer)
 }
 
+/// feir-ops#1: a revoked use token that polls an approval (or reads the approval-result feed) is
+/// a refusal of the agent it belongs to, noted from the stored row as `token_unusable` on the
+/// `approval_resume` entry. Synchronous and O(1): the 403 is returned as before.
+fn note_revoked_token_poll(state: &AppState, token: &UseToken, action: &str) {
+    state.server.note_gateway_refusal(
+        &crate::refusal::RefusalCtx::new(
+            crate::refusal::RefusalEntry::ApprovalResume,
+            Some((token.id.as_str(), token.agent_label.as_deref())),
+            action,
+        ),
+        crate::refusal::RefusalClass::TokenUnusable,
+    );
+}
+
 /// Authenticate a caller and return its approval-ownership identity (without
 /// action scoping), for read-only operations like polling an approval.
 ///
@@ -221,11 +250,14 @@ async fn resolve_approval_caller(
                 agent_label: t.agent_label,
                 tenant: t.tenant,
             }),
-            Ok(Some(_)) => Err(error_response(
-                StatusCode::FORBIDDEN,
-                "token_revoked",
-                "Use token has been revoked",
-            )),
+            Ok(Some(t)) => {
+                note_revoked_token_poll(state, &t, "check_approval");
+                Err(error_response(
+                    StatusCode::FORBIDDEN,
+                    "token_revoked",
+                    "Use token has been revoked",
+                ))
+            }
             _ => Err(error_response(
                 StatusCode::UNAUTHORIZED,
                 "invalid_token",
@@ -299,11 +331,14 @@ async fn resolve_caller_channel_identity(
             .get_use_token_by_hash(&UseToken::hash(secret))
             .await
         {
-            Ok(Some(token)) if token.revoked => Err(error_response(
-                StatusCode::FORBIDDEN,
-                "token_revoked",
-                "Use token has been revoked",
-            )),
+            Ok(Some(token)) if token.revoked => {
+                note_revoked_token_poll(state, &token, "approval_results");
+                Err(error_response(
+                    StatusCode::FORBIDDEN,
+                    "token_revoked",
+                    "Use token has been revoked",
+                ))
+            }
             Ok(Some(token)) => channel_identity(token.agent_label, token.tenant),
             _ => Err(error_response(
                 StatusCode::UNAUTHORIZED,
@@ -341,7 +376,8 @@ pub async fn api_execute(
         }
     };
 
-    let mut exec_auth = match resolve_exec_auth(&state, &secret).await {
+    let presented_action = resolve_execute_action(request.action.clone());
+    let mut exec_auth = match resolve_exec_auth(&state, &secret, &presented_action).await {
         Ok(v) => v,
         Err(resp) => return resp,
     };
@@ -365,7 +401,7 @@ pub async fn api_execute(
     // Build the execute request (action no longer hardcoded — V8).
     let execute_request = ExecuteRequest {
         credential: request.credential,
-        action: resolve_execute_action(request.action),
+        action: presented_action,
         params: serde_json::json!({
             "method": request.method.to_uppercase(),
             "url": request.url,
@@ -3977,6 +4013,8 @@ pub async fn api_metrics(admin: AdminApiAuth, State(state): State<AppState>) -> 
     // default (enabled=false) this endpoint's output is byte-for-byte unchanged
     // (the key is inserted below only when a seal-client exists).
     let averin_seal = state.server.averin().map(|av| av.metrics());
+    // feir-ops#1 — gateway refusal counters, present under the same condition.
+    let averin_refusals = state.server.averin().map(|av| av.refusal_counters());
 
     let mut body = serde_json::json!({
         "unauthorized_attempts": state.server.unauthorized_attempts(),
@@ -4015,6 +4053,9 @@ pub async fn api_metrics(admin: AdminApiAuth, State(state): State<AppState>) -> 
     // `in_flight`/`max_in_flight` = the bounded fan-out gauge + high-water mark.
     if let Some(seal) = averin_seal {
         body["averin_seal"] = serde_json::to_value(seal).unwrap_or(serde_json::Value::Null);
+    }
+    if let Some(refusals) = averin_refusals {
+        body["averin_refusals"] = serde_json::to_value(refusals).unwrap_or(serde_json::Value::Null);
     }
     (StatusCode::OK, Json(body)).into_response()
 }

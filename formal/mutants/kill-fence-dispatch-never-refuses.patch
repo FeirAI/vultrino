@@ -1,13 +1,13 @@
 diff --git a/src/server/mod.rs b/src/server/mod.rs
-index b887170..8b8eeaa 100644
+index 9aead1e..9046bdf 100644
 --- a/src/server/mod.rs
 +++ b/src/server/mod.rs
-@@ -2429,7 +2429,7 @@ impl VultrinoServer {
+@@ -2996,7 +2996,7 @@ impl VultrinoServer {
              })
              .await;
          let refusal = match verdict {
 -            Ok(v) => match v.refusal_reason() {
 +            Ok(_v) => match None::<String> {
                  None => return Ok(()),
-                 Some(reason) => RunError::terminal(VultrinoError::PolicyDenied(reason)),
-             },
+                 Some(reason) => {
+                     RunError::refused(RefusalClass::KillFence, VultrinoError::PolicyDenied(reason))

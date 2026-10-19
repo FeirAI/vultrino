@@ -621,6 +621,15 @@ pub struct RawAverinConfig {
     /// every partially-reversible action. Unknown values are refused at load. See
     /// [`crate::averin::D8EvidenceFloor`].
     pub d8_evidence_floor: Option<String>,
+    /// feir-ops#1: seal every gateway refusal as a `gateway-refusal` record. Default true while the
+    /// seal client is enabled; `false` counts refusals in metrics only.
+    pub seal_refusals: Option<bool>,
+    /// Refusal coalescing window in seconds (default 10; `0` falls back to the default).
+    pub refusal_window_secs: Option<u64>,
+    /// Refusal record burst (default 60; `0` falls back to the default).
+    pub refusal_burst: Option<u32>,
+    /// Refusal records refilled per hour (default 20; `0` falls back to the default).
+    pub refusal_records_per_hour: Option<u32>,
 }
 
 impl TryFrom<RawAverinConfig> for crate::averin::AverinConfig {
@@ -732,6 +741,22 @@ impl TryFrom<RawAverinConfig> for crate::averin::AverinConfig {
             durable,
             d8_complete_evidence,
             d8_evidence_floor,
+            seal_refusals: raw.seal_refusals.unwrap_or(d.seal_refusals),
+            refusal_window_secs: raw
+                .refusal_window_secs
+                .filter(|&n| n > 0)
+                .unwrap_or(d.refusal_window_secs)
+                .min(crate::refusal::MAX_REFUSAL_WINDOW_SECS),
+            refusal_burst: raw
+                .refusal_burst
+                .filter(|&n| n > 0)
+                .unwrap_or(d.refusal_burst)
+                .min(crate::refusal::MAX_REFUSAL_BURST),
+            refusal_records_per_hour: raw
+                .refusal_records_per_hour
+                .filter(|&n| n > 0)
+                .unwrap_or(d.refusal_records_per_hour)
+                .min(crate::refusal::MAX_REFUSAL_RECORDS_PER_HOUR),
         })
     }
 }
@@ -1693,6 +1718,24 @@ action = "deny"
         .unwrap();
         assert!(cfg.averin.durable);
         assert_eq!(cfg.averin.mode, crate::averin::AverinMode::Observe);
+    }
+
+    /// The refusal record budget is the month-size bound, not a tuning knob: an operator value
+    /// above a ceiling is clamped to it, and the posture reports the value in force.
+    #[test]
+    fn refusal_budget_settings_are_clamped_to_their_ceilings() {
+        let cfg = Config::parse(
+            "[averin]\nrefusal_burst = 4000000000\nrefusal_records_per_hour = 4000000000\nrefusal_window_secs = 99999999",
+        )
+        .unwrap();
+        assert_eq!(cfg.averin.refusal_burst, 240);
+        assert_eq!(cfg.averin.refusal_records_per_hour, 60);
+        assert_eq!(cfg.averin.refusal_window_secs, 300);
+        // A value under the ceiling is kept.
+        let cfg =
+            Config::parse("[averin]\nrefusal_burst = 100\nrefusal_records_per_hour = 30").unwrap();
+        assert_eq!(cfg.averin.refusal_burst, 100);
+        assert_eq!(cfg.averin.refusal_records_per_hour, 30);
     }
 
     // ---- FEI-16: Telegram callback decisions ------------------------------------------

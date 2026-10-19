@@ -1,15 +1,15 @@
 diff --git a/src/server/mod.rs b/src/server/mod.rs
-index a6b7ef8..535b652 100644
+index 9aead1e..12174c7 100644
 --- a/src/server/mod.rs
 +++ b/src/server/mod.rs
-@@ -3740,9 +3740,7 @@ impl VultrinoServer {
+@@ -4157,9 +4157,7 @@ impl VultrinoServer {
          // receive a resumed response, so an approval on an LLM credential is never
          // resumed (fail closed). This also covers approvals opened through execute before
          // the /llm-only rule existed.
--        self.refuse_llm_credential_off_channel(&credential, &approval.credential)
+-        self.refuse_llm_credential_off_channel(&credential, &approval.credential, rctx)
 -            .await
 -            .map_err(RunError::terminal)?;
-+        let _ = &credential;
++        let _ = (&credential, rctx);
  
          // Revalidate the exact credential record before consulting any later
          // authority.  The approval names an alias for usability, but the human

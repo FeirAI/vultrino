@@ -1,8 +1,8 @@
 diff --git a/src/web/llm_proxy.rs b/src/web/llm_proxy.rs
-index 423671c..c2566a7 100644
+index 38b540d..0008b5f 100644
 --- a/src/web/llm_proxy.rs
 +++ b/src/web/llm_proxy.rs
-@@ -1316,10 +1316,7 @@ async fn llm_proxy_impl(
+@@ -1653,10 +1653,7 @@ async fn llm_proxy_impl(
          }
          // The card prices tokens at one input and one output price per model. A request
          // field that raises the provider's price beyond that would be booked too low.
@@ -13,4 +13,4 @@ index 423671c..c2566a7 100644
 +        let unpriced: Option<String> = None;
          if let Some(found) = unpriced {
              tracing::warn!(found = %found, "LLM request refused: it sets a price modifier the rate card does not hold");
-             return llm_error(
+             note_llm_refusal(

@@ -121,7 +121,7 @@ if not re.search(r"pub\(crate\) fn direct\(\s*witness: AdmissionWitness,", rust)
     fail("the direct permit no longer consumes an AdmissionWitness")
 if not re.search(r"pub\(crate\) struct AdmissionWitness \{\n    kind: AdmissionKind,\n    subject: JudgedSubject,\n\}", rust):
     fail("AdmissionWitness fields are no longer private")
-if not re.search(r"pub\(crate\) struct Evaluation \{\n    decision: PolicyDecision,\n    observe_downgrade: bool,\n    subject: Option<crate::formal_kernel::JudgedSubject>,\n\}", policy):
+if not re.search(r"pub\(crate\) struct Evaluation \{\n    decision: PolicyDecision,\n    observe_downgrade: bool,\n    subject: Option<crate::formal_kernel::JudgedSubject>,\n    /// Typed reason of a Deny \(None for Allow and Prompt\)\.\n    deny_cause: Option<DenyCause>,\n\}", policy):
     fail("policy Evaluation fields are no longer private")
 if policy.count("Evaluation {\n            decision") != 2:
     fail("Evaluation must be built only by the two admission evaluation methods")
