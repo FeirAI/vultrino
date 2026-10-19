@@ -1,0 +1,17 @@
+diff --git a/src/web/api.rs b/src/web/api.rs
+index bb143fd..2eb2e6c 100644
+--- a/src/web/api.rs
++++ b/src/web/api.rs
+@@ -2753,11 +2753,7 @@ pub async fn api_put_capability(
+     headers: axum::http::HeaderMap,
+     Json(req): Json<CapabilityUpsertRequest>,
+ ) -> Response {
+-    // Operator-only: capabilities carry no tenant (shared enforcement catalog), so a
+-    // tenant-scoped key must not create, replace or delete one. See `require_global_admin`.
+-    if let Err(resp) = require_global_admin(&admin).await {
+-        return resp;
+-    }
++    let _ = &admin;
+     let key = extract_idempotency_key(&headers);
+     // Bind the hash to the path id (same as policies) so the same body PUT to a
+     // different id under one Idempotency-Key isn't replayed as the first.

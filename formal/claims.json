@@ -489,6 +489,18 @@
       "tier": "full",
       "claim": "posture-report-live"
     },
+    "capability-put-tenant-key-allowed": {
+      "tier": "fast",
+      "claim": "capability-writes-operator-only"
+    },
+    "capability-post-tenant-key-allowed": {
+      "tier": "full",
+      "claim": "capability-writes-operator-only"
+    },
+    "capability-delete-tenant-key-allowed": {
+      "tier": "full",
+      "claim": "capability-writes-operator-only"
+    },
     "posture-tenant-key-allowed": {
       "tier": "full",
       "claim": "posture-report-live"
@@ -5754,6 +5766,42 @@
         "llm-x-goog-user-project-forwarded"
       ],
       "does_not_establish": "That OpenAI accepts the configured organization or project id, that the id belongs to the key, or that the real upstream sees the header: the integration tests drive a stub plugin standing in for the http plugin and read the params handed to it, and the http plugin's own removal is tested on its parameter step, not on a live request. A credential with a multi-organization key and no setting sends no header, and OpenAI then bills and scopes the request to the key owner's default organization and project; it does not refuse it. The streaming path is driven for injection and removal on /llm; approval replay and the approval-open refusal reuse the Anthropic workspace claim's helper calls and are covered by its approval test, not by an OpenAI-specific one. The header removal applies to every credential and route, so it also removes the two headers on an Azure OpenAI route, where nothing sets them. Other plugins (internal_http, WASM) get the server-side removal but have no injection of their own. Only the three headers named in the gateway-owned table are operator-set; x-goog-user-project is dropped on /llm but there is no gateway-owned Google project setting yet (not offered, see LIMITATIONS), so a multi-project Google key always uses its own project, and the drop is on /llm only: POST /api/v1/execute and the MCP http_request tool still pass a caller-sent x-goog-user-project through. The x-goog-user-project test drives the openai-chat and openai-responses routes with a stub plugin, not a live Vertex AI or Gemini route; the allowlist is shared by every /llm protocol. Any other allowlisted provider header is still forwarded from the client on /llm. The format check is an operator-facing sanity check, not OpenAI's own validation, and the ceiling of 64 characters is this gateway's choice."
+    },
+    {
+      "id": "capability-writes-operator-only",
+      "statement": "POST /api/v1/capabilities, PUT /api/v1/capabilities/{id} and DELETE /api/v1/capabilities/{id} answer only to a global (untenanted) admin key: a tenant-scoped admin key gets 403 operator_key_required before any read, write or idempotency lookup, so the capability catalog is unchanged afterwards (nothing created, replaced or deleted), a tenant key cannot replay a 2xx cached under an Idempotency-Key a global key used, a global key still succeeds on all three, and the GET list is still served to a tenant-scoped key.",
+      "method": "test",
+      "artifacts": [
+        "src/web/api.rs",
+        "tests/web_smoke.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --test web_smoke -- --exact capability_writes_refuse_a_tenant_scoped_key capability_write_idempotency_replay_cannot_bypass_the_operator_gate",
+      "covers": [
+        {
+          "path": "src/web/api.rs",
+          "symbol": "api_create_capability",
+          "sha256": "9179c1e73e66cac84cd19a52facde9ed23aa18dd33c1e6c29caf2fbd89c2a199"
+        },
+        {
+          "path": "src/web/api.rs",
+          "symbol": "api_put_capability",
+          "sha256": "fc0ee0de491b097aa954021e4ee4901f5304abf8e9c4edae48b2e3cd66f81b3e"
+        },
+        {
+          "path": "src/web/api.rs",
+          "symbol": "api_delete_capability",
+          "sha256": "62492a156f274772553b21f76a9c3d92f10cbc9bff05bfec10032834f7a2673c"
+        }
+      ],
+      "mutants": [
+        "capability-put-tenant-key-allowed",
+        "capability-post-tenant-key-allowed",
+        "capability-delete-tenant-key-allowed"
+      ],
+      "does_not_establish": "That the GET capability list is tenant-filtered: it is not, a tenant-scoped key sees the whole shared catalog. That any other route is operator-only (each carries its own gate). That a global key is held only by operators: who holds one is deployment configuration. The detector drives an in-memory test router, not a deployed binary. The capability body is not validated by this claim, only who may write it."
     }
   ]
 }

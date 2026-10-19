@@ -228,7 +228,8 @@ is confined to its own tenant on the routes listed below, with the exceptions in
 last bullet:
 
 - **Operator-only routes** — no tenant field on the resource, or a label-addressed
-  action: policy CRUD, role CRUD, the event outbox (`/events`, `/events/dead`,
+  action: policy CRUD, capability writes (`POST`/`PUT`/`DELETE
+  /api/v1/capabilities[/{id}]`), role CRUD, the event outbox (`/events`, `/events/dead`,
   `/events/{seq}/replay`), and agent `halt`/`unhalt`. A tenant-scoped key gets
   `403 operator_key_required`; use the global operator key.
 - **Tenant-scoped routes** — resource carries a tenant: use-token revoke,
@@ -238,13 +239,11 @@ last bullet:
   mint for a **different** tenant returns `403 cross_tenant_denied`. The tenant is
   re-checked under the storage lock.
 - The **global operator key is unrestricted** across tenants.
-- **Not partitioned:** the capability routes and some list routes carry no tenant check.
-  A tenant-scoped admin key can create, replace or delete any capability
-  (`POST`/`PUT`/`DELETE /api/v1/capabilities[/{id}]`), including one whose
-  `credential_ref` is another tenant's credential, and `GET /api/v1/capabilities` and
-  `GET /api/v1/sessions` return every tenant's entries. `GET /api/v1/tokens` and
+- **Not partitioned:** some list routes carry no tenant check. `GET /api/v1/capabilities`
+  and `GET /api/v1/sessions` return every tenant's entries (capability writes are
+  operator-only, above; the capability list is not tenant-filtered). `GET /api/v1/tokens` and
   `GET /api/v1/policies` need only `read` and are not tenant-filtered either. Treat a
-  tenant-scoped key as operator-trusted on these routes.
+  tenant-scoped key as operator-trusted on these read routes.
 
 ### Policies
 
