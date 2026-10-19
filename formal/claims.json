@@ -5264,7 +5264,7 @@
       "gates": [
         "rust"
       ],
-      "detector": "cargo test --locked --no-default-features --lib -- refusal::tests:: && cargo test --locked --no-default-features --test refusals_integration refusal_coalesced_ refusal_budget_",
+      "detector": "cargo test --locked --no-default-features --lib -- refusal::tests:: && cargo test --locked --no-default-features --test refusals_integration -- refusal_coalesced_ refusal_budget_",
       "detector_kind": "cargo",
       "covers": [
         {
@@ -5391,7 +5391,7 @@
       "gates": [
         "rust"
       ],
-      "detector": "cargo test --locked --no-default-features --lib -- refusal::tests::no_principal_notes_nothing && cargo test --locked --no-default-features --test refusals_integration not_a_refusal_ refusal_off_by_config_",
+      "detector": "cargo test --locked --no-default-features --lib -- refusal::tests::no_principal_notes_nothing && cargo test --locked --no-default-features --test refusals_integration -- not_a_refusal_ refusal_off_by_config_",
       "detector_kind": "cargo",
       "covers": [
         {
@@ -5461,7 +5461,7 @@
       "gates": [
         "rust"
       ],
-      "detector": "cargo test --locked --no-default-features --lib -- policy::deny_cause_tests && cargo test --locked --no-default-features --test refusals_integration refusal_table_execute_rate_limit refusal_table_execute_kill_fence",
+      "detector": "cargo test --locked --no-default-features --lib -- policy::deny_cause_tests && cargo test --locked --no-default-features --test refusals_integration -- refusal_table_execute_rate_limit refusal_table_execute_kill_fence",
       "detector_kind": "cargo",
       "covers": [
         {
