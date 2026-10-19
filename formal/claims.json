@@ -5439,6 +5439,11 @@
         },
         {
           "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::prepare_execution",
+          "sha256": "c94236d1adb4d35ed6eb004eb0ee88ae778415c516c89a8fdb3ad3c90a1f0c24"
+        },
+        {
+          "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::direct_admission",
           "sha256": "6650757976a97f795330c7a66345d7f57797a941ae369cb2176ff88e03618e39"
         }
