@@ -80,5 +80,5 @@ formal/            Stage-1 gates: Lean model, Kani harnesses, refinement checker
 Cargo.lock         Committed; CI and Docker build with --locked
 ```
 
-Default Cargo features: `wasm-plugins` (wasmtime 47). See [LIMITATIONS.md](LIMITATIONS.md)
+Default Cargo features: `wasm-plugins` (wasmtime 49). See [LIMITATIONS.md](LIMITATIONS.md)
 for why Kani runs with `--no-default-features`.

@@ -44,7 +44,7 @@ bash formal/check-refinement.sh
 bash formal/run-kani.sh    # → cargo kani --no-default-features --harness …
 ```
 
-Default Cargo features include `wasm-plugins` (wasmtime 47). Production
+Default Cargo features include `wasm-plugins` (wasmtime 49). Production
 `cargo test` / `cargo build` keep that default. Formal Kani jobs deliberately
 disable it; see [LIMITATIONS.md](LIMITATIONS.md) for the honest proof scope.
 
