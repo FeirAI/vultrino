@@ -5021,6 +5021,11 @@
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::try_new",
           "sha256": "7c74d2e58847813e76e872fd8da38ec61f9b4d8898a34efc583968f5fe6fc356"
+        },
+        {
+          "path": "src/averin/mod.rs",
+          "symbol": "AverinClient::enqueue_gap",
+          "sha256": "561986002c01568e14aaf9b7efc5983323a5f66fbc96c39d6e7f6ac29855bf13"
         }
       ],
       "mutants": [
@@ -5309,6 +5314,16 @@
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::resolve_llm_proxy_channel_for",
           "sha256": "73f4cc670f03f5a789c4c95cee03ebc1a493abe862186516cf18e610c47e4ef8"
+        },
+        {
+          "path": "src/mcp/server.rs",
+          "symbol": "McpServer::handle_tools_call",
+          "sha256": "0117064e691ba827bc3e6842c74a7f3d3d4a287672586977a95937d6dcdf8ef9"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "llm_proxy_impl",
+          "sha256": "af1c08b08a956dec15ec5acd4e2b4dc60e670058e444b294e14ddf042664d467"
         }
       ],
       "mutants": [
