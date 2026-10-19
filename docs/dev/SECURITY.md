@@ -72,15 +72,23 @@ upstream.
    ordinary policy denials are observable-away.
 7. **Events are signed and ordered.** Every outbox delivery (and replay) carries
    `Govder-Signature: sha256=HMAC-SHA256(secret, body)`; the sequence is monotonic
-   and gap-free, so a consumer detects a dropped *delivery*.
+   and gap-free, so a consumer detects a dropped *delivery*. Detection is not recovery:
+   the `max_retained_events` cap prunes the oldest events whether or not they were
+   delivered, so a consumer that falls behind it sees a hole it cannot refill, and a
+   failed append mints no sequence at all (it is reported only by a later `meter.lost`
+   marker; see LIMITATIONS.md).
 8. **The admin surface is API-key-only.** Use tokens can never reach the admin API
    (`403 not_admin`), and admin authentication is checked before the request body
    is parsed.
-9. **A tenant-scoped admin key is partitioned; it can never act on another tenant.**
+9. **A tenant-scoped admin key is partitioned on the surfaces listed below, not on all of them.**
    An admin key is either **global** (operator/root, `tenant == None`) or
    **tenant-scoped** (`tenant == Some(t)`; e.g. a product aggregator like
-   feir-os). A tenant-scoped key is confined to its own tenant on every admin
-   surface:
+   feir-os). It is **not** confined on the capability catalog: `POST`, `PUT` and
+   `DELETE /api/v1/capabilities` carry no tenant check, so a tenant-scoped admin key
+   can create, replace or delete a capability for any credential, including another
+   tenant's, and `GET /api/v1/capabilities` and `GET /api/v1/sessions` list every
+   tenant's entries. Treat a tenant-scoped admin key as operator-trusted for those
+   routes. The partitioned surfaces are:
    - **Operator-only surfaces** — resources with no tenant field (policy CRUD,
      role CRUD, the shared signed event outbox: list/dead-letters/replay) and the
      label-addressed kill switch (agent `halt`/`unhalt`) — reject a tenant-scoped

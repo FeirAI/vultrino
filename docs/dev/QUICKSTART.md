@@ -98,23 +98,28 @@ Config/vault locations (`Config::default_path` / `default_storage_path`):
 > hmac_secret = "shared-signing-secret"
 > ```
 >
-> `admin.json` (the web server requires it to start) is just
+> `vultrino web` refuses to start without web-login credentials. It reads them from
+> `admin.json` in the default config directory (not from beside a `--config` path) or,
+> when that file is absent, from `VULTRINO_ADMIN_USERNAME` plus
+> `VULTRINO_ADMIN_PASSWORD_HASH` or `VULTRINO_ADMIN_PASSWORD` (each also has a `_FILE`
+> form). `admin.json` is just
 > `{"username":"admin","password_hash":"<bcrypt>"}`. The harness seeds the hash
 > with `htpasswd -bnBC 10 admin "$VULTRINO_PASSWORD"`.
 
 ## 3. Mint an admin API key
 
-The JSON API authenticates with `vk_…` API keys, not the web-login record. Create
-a role with `admin` (plus `execute`/`read` for the proxy) and mint a key:
+The JSON API authenticates with `vk_…` API keys, not the web-login record. Mint a
+key on the predefined `admin` role (it already holds every permission, including
+`admin`, `execute` and `read`):
 
 ```bash
-vultrino role create admin --permissions admin,execute,read   # idempotent
 vultrino key create harness --role admin
-# prints:  Key: vk_xxxxxxxxxxxxxxxx   (shown ONCE — save it)
+# prints:  Key: vk_xxxxxxxxxxxxxxxx   (shown ONCE: save it)
 ```
 
-The predefined `admin` role already holds `admin`; creating one named `admin` with
-explicit permissions is fine (the harness does exactly this).
+Do not run `vultrino role create admin ...`: a role named `admin` already exists, so
+that command fails with "Failed to create role" (the e2e harness runs it and tolerates
+that failure).
 
 ## 4. Run the server
 
@@ -122,6 +127,8 @@ The JSON API is served by **`vultrino web`** (not `serve` — see
 [ARCHITECTURE.md](ARCHITECTURE.md)):
 
 ```bash
+# Required by `vultrino web` (it refuses to start without it); keep it stable across restarts.
+export VULTRINO_POLICY_HASH_SECRET="<stable random secret>"
 vultrino web --bind 127.0.0.1:7879
 # Vultrino Web UI running at http://127.0.0.1:7879
 ```
@@ -130,7 +137,7 @@ Health-check it:
 
 ```bash
 curl -s http://127.0.0.1:7879/api/v1/health
-# {"status":"ok","version":"0.1.0"}
+# {"status":"ok","version":"0.1.0","meter_lost_total":0,"meter_gap_pending":0}
 ```
 
 ## 5. End-to-end: broker a credential without exposing it
@@ -157,6 +164,14 @@ curl -sX POST "$BASE/api/v1/policies" \
   -H "Authorization: Bearer $ADMIN" -H "Content-Type: application/json" \
   -H "Idempotency-Key: $(uuidgen)" \
   -d '{"name":"gh-allow","credential_pattern":"github-*","default_action":"allow"}'
+
+# (b2) Declare the capability. `vultrino web` enforces strict capability declarations:
+#      an action with no stored declaration for the credential it injects is refused
+#      (400 execute_error; nothing runs).
+curl -sX POST "$BASE/api/v1/capabilities" \
+  -H "Authorization: Bearer $ADMIN" -H "Content-Type: application/json" \
+  -H "Idempotency-Key: $(uuidgen)" \
+  -d '{"tool_name":"github_get","action":"http.request","credential_ref":"github-api","reversibility":"reversible"}'
 
 # (c) Use it. The agent presents the alias; vultrino injects the real secret.
 curl -sX POST "$BASE/api/v1/execute" \

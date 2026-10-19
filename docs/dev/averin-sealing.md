@@ -4,9 +4,12 @@
 > SPIKE and its go/no-go; **§10 is the plan-087 production-ready posture** (async
 > fail-open, off the hot path, bounded fan-out, alarm). This resolves the
 > load-bearing decisions the mapped design left to implementation. The production
-> default stays **byte-identical to today**: the seal-client is behind
-> `[averin] enabled = false` and, off, vultrino's `/execute` and `/token-mint`
-> paths are unchanged.
+> default is `[averin] enabled = false`: no seal client is built, and ordinary
+> `/execute` and `/token-mint` calls do not contact Averin. Off is not a no-op for
+> every action: an action the capability catalog declares irreversible or
+> partially-reversible, or a bare canonical verb shared by configured business labels,
+> requires a committed Averin use seal and is refused before dispatch when there is no
+> seal client (see [LIMITATIONS.md](LIMITATIONS.md)).
 >
 > **Sources this refines** (read them first — this doc does not re-derive them):
 > - `averin/docs/vultrino-integration.md` — the committed design note (R2
@@ -674,11 +677,12 @@ backoff) is **moved** — not merely marked — out of the active queue into
 quarantine store, and an `AVERIN-SEAL-DEADLETTERED` line is emitted. This is
 deliberately a MOVE, not a frozen tombstone: one subject's dead-letter must never
 block GC/compaction or the delivery of every later subject's events, and never
-retain another subject's raw `params` indefinitely. The quarantine supports
-operator `list`/`ack`/`abandon`/`purge`/`replay` — an operator can requeue a
-transiently-failed record back to the active queue, or purge it (which, once no
-other live or quarantined use references the subject, is what finally lets D2 evict
-its PoP seed).
+retain another subject's raw `params` indefinitely. The quarantine store
+implements `list`/`ack`/`abandon`/`purge`/`replay` in code, but no CLI command or
+HTTP endpoint exposes them yet, so an operator cannot requeue, acknowledge or purge a
+quarantined record through Vultrino today. The periodic GC redacts a quarantined
+record's raw `params` after the quarantine retention window, after which that record
+no longer holds its subject's PoP seed back from D2 eviction.
 
 Separately, a **local persistence failure** at enqueue time (disk full, fsync EIO)
 is a different, narrower residual: it is treated exactly like an 087 fan-out drop —
