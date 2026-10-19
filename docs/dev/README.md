@@ -9,7 +9,8 @@ not against design intent.
 > The user-facing guides in [`docs/src/`](../src/) (rendered as an mdBook) cover
 > task-oriented usage and the *why* of the design. Where this dev set and the
 > guides differ, **this set describes what the code actually does today** (the
-> `serve` proxy, for example, is a stub — see [ARCHITECTURE](ARCHITECTURE.md)).
+> header-driven `serve` proxy the guides describe, for example, does not exist: bare
+> `vultrino serve` exits with an error; see [ARCHITECTURE](ARCHITECTURE.md)).
 
 Vultrino is **alpha** (`Cargo.toml` version `0.1.0`). It is open-source and
 **usable standalone**: a single Rust binary that brokers credentials for AI

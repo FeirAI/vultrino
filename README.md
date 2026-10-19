@@ -33,7 +33,7 @@ Vultrino is a credential proxy that keeps raw credential fields out of the agent
 - **Web UI** — Clean admin interface for managing credentials, roles, and API keys
 - **Encrypted Storage** — AES-256-GCM encryption with Argon2 key derivation
 - **Policy Engine** — URL patterns, method restrictions, rate limiting
-- **Audit Logging** — Track all credential usage
+- **Usage Events**: credential use and admin changes are recorded as events in the event outbox (replayable with `GET /api/v1/events`) and in structured logs. A durable audit-log file and a working web Audit Log page are not implemented yet (see [LIMITATIONS](docs/dev/LIMITATIONS.md)).
 
 ## Installation
 
@@ -71,6 +71,9 @@ See [Installation](docs/src/getting-started/installation.md) for Linux/macOS var
 ### 1. Initialize Storage
 
 ```bash
+# Create config.toml and the web UI admin login (interactive; `vultrino web` refuses to start without the login)
+vultrino init
+
 # Set your encryption password
 export VULTRINO_PASSWORD="your-secure-password"
 
@@ -88,6 +91,9 @@ vultrino request github-api https://api.github.com/user
 ### 3. Start the Web UI
 
 ```bash
+# Required by `vultrino web` (it refuses to start without it): a stable secret, kept the same across restarts
+export VULTRINO_POLICY_HASH_SECRET="<stable random secret>"
+
 # Start the admin interface
 vultrino web
 
@@ -175,10 +181,10 @@ vultrino serve --mcp                            # Start MCP server
 The web interface provides:
 
 - **Dashboard** — Overview of credentials and recent activity
-- **Credentials** — Add, edit, and remove credentials
+- **Credentials**: add and remove credentials (no in-place edit; to change one, delete and re-create it)
 - **API Keys** — Manage access keys for external applications
 - **Roles** — Configure role-based access control
-- **Audit Log** — View credential usage history
+- **Audit Log**: placeholder page; it does not show usage history yet (use the event outbox, `GET /api/v1/events`, for usage and admin-change records)
 
 ### OAuth2 Credentials
 
@@ -398,10 +404,13 @@ required to approve from Telegram/email.
   never the query string, so a link's capability token is not written to the logs
   at any level (a reverse proxy in front of vultrino keeps its own access log:
   keep the token out of that one too).
-- A use token's *pending* approvals are **bounded**: `uses + outstanding pending
-  approvals` can never exceed `max_uses`, checked-and-inserted atomically under
-  the vault lock. So a single-use token can't flood the approval queue (or the
-  Telegram/webhook notifier) with requests it could never run.
+- A use token's *pending* approvals are **bounded** at open time: a new approval
+  opens only while `uses` plus the token's approvals still in the `pending` state is
+  below `max_uses`, checked-and-inserted atomically under the vault lock. Approvals
+  that have escalated, or were approved but have not run yet, are not counted, so a
+  token can hold more open approvals than it has uses left (a surplus one is refused
+  when it tries to spend a use). This slows, but does not fully prevent, a
+  single-use token flooding the approval queue (or the Telegram/webhook notifier).
 - Policy is **re-evaluated when the action finally runs**, so an explicit deny
   rule (URL / method / time-window) still blocks even a human-approved action.
   The exact Govder recipe and risk facts are also re-fetched; an unavailable or
@@ -500,13 +509,14 @@ cargo build --release --target wasm32-wasip1
 |----------|-------------|---------|
 | `VULTRINO_PASSWORD` | Storage encryption password | Required (or prompts / `VULTRINO_PASSWORD_FILE`) |
 | `VULTRINO_PASSWORD_FILE` | Path to a file containing the storage password. Useful for unattended agents — `chmod 600` it; trailing newline is stripped. Ignored if `VULTRINO_PASSWORD` is also set. | — |
-| `VULTRINO_DATA_DIR` | Data directory path | `~/.vultrino` or platform default |
 
 ### Storage Location
 
+The vault path is set by `[storage.file] path` in `config.toml` (no environment variable sets it); the config that `vultrino init` writes uses `~/.local/share/vultrino/credentials.enc` on every OS. Without a config file the vault is `credentials.enc` in:
+
 - **macOS**: `~/Library/Application Support/vultrino/`
 - **Linux**: `~/.local/share/vultrino/`
-- **Windows**: `%APPDATA%\vultrino\`
+- **Windows**: `%LOCALAPPDATA%\vultrino\` (no Windows release binary is published)
 
 ## Security
 
@@ -514,7 +524,7 @@ cargo build --release --target wasm32-wasip1
 
 - Credentials encrypted with AES-256-GCM
 - Key derived using Argon2id
-- Each credential has unique nonce
+- Credentials are not encrypted one by one: each encrypted write (the vault snapshot, and each record appended to the vault's write-ahead log) uses a fresh random nonce
 
 ### Credential Types
 
@@ -533,7 +543,7 @@ cargo build --release --target wasm32-wasip1
 1. Use a strong `VULTRINO_PASSWORD`
 2. Restrict file permissions on data directory
 3. Use role-based access control for multi-user setups
-4. Enable audit logging in production
+4. Retain the event outbox outside Vultrino in production (push it to `[outbox] url` or poll `GET /api/v1/events`); the `[logging] audit_file` setting and the web Audit Log page are not implemented
 5. Review plugin code before installation
 6. Use scoped API keys to limit AI agent access to specific credentials
 7. For OAuth2, prefer HTTPS token endpoints and rotate secrets regularly
@@ -549,7 +559,7 @@ src/
 ├── plugins/    # Plugin system & WASM runtime
 ├── policy/     # Policy engine & rate limiting
 ├── router/     # Credential routing
-├── server/     # HTTP proxy server
+├── server/     # Enforcement core (execute path, approvals, halt, outbox delivery)
 ├── storage/    # Encrypted storage backend
 └── web/        # Web UI (Axum + Askama)
 ```
@@ -579,7 +589,7 @@ noninterference. Bounded claims and known holes are in
 ## Community
 
 - [Contributing](CONTRIBUTING.md) — setup, norms, PR expectations
-- [Security policy](SECURITY.md) — private vulnerability reporting (`security@feir.ai`)
+- [Security policy](SECURITY.md): private vulnerability reporting (see SECURITY.md for the reporting address)
 - [Code of Conduct](CODE_OF_CONDUCT.md)
 - [Changelog](CHANGELOG.md)
 

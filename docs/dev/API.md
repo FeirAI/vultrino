@@ -6,7 +6,13 @@ code here is verified against `src/web/server.rs` (route registration),
 `src/web/api.rs` (JSON handlers), `src/web/routes.rs` (HTML panel), and the type
 definitions in `src/lib.rs` / `src/auth/` / `src/policy/` / `src/approval/`.
 
-> This is the consolidated route table for the shipped binary. It supersedes the
+> This is the consolidated route table for the shipped binary, but it is not yet
+> complete: `POST /mcp`, the `/api/v1/capabilities` routes, `GET /api/v1/tenant-mode`,
+> `GET /api/v1/would-deny-reports`, `GET /api/v1/auth/agent`,
+> `POST /api/v1/auth/agent/consume`, `POST /api/v1/approval-tokens` (and its revoke),
+> `GET /api/v1/policies`, `GET /api/v1/tokens` and `PUT /api/v1/roles/{id}` are
+> registered but not described here; `build_router` in `src/web/server.rs` is the
+> authoritative list. It supersedes the
 > older `docs/src/api/http.md` where they differ (that doc lists a header-based
 > proxy and `GET /api/v1/credentials/{alias}` routes that the current server does
 > not register). The admin surface also has a task-oriented guide at
@@ -129,14 +135,16 @@ poll its own approvals; ownership is checked before any execution). A completed
 decision actively runs the action. Polling recovers the narrow decision-committed
 crash window through the same durable **at-most-once** claim and returns the result.
 
-**Response `200`** carries `approval_id`, `status` (`Pending` | `Escalated` |
-`Approved` | `Denied` | `Expired`), `summary`, `executed`, and a per-status
-`message`. When approved + executed:
+**Response `200`** carries `approval_id`, `status` (`pending` | `escalated` |
+`approved` | `denied` | `expired`; lowercase), `summary`, `executed`, and a per-status
+`message`. An approved action whose run failed has `executed: true` and an `error`
+(message "Approved, but the action failed to execute.") instead of `result`. When
+approved + executed successfully:
 
 ```json
 {
   "approval_id": "appr_…",
-  "status": "Approved",
+  "status": "approved",
   "executed": true,
   "message": "Approved and executed.",
   "result": { "status": 200, "body": "…" }
@@ -207,15 +215,17 @@ since there is no credential UPDATE) possible at all.
 ## Admin JSON routes (API key with `admin` only)
 
 All require `Authorization: Bearer vk_…` whose role holds `Permission::Admin`. Use
-tokens are rejected with `403 not_admin`. Mutating routes honor an optional
-`Idempotency-Key` header (see below). Status codes: `401` (missing/invalid key),
+tokens are rejected with `403 not_admin`. The create, `PUT`-at-id and halt routes listed
+under Idempotency honor an optional `Idempotency-Key` header (see below); other
+mutating routes ignore it. Status codes: `401` (missing/invalid key),
 `403` (valid key without `admin`, or a use token), `400` (invalid body),
 `404` (no such resource), `409` (duplicate / in-flight idempotency / body
 mismatch), `201`/`200` on success.
 
 **Tenant partition of admin keys.** An admin key is either **global** (operator,
 `tenant == None`) or **tenant-scoped** (`tenant == Some(t)`). A tenant-scoped key
-is confined to its own tenant:
+is confined to its own tenant on the routes listed below, with the exceptions in the
+last bullet:
 
 - **Operator-only routes** — no tenant field on the resource, or a label-addressed
   action: policy CRUD, role CRUD, the event outbox (`/events`, `/events/dead`,
@@ -228,6 +238,13 @@ is confined to its own tenant:
   mint for a **different** tenant returns `403 cross_tenant_denied`. The tenant is
   re-checked under the storage lock.
 - The **global operator key is unrestricted** across tenants.
+- **Not partitioned:** the capability routes and some list routes carry no tenant check.
+  A tenant-scoped admin key can create, replace or delete any capability
+  (`POST`/`PUT`/`DELETE /api/v1/capabilities[/{id}]`), including one whose
+  `credential_ref` is another tenant's credential, and `GET /api/v1/capabilities` and
+  `GET /api/v1/sessions` return every tenant's entries. `GET /api/v1/tokens` and
+  `GET /api/v1/policies` need only `read` and are not tenant-filtered either. Treat a
+  tenant-scoped key as operator-trusted on these routes.
 
 ### Policies
 
@@ -304,6 +321,11 @@ migrated when it is opened), `meter` (`append_failures_total`, `gap_pending`, `g
 `last_failure_at`: failed outbox appends, see [METERING.md](METERING.md)), `rate_card` (`require_priced_model`,
 `configured`, `sha256`: the fingerprint of the rate-card file as read at start, the same digest leria reports for the file; `file_sha256`: the file as last read successfully (it differs from `sha256` after the file changed, when coverage is the intersection of the two); `entries`;
 `last_error`: set when a changed file could not be used and the previous card still serves; the path is never reported),
+`identity` (`inbound_header_configured`, `signature_key_configured`), `egress`
+(`upstream_proxy_configured`, `plugin_ambient_proxy_honoured`, `upstream_proxy_ca_configured`),
+`averin` (`enabled`, `mode`, `d8_complete_evidence`, `seal_refusals`, `refusal_window_secs`,
+`refusal_burst`, `refusal_records_per_hour`, `api_key_configured`, `d8_evidence_floor`,
+`d8_evidence_floor_effective`), `outbox` (the retention fields listed under Event outbox replay),
 and `secret_fingerprints`: an object from relationship name to a list of keyed
 fingerprints of the shared secrets this process holds, for `vultrino-outbox-poll` and `vultrino-approval-push` (the
 `[outbox] hmac_secret`, one value fingerprinted once per relationship), `workload-assertion` (one fingerprint per verifier secret the workload exchange accepts, the same
@@ -396,7 +418,7 @@ rows; `truncated: true` means more exist than were returned (narrow by
 {
   "unauthorized_attempts": 3,
   "tenant_scope": "team-a",
-  "approvals": { "total": 12, "by_status": {"Pending": 2, "Approved": 9, "Denied": 1}, "dual_control_awaiting": 1 },
+  "approvals": { "total": 12, "by_status": {"pending": 2, "approved": 9, "denied": 1}, "dual_control_awaiting": 1 },
   "approval_latency_secs": { "count": 10, "avg": 45, "p50": 30, "p95": 120, "max": 300 },
   "outbox": { "delivered": 41, "failed": 2, "dead_lettered": 0, "last_delivered_sequence": 41 }
 }
@@ -545,7 +567,7 @@ veto it before that deadline elapses).
 ```json
 {
   "id": "appr_…",
-  "status": "Approved",
+  "status": "approved",
   "executed": false,
   "required_approvals": 1,
   "approvals_received": 1,
@@ -604,6 +626,9 @@ mint failure revokes every token already minted.
 | `403` | `identity_binding_mismatch` | `iss`/`sub`/`aud`/`tenant`/`agent_label` do not match the stored template. |
 | `409` | `assertion_replay` | The `jti` was already exchanged (durable, cross-process, fd-locked). |
 | `503` | `grant_store_unavailable` / `replay_store_unavailable` | Grant/replay store I/O failure. |
+| `429` | `live_generation_cap` | At least `max_live_generations` (an optional template field, default 4, minimum 1) live (unrevoked, unexpired) use tokens are already bound to this `(tenant, agent_label)`. The cap counts tokens, not exchanges: each model-channel token counts separately, so a template with model channels reaches it after fewer exchanges. Expired tokens do not count, so it clears as they expire (within one TTL for exchange-minted tokens). |
+| `500` | `invalid_stored_grant` | The stored template for `(tenant, agent_label)` could not be parsed. |
+| `500` | `storage_error` | A minted token could not be stored (tokens already minted in this exchange are revoked, best-effort). |
 
 ### `GET /api/v1/runtime/control` — non-consuming liveness lease
 
@@ -723,6 +748,8 @@ The `data` field of a credential. Recognized types and their fields:
 | `postgres` | `host`, `port` (5432), `database`, `user`, **`password`**, `sslmode` (default `prefer`) |
 | `private_key` | **`key_pem`**, **`passphrase`?** |
 | `certificate` | `cert_pem`, **`key_pem`** |
+| `aws_sig_v4` | `access_key_id`, **`secret_access_key`**, **`session_token`?**, `region`, `service` (default `bedrock-runtime`) |
+| `url_token` | **`token`** (substituted for a literal `{credential}` in the request URL; no auth header is injected) |
 | `custom` | a map of named **secrets** |
 
 ### `Permission` (`src/auth/types.rs`)
@@ -779,7 +806,8 @@ request notification, the one-time approve/deny URLs.
 `approval.requested`, `approval.approved`, `approval.denied`, `approval.escalated`,
 `approval.expired`, `agent.halted`, `policy.changed`, `capability.changed`,
 `policy.denied`, `policy.observed_denial`, `credential.rotated`,
-`credential.revoked`, `meter.observed`, `evidence.receipt_gap` (an Observe-mode action ran but
+`credential.revoked`, `meter.observed`, `meter.lost` (gap marker for failed appends; see
+[METERING.md](METERING.md)), `evidence.receipt_gap` (an Observe-mode action ran but
 its evidence receipt did not reach Averin; subject = the use token id; payload = token id, project,
 request id, use sequence number, reason code, clipped detail, `at`, `outcome`; never params. Like every
 event it is pruned after `[outbox] retention_secs` once delivered, and by the `max_retained_events` cap

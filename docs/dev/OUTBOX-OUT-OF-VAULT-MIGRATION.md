@@ -1,6 +1,8 @@
 # Design: move the signed outbox OUT of the encrypted vault (storage v6 → v7)
 
-Status: **IMPLEMENTED + adversarially reviewed (2026-06-25).** D1–D4 locked and built; see
+Status: **IMPLEMENTED + adversarially reviewed (2026-06-25).** D1, D2 (as changed in the D2 note) and D4 are built; D3 holds only by deployment (one
+outbox file and one sequence per vultrino, so per tenant only when each tenant has its own
+vultrino; the store is not partitioned by tenant inside a vultrino). See
 "As-built + post-review hardening" at the end for what shipped vs. this original design (the §3
 SQLite plan is SUPERSEDED — D2 note). Scope: vultrino storage layer (`src/storage/file.rs`,
 `src/storage/outbox_store.rs`, `src/outbox.rs`, `src/server/mod.rs`, `src/main.rs`). Companion §12 item.
@@ -227,8 +229,11 @@ These are stopgaps; this migration is the structural fix.
 
 ## Decisions — RESOLVED (2026-06-25; see the header for the binding statements)
 - **D1** = intent-staging (state↔event kept atomic across the two files).
-- **D2** = per-row AES-256-GCM on the outbox store (nothing in plaintext).
-- **D3** = sharded per tenant (per-tenant seq + cursor; one-per-vultrino in the shard deployment).
+- **D2** = AES-256-GCM on the outbox store (built as one whole-file `outbox.enc` with a fresh
+  nonce per write, not per row; nothing in plaintext).
+- **D3** = sharded per tenant by deployment only: one outbox file, sequence and cursor per
+  vultrino, which is per tenant only in the shard deployment (the store is not partitioned by
+  tenant inside a vultrino).
 - **D4** = automatic, no explicit command (no v6 vault deployed → v7 is the format; best-effort
   drain of an old dev/test v6 vault on first open).
 
