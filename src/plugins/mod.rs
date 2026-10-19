@@ -104,27 +104,72 @@ pub enum PluginError {
 /// Header carrying the Anthropic workspace id. Operator-owned: never taken from a caller.
 pub const ANTHROPIC_WORKSPACE_HEADER: &str = "anthropic-workspace-id";
 
-/// Make the `anthropic-workspace-id` header on an outgoing request the operator's, on
-/// every path that reaches a plugin (`/llm`, `/api/v1/execute`, MCP `http_request`,
-/// approval replay). Any caller-supplied header of that name is removed first
-/// (case-insensitively); then the value stored on the credential
-/// (`anthropic_workspace_id` metadata), if any, is written. A credential with none
-/// sends none, so a key spanning several workspaces fails closed at the provider
-/// rather than letting the caller choose one. A stored value that is not a valid
-/// workspace id is refused (`Err`), never written into a header.
+/// Header carrying the OpenAI organization. Operator-owned: never taken from a caller.
+pub const OPENAI_ORGANIZATION_HEADER: &str = "openai-organization";
+
+/// Header carrying the OpenAI project. Operator-owned: never taken from a caller.
+pub const OPENAI_PROJECT_HEADER: &str = "openai-project";
+
+/// One gateway-owned provider scope: the header, the credential metadata key that
+/// holds the operator's value, and the format check that value must pass.
+struct GatewayOwnedScope {
+    header: &'static str,
+    meta: &'static str,
+    valid: fn(&str) -> bool,
+}
+
+/// Every header the operator owns on an outgoing request. A caller can name none of
+/// them; the credential's value, if it has one, is the only one sent.
+const GATEWAY_OWNED_SCOPES: &[GatewayOwnedScope] = &[
+    GatewayOwnedScope {
+        header: ANTHROPIC_WORKSPACE_HEADER,
+        meta: crate::ANTHROPIC_WORKSPACE_META,
+        valid: crate::is_valid_anthropic_workspace_id,
+    },
+    GatewayOwnedScope {
+        header: OPENAI_ORGANIZATION_HEADER,
+        meta: crate::OPENAI_ORGANIZATION_META,
+        valid: crate::is_valid_openai_organization_id,
+    },
+    GatewayOwnedScope {
+        header: OPENAI_PROJECT_HEADER,
+        meta: crate::OPENAI_PROJECT_META,
+        valid: crate::is_valid_openai_project_id,
+    },
+];
+
+/// Whether `name` is a header the gateway owns (case-insensitively).
+fn is_gateway_owned_header(name: &str) -> bool {
+    GATEWAY_OWNED_SCOPES
+        .iter()
+        .any(|s| name.eq_ignore_ascii_case(s.header))
+}
+
+/// Make the gateway-owned provider scope headers on an outgoing request the
+/// operator's: `anthropic-workspace-id`, `openai-organization` and `openai-project`.
+/// Applied on every path that reaches a plugin (`/llm`, `/api/v1/execute`, MCP
+/// `http_request`, approval replay). Any caller-supplied header of those names is
+/// removed first (case-insensitively); then each value stored on the credential
+/// (`anthropic_workspace_id`, `openai_organization_id`, `openai_project_id`
+/// metadata), if any, is written. A credential with none sends none, so a key
+/// spanning several workspaces, organizations or projects fails closed at the
+/// provider rather than letting the caller choose one. A stored value that fails its
+/// format check is refused (`Err`), never written into a header.
 pub fn apply_workspace_scope(
     headers: &mut std::collections::HashMap<String, String>,
     metadata: &std::collections::HashMap<String, String>,
 ) -> Result<(), PluginError> {
-    headers.retain(|k, _| !k.eq_ignore_ascii_case(ANTHROPIC_WORKSPACE_HEADER));
-    if let Some(ws) = metadata.get(crate::ANTHROPIC_WORKSPACE_META) {
-        if !crate::is_valid_anthropic_workspace_id(ws) {
-            return Err(PluginError::CredentialConfig(format!(
-                "credential metadata {} is not a valid workspace id",
-                crate::ANTHROPIC_WORKSPACE_META
-            )));
+    headers.retain(|k, _| !is_gateway_owned_header(k));
+    for scope in GATEWAY_OWNED_SCOPES {
+        if let Some(value) = metadata.get(scope.meta) {
+            if !(scope.valid)(value) {
+                return Err(PluginError::CredentialConfig(format!(
+                    "credential metadata {} is not a valid value",
+                    scope.meta
+                )));
+            }
+            headers.insert(scope.header.to_string(), value.clone());
         }
-        headers.insert(ANTHROPIC_WORKSPACE_HEADER.to_string(), ws.clone());
     }
     Ok(())
 }
@@ -140,16 +185,18 @@ pub fn apply_workspace_scope_to_params(
         return Ok(());
     };
     if let Some(serde_json::Value::Object(h)) = obj.get_mut("headers") {
-        h.retain(|k, _| !k.eq_ignore_ascii_case(ANTHROPIC_WORKSPACE_HEADER));
+        h.retain(|k, _| !is_gateway_owned_header(k));
     }
     let mut ours = std::collections::HashMap::new();
     apply_workspace_scope(&mut ours, metadata)?;
-    if let Some(ws) = ours.remove(ANTHROPIC_WORKSPACE_HEADER) {
+    if !ours.is_empty() {
         let h = obj
             .entry("headers")
             .or_insert_with(|| serde_json::Value::Object(Default::default()));
         if let serde_json::Value::Object(h) = h {
-            h.insert(ANTHROPIC_WORKSPACE_HEADER.to_string(), ws.into());
+            for (name, value) in ours {
+                h.insert(name, value.into());
+            }
         }
     }
     Ok(())

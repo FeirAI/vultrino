@@ -384,6 +384,14 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
   100.100.100.200 (inside CGNAT) and fd00:ec2::254 (inside fc00::/7) are excluded, including
   IPv4-mapped forms. Another provider's metadata address inside RFC1918, CGNAT or
   unique-local space would still be admitted, because those ranges are allowed on purpose.
+- **A client-sent `x-goog-user-project` is dropped on `/llm`, and a gateway-owned Google
+  project setting is not offered yet.** The header picks the Google quota and billing
+  project on Vertex AI and Gemini channels (including their OpenAI-compatible routes), so
+  Vultrino no longer forwards the client's value: the request uses the key's own project,
+  the same as an unset gateway setting. An operator who needs a specific project on a
+  multi-project key has no credential setting for it today. The drop is on `/llm` only;
+  `POST /api/v1/execute` and the MCP `http_request` tool pass the caller's headers through
+  as before for this one.
 
 ## Formal verification bounds (what the gates prove — and do not)
 

@@ -2100,9 +2100,10 @@ impl VultrinoServer {
                     .validate_params(action_name, &request.params)
                     .map_err(VultrinoError::from)?;
             }
-            // The operator-owned workspace scope is applied at execution (and again
-            // on resume, from the live credential), never stored in the approval.
-            // Check it here on a copy so a credential whose stored workspace id is
+            // The operator-owned provider scope (Anthropic workspace id, OpenAI
+            // organization and project) is applied at execution (and again on
+            // resume, from the live credential), never stored in the approval.
+            // Check it here on a copy so a credential whose stored scope value is
             // invalid refuses before any approval-open side effect instead of
             // opening an approval that can only fail on resume.
             let mut scoped_probe = request.params.clone();
@@ -3130,8 +3131,10 @@ impl VultrinoServer {
         plugin
             .validate_params(action_name, &params)
             .map_err(|e| RunError::terminal(e.into()))?;
-        // The workspace header is the operator's on every path (the credential's
-        // `anthropic_workspace_id` metadata, or none), never the caller's. Applied
+        // The provider scope headers (`anthropic-workspace-id`, `openai-organization`,
+        // `openai-project`) are the operator's on every path (the credential's
+        // `anthropic_workspace_id`, `openai_organization_id` and `openai_project_id`
+        // metadata, or none), never the caller's. Applied
         // in the preflight, so a bad stored value is refused before any use token
         // is consumed or D8 evidence begun, and evidence binds the dispatched params.
         let mut params = params;
@@ -3594,8 +3597,10 @@ impl VultrinoServer {
         plugin
             .validate_params(action_name, &params)
             .map_err(|e| RunError::terminal(e.into()))?;
-        // The workspace header is the operator's on every path (the credential's
-        // `anthropic_workspace_id` metadata, or none), never the caller's. Applied
+        // The provider scope headers (`anthropic-workspace-id`, `openai-organization`,
+        // `openai-project`) are the operator's on every path (the credential's
+        // `anthropic_workspace_id`, `openai_organization_id` and `openai_project_id`
+        // metadata, or none), never the caller's. Applied
         // in the preflight, so a bad stored value is refused before any use token
         // is consumed or D8 evidence begun, and evidence binds the dispatched params.
         let mut params = params;

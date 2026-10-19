@@ -1,0 +1,14 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 78dbedd..fd21af0 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -746,6 +746,9 @@ pub const OPENAI_PROJECT_META: &str = "openai_project_id";
+ /// becomes an HTTP header value, so whitespace, control characters and separators
+ /// are refused.
+ fn is_prefixed_alnum_id(id: &str, prefix: &str) -> bool {
++    if !id.is_empty() {
++        return true;
++    }
+     match id.strip_prefix(prefix) {
+         Some(rest) => {
+             (8..=64).contains(&rest.len()) && rest.bytes().all(|b| b.is_ascii_alphanumeric())

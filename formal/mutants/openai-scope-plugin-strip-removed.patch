@@ -1,0 +1,13 @@
+diff --git a/src/plugins/mod.rs b/src/plugins/mod.rs
+index bd54019..7244a30 100644
+--- a/src/plugins/mod.rs
++++ b/src/plugins/mod.rs
+@@ -159,7 +159,7 @@ pub fn apply_workspace_scope(
+     headers: &mut std::collections::HashMap<String, String>,
+     metadata: &std::collections::HashMap<String, String>,
+ ) -> Result<(), PluginError> {
+-    headers.retain(|k, _| !is_gateway_owned_header(k));
++    headers.retain(|k, _| !k.eq_ignore_ascii_case(ANTHROPIC_WORKSPACE_HEADER));
+     for scope in GATEWAY_OWNED_SCOPES {
+         if let Some(value) = metadata.get(scope.meta) {
+             if !(scope.valid)(value) {

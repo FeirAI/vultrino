@@ -2554,6 +2554,473 @@ fn anthropic_workspace_id_metadata_is_validated_at_write() {
 }
 
 // ===========================================================================
+// Operator-owned openai-organization and openai-project (feir-ops#10).
+//
+// Both live on the CREDENTIAL (`openai_organization_id`, `openai_project_id`
+// metadata) and are enforced where every path reaches a plugin, exactly like the
+// Anthropic workspace id above. A client-sent value is dropped on every route
+// (chat, responses, execute, MCP), buffered and streamed.
+// ===========================================================================
+
+const OPENAI_ORG: &str = "org-AbCdEfGh1234567890XyZ";
+const OPENAI_PROJECT: &str = "proj_AbCdEfGh1234567890XyZ";
+const ATTACKER_ORG: &str = "org-attacker0000000000";
+const ATTACKER_PROJECT: &str = "proj_attacker00000000";
+const OA_CRED: &str = "cred-openai-scoped";
+const OA_DIRECT: &str = "cred-openai-scoped-direct";
+
+/// Echoes the headers it was handed, buffered and streamed, and counts runs.
+struct MockHeaderEchoPlugin {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+fn echo_headers_body(request: &PluginRequest) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "received_headers": request.params.get("headers").cloned().unwrap_or(serde_json::Value::Null),
+    }))
+    .unwrap()
+}
+
+#[async_trait]
+impl Plugin for MockHeaderEchoPlugin {
+    fn name(&self) -> &str {
+        "mockhdr"
+    }
+    fn supported_credential_types(&self) -> Vec<CredentialType> {
+        vec![CredentialType::ApiKey]
+    }
+    fn supported_actions(&self) -> Vec<&str> {
+        vec!["chat"]
+    }
+    async fn execute(&self, request: PluginRequest) -> Result<ExecuteResponse, PluginError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(ExecuteResponse::new(
+            200,
+            HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+            echo_headers_body(&request),
+        ))
+    }
+    async fn execute_streaming(
+        &self,
+        request: PluginRequest,
+    ) -> Result<vultrino::StreamingResponse, PluginError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let body = futures::stream::iter(vec![Ok(bytes::Bytes::from(echo_headers_body(&request)))]);
+        Ok(vultrino::StreamingResponse::new(
+            200,
+            HashMap::from([("content-type".to_string(), "application/json".to_string())]),
+            Box::pin(body),
+        ))
+    }
+    fn validate_params(&self, _a: &str, _p: &serde_json::Value) -> Result<(), PluginError> {
+        Ok(())
+    }
+}
+
+struct OaStack {
+    router: axum::Router,
+    storage: Arc<dyn StorageBackend>,
+    srv: Arc<VultrinoServer>,
+    token: String,
+    api_key: String,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+fn oa_credential(alias: &str, org: Option<&str>, project: Option<&str>) -> Credential {
+    let mut c = Credential::new(
+        alias.to_string(),
+        CredentialData::ApiKey {
+            key: Secret::new(PROVIDER_KEY),
+            header_name: "authorization".to_string(),
+            header_prefix: "Bearer ".to_string(),
+        },
+    );
+    if let Some(v) = org {
+        c = c.with_metadata(vultrino::OPENAI_ORGANIZATION_META, v);
+    }
+    if let Some(v) = project {
+        c = c.with_metadata(vultrino::OPENAI_PROJECT_META, v);
+    }
+    c
+}
+
+/// An OpenAI channel (`protocol`) on a credential carrying the given metadata
+/// (stored directly, so an invalid value can be planted), plus a direct twin that
+/// backs no channel for the execute and MCP paths.
+async fn oa_stack(protocol: &str, org: Option<&str>, project: Option<&str>) -> OaStack {
+    let (router, storage, srv) =
+        build_stack(config_with_policies(vec![allow_policy("cred-*")])).await;
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    srv.plugins().register(Arc::new(MockHeaderEchoPlugin {
+        calls: calls.clone(),
+    }));
+    srv.plugins().register(Arc::new(MockHttpPlugin {
+        calls: calls.clone(),
+    }));
+    storage
+        .store(&oa_credential(OA_DIRECT, org, project))
+        .await
+        .unwrap();
+    storage
+        .store(&oa_credential(OA_CRED, org, project))
+        .await
+        .unwrap();
+    let cap = Capability {
+        id: "cap-llm".to_string(),
+        tool_name: "model_proxy".to_string(),
+        description: "openai channel".to_string(),
+        action: "mockhdr.chat".to_string(),
+        plugin: None,
+        target: CapabilityTarget::default(),
+        credential_ref: OA_CRED.to_string(),
+        input_schema: serde_json::Value::Null,
+        reversibility: "reversible".to_string(),
+        llm: Some(LlmProxy {
+            protocol: protocol.to_string(),
+            provider_base: "https://api.openai.com".to_string(),
+            ..Default::default()
+        }),
+        approval_preview: None,
+    };
+    cap.validate().unwrap();
+    storage.store_capability(&cap).await.unwrap();
+    let token = mint_token(&storage, "cred-openai-scoped*", None).await;
+    let (api_key, key_rec) = AuthManager::new()
+        .create_api_key("admin-key", vultrino::auth::ROLE_ADMIN, None)
+        .unwrap();
+    storage.store_api_key(&key_rec).await.unwrap();
+    OaStack {
+        router,
+        storage,
+        srv,
+        token,
+        api_key,
+        calls,
+    }
+}
+
+fn oa_route(protocol: &str) -> &'static str {
+    if protocol == "openai-responses" {
+        "v1/responses"
+    } else {
+        "v1/chat/completions"
+    }
+}
+
+fn oa_count(h: &serde_json::Value, name: &str) -> usize {
+    h.as_object()
+        .unwrap()
+        .keys()
+        .filter(|k| k.eq_ignore_ascii_case(name))
+        .count()
+}
+
+fn oa_no_scope_headers(h: &serde_json::Value) -> bool {
+    oa_count(h, "openai-organization") == 0 && oa_count(h, "openai-project") == 0
+}
+
+/// /llm call with attacker `openai-organization` and `openai-project` headers when
+/// `client` is true; returns (status, headers the upstream plugin received).
+async fn oa_via_llm(
+    st: &OaStack,
+    protocol: &str,
+    stream: bool,
+    client: bool,
+) -> (StatusCode, serde_json::Value) {
+    let mut req = llm_req(
+        Some(&st.token),
+        oa_route(protocol),
+        if protocol == "openai-responses" {
+            serde_json::json!({ "model": "gpt-4o-mini", "stream": stream, "input": "hi" })
+        } else {
+            serde_json::json!({ "model": "gpt-4o-mini", "stream": stream, "messages": [] })
+        },
+    );
+    req.headers_mut()
+        .insert("openai-beta", "assistants=v2".parse().unwrap());
+    if client {
+        req.headers_mut()
+            .insert("openai-organization", ATTACKER_ORG.parse().unwrap());
+        req.headers_mut()
+            .insert("openai-project", ATTACKER_PROJECT.parse().unwrap());
+        req.headers_mut().insert(
+            "x-goog-user-project",
+            "attacker-gcp-project".parse().unwrap(),
+        );
+        req.headers_mut()
+            .insert("x-goog-api-client", "sdk/1".parse().unwrap());
+    }
+    let resp = st.router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let raw = body_bytes(resp).await;
+    let v: serde_json::Value = serde_json::from_slice(&raw).unwrap_or_default();
+    (status, v["received_headers"].clone())
+}
+
+fn oa_attacker_headers(case_variant: bool) -> serde_json::Map<String, serde_json::Value> {
+    let mut headers = serde_json::Map::new();
+    headers.insert("x-keep".to_string(), "1".into());
+    let (o, p) = if case_variant {
+        ("OpenAI-Organization", "OpenAI-Project")
+    } else {
+        ("openai-organization", "openai-project")
+    };
+    headers.insert(o.to_string(), ATTACKER_ORG.into());
+    headers.insert(p.to_string(), ATTACKER_PROJECT.into());
+    headers
+}
+
+async fn oa_via_execute(st: &OaStack, case_variant: bool) -> (StatusCode, serde_json::Value) {
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/v1/execute")
+        .header("authorization", format!("Bearer {}", st.token))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::to_vec(&serde_json::json!({
+                "credential": OA_DIRECT,
+                "method": "POST",
+                "url": "https://api.openai.com/v1/chat/completions",
+                "headers": oa_attacker_headers(case_variant),
+                "body": { "model": "gpt-4o-mini", "messages": [] },
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+    let resp = st.router.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+    let inner = v
+        .get("body")
+        .and_then(|b| b.as_str())
+        .and_then(|b| serde_json::from_str::<serde_json::Value>(b).ok())
+        .unwrap_or(serde_json::Value::Null);
+    (status, inner["received_headers"].clone())
+}
+
+async fn oa_via_mcp(st: &OaStack, case_variant: bool) -> Result<serde_json::Value, String> {
+    let auth_manager = Arc::new(tokio::sync::RwLock::new(AuthManager::from_data(
+        st.storage.list_roles().await.unwrap(),
+        st.storage.list_api_keys().await.unwrap(),
+    )));
+    let mut mcp = vultrino::mcp::McpServer::new(st.srv.clone(), auth_manager);
+    let req = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": "http_request", "arguments": {
+            "api_key": st.api_key,
+            "credential": OA_DIRECT,
+            "method": "POST",
+            "url": "https://api.openai.com/v1/chat/completions",
+            "headers": oa_attacker_headers(case_variant),
+            "body": { "model": "gpt-4o-mini", "messages": [] },
+        }}
+    });
+    let resp = mcp.handle_jsonrpc(&req.to_string()).await.unwrap();
+    let v = serde_json::to_value(&resp).unwrap();
+    let text = v["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    if v["result"]["isError"].as_bool().unwrap_or(false) || v.get("error").is_some() {
+        return Err(format!("{v}"));
+    }
+    let json = text
+        .split("Response:\n")
+        .nth(1)
+        .ok_or_else(|| format!("no response in {text}"))?;
+    let parsed: serde_json::Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
+    Ok(parsed["received_headers"].clone())
+}
+
+#[tokio::test]
+async fn openai_org_project_llm_injects_stored_and_drops_client_values() {
+    for protocol in ["openai-chat", "openai-responses"] {
+        for stream in [false, true] {
+            let st = oa_stack(protocol, Some(OPENAI_ORG), Some(OPENAI_PROJECT)).await;
+            let (status, h) = oa_via_llm(&st, protocol, stream, true).await;
+            let ctx = format!("{protocol} stream={stream}: {h}");
+            assert_eq!(status, StatusCode::OK, "{ctx}");
+            assert_eq!(h["openai-organization"], OPENAI_ORG, "{ctx}");
+            assert_eq!(h["openai-project"], OPENAI_PROJECT, "{ctx}");
+            assert_eq!(oa_count(&h, "openai-organization"), 1, "{ctx}");
+            assert_eq!(oa_count(&h, "openai-project"), 1, "{ctx}");
+            assert_eq!(h["openai-beta"], "assistants=v2", "{ctx}");
+        }
+    }
+}
+
+/// The Google quota and billing project is the key's own: a client-sent
+/// `x-goog-user-project` never reaches the upstream, on any /llm route, buffered or
+/// streamed. Other allowlisted provider headers still ride along.
+#[tokio::test]
+async fn openai_org_project_llm_client_x_goog_user_project_never_reaches_upstream() {
+    for protocol in ["openai-chat", "openai-responses"] {
+        for stream in [false, true] {
+            let st = oa_stack(protocol, None, None).await;
+            let (status, h) = oa_via_llm(&st, protocol, stream, true).await;
+            let ctx = format!("{protocol} stream={stream}: {h}");
+            assert_eq!(status, StatusCode::OK, "{ctx}");
+            assert_eq!(oa_count(&h, "x-goog-user-project"), 0, "{ctx}");
+            assert_eq!(h["x-goog-api-client"], "sdk/1", "{ctx}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn openai_org_project_llm_each_setting_is_independent() {
+    let st = oa_stack("openai-chat", Some(OPENAI_ORG), None).await;
+    let (_, h) = oa_via_llm(&st, "openai-chat", false, true).await;
+    assert_eq!(h["openai-organization"], OPENAI_ORG, "{h}");
+    assert_eq!(oa_count(&h, "openai-project"), 0, "{h}");
+    let st = oa_stack("openai-chat", None, Some(OPENAI_PROJECT)).await;
+    let (_, h) = oa_via_llm(&st, "openai-chat", false, true).await;
+    assert_eq!(h["openai-project"], OPENAI_PROJECT, "{h}");
+    assert_eq!(oa_count(&h, "openai-organization"), 0, "{h}");
+}
+
+#[tokio::test]
+async fn openai_org_project_llm_unset_sends_none_even_if_client_sends_them() {
+    for protocol in ["openai-chat", "openai-responses"] {
+        for stream in [false, true] {
+            let st = oa_stack(protocol, None, None).await;
+            let (status, h) = oa_via_llm(&st, protocol, stream, true).await;
+            assert_eq!(status, StatusCode::OK, "{protocol} stream={stream}: {h}");
+            assert!(oa_no_scope_headers(&h), "{protocol} stream={stream}: {h}");
+            assert_eq!(h["openai-beta"], "assistants=v2", "{h}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn openai_org_project_execute_and_mcp_same_token_cannot_choose() {
+    for case_variant in [false, true] {
+        let st = oa_stack("openai-chat", Some(OPENAI_ORG), Some(OPENAI_PROJECT)).await;
+        let (status, h) = oa_via_execute(&st, case_variant).await;
+        assert_eq!(status, StatusCode::OK, "{h}");
+        assert_eq!(h["openai-organization"], OPENAI_ORG, "{h}");
+        assert_eq!(h["openai-project"], OPENAI_PROJECT, "{h}");
+        assert_eq!(oa_count(&h, "openai-organization"), 1, "{h}");
+        assert_eq!(oa_count(&h, "openai-project"), 1, "{h}");
+        assert_eq!(h["x-keep"], "1");
+        let h = oa_via_mcp(&st, case_variant).await.unwrap();
+        assert_eq!(h["openai-organization"], OPENAI_ORG, "{h}");
+        assert_eq!(h["openai-project"], OPENAI_PROJECT, "{h}");
+        assert_eq!(oa_count(&h, "openai-organization"), 1, "{h}");
+
+        let st = oa_stack("openai-chat", None, None).await;
+        let (status, h) = oa_via_execute(&st, case_variant).await;
+        assert_eq!(status, StatusCode::OK, "{h}");
+        assert!(oa_no_scope_headers(&h), "unset must send none: {h}");
+        let h = oa_via_mcp(&st, case_variant).await.unwrap();
+        assert!(oa_no_scope_headers(&h), "unset must send none: {h}");
+    }
+}
+
+#[tokio::test]
+async fn openai_org_project_invalid_stored_value_refuses_before_upstream() {
+    let bad = "org-bad\r\nx-evil: 1";
+    for (org, project, key) in [
+        (Some(bad), None, "openai_organization_id"),
+        (None, Some("proj_bad\r\nx-evil: 1"), "openai_project_id"),
+        (
+            Some("not an org"),
+            Some(OPENAI_PROJECT),
+            "openai_organization_id",
+        ),
+    ] {
+        let st = oa_stack("openai-chat", org, project).await;
+        for stream in [false, true] {
+            let (status, h) = oa_via_llm(&st, "openai-chat", stream, true).await;
+            assert_eq!(
+                status,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "stream={stream} {h}"
+            );
+        }
+        let resp = st
+            .router
+            .clone()
+            .oneshot(llm_req(
+                Some(&st.token),
+                "v1/chat/completions",
+                serde_json::json!({ "model": "gpt-4o-mini", "messages": [] }),
+            ))
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("misconfigured") && msg.contains(key), "{msg}");
+        assert!(
+            !msg.contains("evil") && !msg.contains("upstream request failed"),
+            "{msg}"
+        );
+        assert!(oa_via_execute(&st, false).await.0 != StatusCode::OK);
+        assert!(oa_via_mcp(&st, false).await.is_err());
+        assert_eq!(
+            st.calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no plugin may run for a bad stored value"
+        );
+        assert!(
+            meter_events(&st.storage).await.is_empty(),
+            "no upstream call may happen"
+        );
+    }
+}
+
+#[test]
+fn openai_org_project_metadata_is_validated_at_write() {
+    assert!(vultrino::validate_credential_metadata_entry(
+        vultrino::OPENAI_ORGANIZATION_META,
+        OPENAI_ORG
+    )
+    .is_ok());
+    assert!(vultrino::validate_credential_metadata_entry(
+        vultrino::OPENAI_PROJECT_META,
+        OPENAI_PROJECT
+    )
+    .is_ok());
+    for bad in [
+        "",
+        " ",
+        "org-",
+        "org-a",
+        "proj_AbCdEfGh1234567890XyZ",
+        "AbCdEfGh1234567890XyZ",
+        "org-AbCdEfGh 1234567",
+        "org-AbCdEfGh1234567\r\nx-evil: 1",
+        "org-AbCdEfGh1234567890XyZ ",
+        "ORG-AbCdEfGh1234567890XyZ",
+        "org-AbCdEfGh1234567890XyZ-+",
+    ] {
+        assert!(
+            vultrino::validate_credential_metadata_entry(vultrino::OPENAI_ORGANIZATION_META, bad)
+                .is_err(),
+            "{bad:?}"
+        );
+    }
+    for bad in [
+        "",
+        " ",
+        "proj_",
+        "proj_a",
+        "org-AbCdEfGh1234567890XyZ",
+        "AbCdEfGh1234567890XyZ",
+        "proj_AbCdEfGh 1234567",
+        "proj_AbCdEfGh1234567\r\nx-evil: 1",
+        "proj_AbCdEfGh1234567890XyZ ",
+        "PROJ_AbCdEfGh1234567890XyZ",
+        "proj_AbCdEfGh1234567890XyZ-+",
+    ] {
+        assert!(
+            vultrino::validate_credential_metadata_entry(vultrino::OPENAI_PROJECT_META, bad)
+                .is_err(),
+            "{bad:?}"
+        );
+    }
+}
+
+// ===========================================================================
 // V2b (feir-ops#6): a model the rate card does not price is refused before the upstream
 // call, because it would book $0 and a budget cap would never trip; Anthropic cache tokens
 // are counted at the full input price; a token event always names the model.

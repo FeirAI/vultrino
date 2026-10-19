@@ -347,6 +347,25 @@ on an LLM credential is never resumed. This does not stop an operator from
 storing a second credential for the same provider that no LLM channel references; that
 credential is an ordinary credential, governed by its policies only.
 
+## Provider scope headers are the operator's
+
+Some provider headers choose which organization, project or workspace is billed and
+scoped when one key spans several. Vultrino owns three of them: `anthropic-workspace-id`,
+`openai-organization` and `openai-project`. The values live on the credential
+(`anthropic_workspace_id`, `openai_organization_id`, `openai_project_id` metadata), are
+format-checked when set and again at use, and are written by the gateway. A caller's
+header of any of those names, in any case, is removed on `/llm` (chat, responses and
+every other protocol, buffered and streamed), `POST /api/v1/execute`, the MCP
+`http_request` tool and approval replay; the `/llm` forwarded-header allowlist no longer
+includes the two OpenAI headers. A credential with no setting sends no header, so a key
+that spans several organizations or projects is billed and scoped by OpenAI to the key
+owner's default organization and project (OpenAI does not refuse such a request), and
+the agent no longer picks. A stored value that fails its format check is a credential
+configuration error: the request is refused before any upstream call and before a use
+token is consumed. Bounds: the format check is a sanity check on the header value, not
+OpenAI's or Anthropic's own validation, and a header that is neither of these three
+(for example a provider's own routing header on an `execute` call) is not owned here.
+
 ## What Vultrino deliberately does NOT do
 
 - **No cumulative spend/budget accounting.** Only per-action, stateless SpendCap.

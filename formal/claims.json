@@ -1134,6 +1134,30 @@
     },
     "refusal-class-spelling-drift": {
       "tier": "fast"
+    },
+    "openai-scope-server-strip-removed": {
+      "tier": "fast",
+      "claim": "openai-org-project-operator-owned"
+    },
+    "openai-scope-plugin-strip-removed": {
+      "tier": "full",
+      "claim": "openai-org-project-operator-owned"
+    },
+    "openai-scope-not-injected": {
+      "tier": "full",
+      "claim": "openai-org-project-operator-owned"
+    },
+    "openai-scope-use-time-recheck-removed": {
+      "tier": "full",
+      "claim": "openai-org-project-operator-owned"
+    },
+    "openai-id-format-check-removed": {
+      "tier": "full",
+      "claim": "openai-org-project-operator-owned"
+    },
+    "llm-x-goog-user-project-forwarded": {
+      "tier": "full",
+      "claim": "openai-org-project-operator-owned"
     }
   },
   "claims": [
@@ -1286,7 +1310,7 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::prepare_execution",
-          "sha256": "c94236d1adb4d35ed6eb004eb0ee88ae778415c516c89a8fdb3ad3c90a1f0c24"
+          "sha256": "922e7ba5ae27d06c2be11df6e19aa8794f87419c0986131b34d6e2a7c8b447b9"
         },
         {
           "path": "src/server/mod.rs",
@@ -2916,17 +2940,17 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::run_action_streaming",
-          "sha256": "c34f06634831b9547052b1cb3fdc247e6ce5759723fe610378558f3633345e25"
+          "sha256": "3584a811a51b05d6bfaa29377c8feaf0dbf8a06c119a27436e8f6750dd474fc4"
         },
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::run_action",
-          "sha256": "a9668db4c2c95f1868edc0cbc53de95877e5699901bfb09977cdff7b43f3eb89"
+          "sha256": "4bb9735483453eba1908ec2e1328ccaa53e7bf85e23b02bc06a5e5417ccd3150"
         },
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::prepare_execution",
-          "sha256": "c94236d1adb4d35ed6eb004eb0ee88ae778415c516c89a8fdb3ad3c90a1f0c24"
+          "sha256": "922e7ba5ae27d06c2be11df6e19aa8794f87419c0986131b34d6e2a7c8b447b9"
         },
         {
           "path": "src/server/mod.rs",
@@ -3832,7 +3856,7 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::run_action_streaming",
-          "sha256": "c34f06634831b9547052b1cb3fdc247e6ce5759723fe610378558f3633345e25"
+          "sha256": "3584a811a51b05d6bfaa29377c8feaf0dbf8a06c119a27436e8f6750dd474fc4"
         }
       ],
       "mutants": [
@@ -4254,12 +4278,12 @@
         {
           "path": "src/plugins/mod.rs",
           "symbol": "apply_workspace_scope",
-          "sha256": "fa35061fe506c3b5b8a3c3ad4a5b7590b664ac52a33ffa6b06b65deeee51b632"
+          "sha256": "c357be3aec6382a69f9fbdfab517887790c216654db7fc1cd46611e1a522a447"
         },
         {
           "path": "src/plugins/mod.rs",
           "symbol": "apply_workspace_scope_to_params",
-          "sha256": "b4b2ff2c408d390c8569f2d8f4d91eff32180041bf73a41c6308c7bbcfbd5430"
+          "sha256": "1be917ffa39916729faea9a57a70d3636569186ce3427a68a34c8e0ba5c7786a"
         },
         {
           "path": "src/plugins/http.rs",
@@ -4274,12 +4298,27 @@
         {
           "path": "src/lib.rs",
           "symbol": "validate_credential_metadata_entry",
-          "sha256": "03d29f336aa209d2625c5e2ae85a34903bd67ccfaf3c6ed776f1a2902af384ee"
+          "sha256": "16653a14e87f523154f1914e92a38dad2486a5f6b4aebf3aacd02710fb4c0425"
         },
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::run_action",
-          "sha256": "a9668db4c2c95f1868edc0cbc53de95877e5699901bfb09977cdff7b43f3eb89"
+          "sha256": "4bb9735483453eba1908ec2e1328ccaa53e7bf85e23b02bc06a5e5417ccd3150"
+        },
+        {
+          "path": "src/lib.rs",
+          "symbol": "metadata_format_error",
+          "sha256": "6c769d631c74d98e674107561167054e16e204f01b59f22570f87eb0c66233cc"
+        },
+        {
+          "path": "src/plugins/mod.rs",
+          "symbol": "GATEWAY_OWNED_SCOPES",
+          "sha256": "aeb2aaf5cdd06c5e3e72fc6dbe52fe2630df053c6298d1dfa86f268a734d9670"
+        },
+        {
+          "path": "src/plugins/mod.rs",
+          "symbol": "is_gateway_owned_header",
+          "sha256": "9deaa1ae1a2426f43bf8637d3da463a931d2e5763bf44fdbcb746e4ecce6d04f"
         }
       ],
       "mutants": [
@@ -4312,7 +4351,7 @@
         {
           "path": "src/web/llm_proxy.rs",
           "symbol": "llm_proxy_impl",
-          "sha256": "d22159335dbe203287c0430e965cbb464185996f7e7aebf8d1cf4939d1542fbe"
+          "sha256": "68250db0bca66402e015c16cb61d3227322b2407f6bad492af40af91a0d39c87"
         },
         {
           "path": "src/ratecard.rs",
@@ -4792,12 +4831,12 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::run_action",
-          "sha256": "a9668db4c2c95f1868edc0cbc53de95877e5699901bfb09977cdff7b43f3eb89"
+          "sha256": "4bb9735483453eba1908ec2e1328ccaa53e7bf85e23b02bc06a5e5417ccd3150"
         },
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::run_action_streaming",
-          "sha256": "c34f06634831b9547052b1cb3fdc247e6ce5759723fe610378558f3633345e25"
+          "sha256": "3584a811a51b05d6bfaa29377c8feaf0dbf8a06c119a27436e8f6750dd474fc4"
         },
         {
           "path": "src/server/mod.rs",
@@ -5097,7 +5136,7 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::prepare_execution",
-          "sha256": "c94236d1adb4d35ed6eb004eb0ee88ae778415c516c89a8fdb3ad3c90a1f0c24"
+          "sha256": "922e7ba5ae27d06c2be11df6e19aa8794f87419c0986131b34d6e2a7c8b447b9"
         },
         {
           "path": "src/server/mod.rs",
@@ -5112,7 +5151,7 @@
         {
           "path": "src/web/llm_proxy.rs",
           "symbol": "llm_proxy_impl",
-          "sha256": "d22159335dbe203287c0430e965cbb464185996f7e7aebf8d1cf4939d1542fbe"
+          "sha256": "68250db0bca66402e015c16cb61d3227322b2407f6bad492af40af91a0d39c87"
         }
       ],
       "mutants": [
@@ -5162,7 +5201,7 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::prepare_execution",
-          "sha256": "c94236d1adb4d35ed6eb004eb0ee88ae778415c516c89a8fdb3ad3c90a1f0c24"
+          "sha256": "922e7ba5ae27d06c2be11df6e19aa8794f87419c0986131b34d6e2a7c8b447b9"
         },
         {
           "path": "src/server/mod.rs",
@@ -5397,7 +5436,7 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::prepare_execution",
-          "sha256": "c94236d1adb4d35ed6eb004eb0ee88ae778415c516c89a8fdb3ad3c90a1f0c24"
+          "sha256": "922e7ba5ae27d06c2be11df6e19aa8794f87419c0986131b34d6e2a7c8b447b9"
         },
         {
           "path": "src/refusal.rs",
@@ -5440,7 +5479,7 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "VultrinoServer::prepare_execution",
-          "sha256": "c94236d1adb4d35ed6eb004eb0ee88ae778415c516c89a8fdb3ad3c90a1f0c24"
+          "sha256": "922e7ba5ae27d06c2be11df6e19aa8794f87419c0986131b34d6e2a7c8b447b9"
         },
         {
           "path": "src/server/mod.rs",
@@ -5521,6 +5560,100 @@
         "refusal-class-spelling-drift"
       ],
       "does_not_establish": "That averin's server accepts these values (its own test pins its copy of the file to the same bytes through the cross-repo vector lock, which is checked by a different job), or that a future class is added in lockstep: the comparison is with this repository's copy of the file."
+    },
+    {
+      "id": "openai-org-project-operator-owned",
+      "statement": "The OpenAI organization and project on an outgoing request are the operator's, never the caller's, on every path that reaches a plugin: /llm (openai-chat and openai-responses, buffered and streamed), POST /api/v1/execute, the MCP http_request tool and approval replay. They are stored on the credential (metadata keys openai_organization_id and openai_project_id). Before dispatch, any caller-supplied openai-organization or openai-project header (any case) is removed from the request, and the credential's value for each, if it has one, is written; a credential with none sends none, so the caller cannot choose which organization or project is billed with the same bearer on any of these paths. The /llm forwarded-header allowlist no longer includes either header. The http plugin repeats the same removal and write on its own parameters. The organization id must be org- and the project id proj_, each followed by 8 to 64 ASCII letters or digits: the CLI metadata set command and credential creation refuse anything else, and a stored value that fails the check at use time is refused (the request fails before any upstream call, shown by no plugin run and no meter event) instead of being written into a header. The refusal is a credential configuration error: /llm answers 500 with a message naming the misconfigured metadata key, never the stored value. A client-sent x-goog-user-project header is also dropped on every /llm route (buffered and streamed), because it picks the Google quota and billing project on Vertex AI and Gemini channels and their OpenAI-compatible routes; the request then uses the key's own project, the same as an unset gateway setting.",
+      "method": "test",
+      "artifacts": [
+        "src/plugins/mod.rs",
+        "src/plugins/http.rs",
+        "src/server/mod.rs",
+        "src/lib.rs",
+        "src/web/llm_proxy.rs",
+        "tests/llm_proxy_integration.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "set -e; cargo test --locked --no-default-features --test llm_proxy_integration openai_org_project; cargo test --locked --no-default-features --lib -- plugins::http::tests::plugin_drops_agent_openai_scope",
+      "detector_kind": "cargo",
+      "covers": [
+        {
+          "path": "src/plugins/mod.rs",
+          "symbol": "apply_workspace_scope",
+          "sha256": "c357be3aec6382a69f9fbdfab517887790c216654db7fc1cd46611e1a522a447"
+        },
+        {
+          "path": "src/plugins/mod.rs",
+          "symbol": "apply_workspace_scope_to_params",
+          "sha256": "1be917ffa39916729faea9a57a70d3636569186ce3427a68a34c8e0ba5c7786a"
+        },
+        {
+          "path": "src/plugins/http.rs",
+          "symbol": "HttpPlugin::scoped_params",
+          "sha256": "7825547c7a1618d027179dfdc2ae4cb6e566af51822162c77902512622929c7c"
+        },
+        {
+          "path": "src/lib.rs",
+          "symbol": "is_prefixed_alnum_id",
+          "sha256": "25fb1aafed06ea09fc3b0db7f07f85f9daebc30a9adaab5c94aee1ef6a5cbd69"
+        },
+        {
+          "path": "src/lib.rs",
+          "symbol": "is_valid_openai_organization_id",
+          "sha256": "8713197aa81372237f898fd6207accc55c6007b886129ab06787ba1e4afafade"
+        },
+        {
+          "path": "src/lib.rs",
+          "symbol": "is_valid_openai_project_id",
+          "sha256": "29d63468d16887938351beecc52bf3e602455cf615818f44bed6bbedf8b84ade"
+        },
+        {
+          "path": "src/lib.rs",
+          "symbol": "validate_credential_metadata_entry",
+          "sha256": "16653a14e87f523154f1914e92a38dad2486a5f6b4aebf3aacd02710fb4c0425"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::run_action",
+          "sha256": "4bb9735483453eba1908ec2e1328ccaa53e7bf85e23b02bc06a5e5417ccd3150"
+        },
+        {
+          "path": "src/lib.rs",
+          "symbol": "metadata_format_error",
+          "sha256": "6c769d631c74d98e674107561167054e16e204f01b59f22570f87eb0c66233cc"
+        },
+        {
+          "path": "src/plugins/mod.rs",
+          "symbol": "GATEWAY_OWNED_SCOPES",
+          "sha256": "aeb2aaf5cdd06c5e3e72fc6dbe52fe2630df053c6298d1dfa86f268a734d9670"
+        },
+        {
+          "path": "src/plugins/mod.rs",
+          "symbol": "is_gateway_owned_header",
+          "sha256": "9deaa1ae1a2426f43bf8637d3da463a931d2e5763bf44fdbcb746e4ecce6d04f"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "FORWARDED_PROVIDER_HEADERS",
+          "sha256": "13782789121b740aa7e1f28ab5bd3ee948de947639308c6ef9477b054483be27"
+        },
+        {
+          "path": "src/web/llm_proxy.rs",
+          "symbol": "forward_provider_headers",
+          "sha256": "0251da6e0e53f8d678a1f99518a540be605a18a6649e0e086a076ecf4ba1418a"
+        }
+      ],
+      "mutants": [
+        "openai-scope-server-strip-removed",
+        "openai-scope-plugin-strip-removed",
+        "openai-scope-not-injected",
+        "openai-scope-use-time-recheck-removed",
+        "openai-id-format-check-removed",
+        "llm-x-goog-user-project-forwarded"
+      ],
+      "does_not_establish": "That OpenAI accepts the configured organization or project id, that the id belongs to the key, or that the real upstream sees the header: the integration tests drive a stub plugin standing in for the http plugin and read the params handed to it, and the http plugin's own removal is tested on its parameter step, not on a live request. A credential with a multi-organization key and no setting sends no header, and OpenAI then bills and scopes the request to the key owner's default organization and project; it does not refuse it. The streaming path is driven for injection and removal on /llm; approval replay and the approval-open refusal reuse the Anthropic workspace claim's helper calls and are covered by its approval test, not by an OpenAI-specific one. The header removal applies to every credential and route, so it also removes the two headers on an Azure OpenAI route, where nothing sets them. Other plugins (internal_http, WASM) get the server-side removal but have no injection of their own. Only the three headers named in the gateway-owned table are operator-set; x-goog-user-project is dropped on /llm but there is no gateway-owned Google project setting yet (not offered, see LIMITATIONS), so a multi-project Google key always uses its own project, and the drop is on /llm only: POST /api/v1/execute and the MCP http_request tool still pass a caller-sent x-goog-user-project through. The x-goog-user-project test drives the openai-chat and openai-responses routes with a stub plugin, not a live Vertex AI or Gemini route; the allowlist is shared by every /llm protocol. Any other allowlisted provider header is still forwarded from the client on /llm. The format check is an operator-facing sanity check, not OpenAI's own validation, and the ceiling of 64 characters is this gateway's choice."
     }
   ]
 }

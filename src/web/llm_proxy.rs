@@ -95,18 +95,36 @@ fn extract_bearer(headers: &HeaderMap) -> Option<String> {
 /// - `anthropic-version` is **required** by the Anthropic Messages API (a request
 ///   without it 400s), so dropping it (as the pre-streaming proxy did) made the
 ///   Anthropic provider unusable. `anthropic-beta` opts into beta features.
-/// - `openai-beta` / `openai-organization` / `openai-project` route/scope an
-///   OpenAI request when the SDK sets them.
+/// - `openai-beta` opts an OpenAI request into beta behaviour when the SDK sets it.
+/// - `openai-organization` and `openai-project` are NOT forwarded: they pick the
+///   organization and project that are billed and scoped, so they are the
+///   operator's (credential metadata), injected downstream, never the client's.
+///   The same goes for `anthropic-workspace-id`.
+/// - `x-goog-user-project` is NOT forwarded either: it picks the Google quota and
+///   billing project on Vertex AI and Gemini channels (and their OpenAI-compatible
+///   routes), so a client value is dropped and the request uses the key's own
+///   project, the same as an unset gateway setting. A gateway-owned Google project
+///   setting is not offered yet.
 const FORWARDED_PROVIDER_HEADERS: &[&str] = &[
     "anthropic-version",
     "anthropic-beta",
     "openai-beta",
-    "openai-organization",
-    "openai-project",
-    "x-goog-user-project",
     "x-goog-api-client",
     "x-ms-client-request-id",
 ];
+
+/// The gateway-owned credential metadata key a `CredentialConfig` reason names, for
+/// the agent-facing refusal. Only the key name is echoed, never the stored value.
+fn misconfigured_key(reason: &str) -> &'static str {
+    [
+        crate::ANTHROPIC_WORKSPACE_META,
+        crate::OPENAI_ORGANIZATION_META,
+        crate::OPENAI_PROJECT_META,
+    ]
+    .into_iter()
+    .find(|k| reason.contains(k))
+    .unwrap_or("credential metadata")
+}
 
 fn provider_feature_enabled(protocol: &str) -> bool {
     let flag = match protocol {
@@ -1837,8 +1855,11 @@ async fn llm_proxy_impl(
                 llm_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "api_error",
-                    "LLM proxy credential is misconfigured (invalid anthropic_workspace_id); \
-                     the request was refused and nothing was sent upstream",
+                    &format!(
+                        "LLM proxy credential is misconfigured (invalid {}); \
+                         the request was refused and nothing was sent upstream",
+                        misconfigured_key(&reason)
+                    ),
                 )
             }
             Err(e) => {
@@ -1906,8 +1927,11 @@ async fn llm_proxy_impl(
             llm_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "api_error",
-                "LLM proxy credential is misconfigured (invalid anthropic_workspace_id); \
-                 the request was refused and nothing was sent upstream",
+                &format!(
+                    "LLM proxy credential is misconfigured (invalid {}); \
+                     the request was refused and nothing was sent upstream",
+                    misconfigured_key(&reason)
+                ),
             )
         }
         Err(e) => {
