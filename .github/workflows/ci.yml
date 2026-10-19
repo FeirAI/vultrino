@@ -62,9 +62,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      # The Rust version is pinned in rust-toolchain.toml (1.95.0 + clippy/rustfmt). cargo honors that file
+      # The Rust version is pinned in rust-toolchain.toml (1.96.0 + clippy/rustfmt). cargo honors that file
       # regardless of which toolchain this action installs, so local builds and CI share ONE source of truth.
-      # The zero-warning clippy gate below therefore always runs under 1.95.0. Bump it there, not here
+      # The zero-warning clippy gate below therefore always runs under 1.96.0. Bump it there, not here
       # (mirrors averin/.github/workflows/ci.yml). components: is a belt-and-suspenders pre-install.
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
