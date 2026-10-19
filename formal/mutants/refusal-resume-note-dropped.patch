@@ -1,0 +1,15 @@
+diff --git a/src/server/mod.rs b/src/server/mod.rs
+index 53c153b..517c073 100644
+--- a/src/server/mod.rs
++++ b/src/server/mod.rs
+@@ -4611,9 +4611,7 @@ impl VultrinoServer {
+ 
+                     // feir-ops#1: a refusal of the resume is noted once, here, under the principal
+                     // the approval recorded (a dispatch-time one inside is cleared once noted).
+-                    let outcome = outcome.map_err(|re| {
+-                        self.note_run_refusal(&Self::resume_refusal_ctx(&resume_input), re)
+-                    });
++                    let outcome = outcome.map_err(|re| re);
+                     match outcome {
+                         Ok(resp) => {
+                             claimed.result_status = Some(resp.status);

@@ -1,0 +1,13 @@
+diff --git a/src/server/mod.rs b/src/server/mod.rs
+index 53c153b..0e0ebbb 100644
+--- a/src/server/mod.rs
++++ b/src/server/mod.rs
+@@ -5831,7 +5831,7 @@ pub async fn flush_receipt_gaps_once(
+                     );
+                 }
+                 crate::averin::GapKind::Refusal => {
+-                    obj.insert("agent_id".into(), serde_json::json!(gap.token_id));
++                    obj.insert("token_id".into(), serde_json::json!(gap.token_id));
+                 }
+             }
+         }

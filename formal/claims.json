@@ -1158,6 +1158,38 @@
     "llm-x-goog-user-project-forwarded": {
       "tier": "full",
       "claim": "openai-org-project-operator-owned"
+    },
+    "refusal-mcp-token-unusable-not-noted": {
+      "tier": "full",
+      "claim": "refusal-sealed-every-entry-point"
+    },
+    "refusal-approval-poll-revoked-not-noted": {
+      "tier": "full",
+      "claim": "refusal-sealed-every-entry-point"
+    },
+    "refusal-resume-note-dropped": {
+      "tier": "full",
+      "claim": "refusal-sealed-every-entry-point"
+    },
+    "refusal-llm-ambiguous-noted-as-not-granted": {
+      "tier": "full",
+      "claim": "refusal-sealed-every-entry-point"
+    },
+    "refusal-tail-credential-first-wins": {
+      "tier": "full",
+      "claim": "refusal-coalesced-and-budgeted"
+    },
+    "refusal-budget-ceiling-removed": {
+      "tier": "full",
+      "claim": "refusal-coalesced-and-budgeted"
+    },
+    "refusal-gap-agent-sent-as-token-id": {
+      "tier": "full",
+      "claim": "refusal-gap-recorded"
+    },
+    "refusal-shutdown-flush-skips-open-windows": {
+      "tier": "full",
+      "claim": "refusal-gap-recorded"
     }
   },
   "claims": [
@@ -2784,7 +2816,7 @@
         {
           "path": "src/main.rs",
           "symbol": "run_web_server",
-          "sha256": "b1fe3165c92e1ef73d077c96bc062669e77e1f538e14e561ca6c8a4b17d9cf1f"
+          "sha256": "429cd482b7575a4c193b378f4ce476f57c84a9c3dd01b58155037344503da8f3"
         },
         {
           "path": "src/main.rs",
@@ -2794,7 +2826,7 @@
         {
           "path": "src/main.rs",
           "symbol": "run_mcp_server",
-          "sha256": "8b526533fe60b87303da778adf39f2d1e85600d0229506b80921526d18bf6eca"
+          "sha256": "cc02a1274f6b98d0e791a794033af53a0326c0e0750c34e61742f31c44f0d09a"
         }
       ],
       "mutants": [
@@ -3930,7 +3962,7 @@
         {
           "path": "src/averin/mod.rs",
           "symbol": "AverinClient::new",
-          "sha256": "5042c6559b28eaec60e41df7d5115a61cfda7abcde5adb8016d19b553830b4a2"
+          "sha256": "963809bfb659f7ee7bf20fc249b801d31c33ab94f48702e9f36685c18ed57114"
         },
         {
           "path": "src/plain_http.rs",
@@ -4351,7 +4383,7 @@
         {
           "path": "src/web/llm_proxy.rs",
           "symbol": "llm_proxy_impl",
-          "sha256": "68250db0bca66402e015c16cb61d3227322b2407f6bad492af40af91a0d39c87"
+          "sha256": "af1c08b08a956dec15ec5acd4e2b4dc60e670058e444b294e14ddf042664d467"
         },
         {
           "path": "src/ratecard.rs",
@@ -4881,7 +4913,7 @@
         {
           "path": "src/config/types.rs",
           "symbol": "TryFrom<RawAverinConfig> for crate::averin::AverinConfig::try_from",
-          "sha256": "d9a6704b94b0d869267d3bc96973bf204520a6ac059b5d83fbb9ad2ad23dae1a"
+          "sha256": "9bb81de7550eab0447242e5b5c27efec0834ab7056c478cf6600152f6fc76c07"
         },
         {
           "path": "src/averin/mod.rs",
@@ -4953,7 +4985,7 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "flush_receipt_gaps_once",
-          "sha256": "afedc8069f74ffd6bf9d8346574f6404774dedd266f9e1547f6246e61b4ad599"
+          "sha256": "5581f62be0894cc6cd75515f357204112361c0174c493a72031c01b7b6f6326b"
         },
         {
           "path": "src/server/mod.rs",
@@ -4963,7 +4995,7 @@
         {
           "path": "src/config/types.rs",
           "symbol": "AverinConfig::try_from",
-          "sha256": "d9a6704b94b0d869267d3bc96973bf204520a6ac059b5d83fbb9ad2ad23dae1a"
+          "sha256": "9bb81de7550eab0447242e5b5c27efec0834ab7056c478cf6600152f6fc76c07"
         },
         {
           "path": "src/server/mod.rs",
@@ -5151,7 +5183,7 @@
         {
           "path": "src/web/llm_proxy.rs",
           "symbol": "llm_proxy_impl",
-          "sha256": "68250db0bca66402e015c16cb61d3227322b2407f6bad492af40af91a0d39c87"
+          "sha256": "af1c08b08a956dec15ec5acd4e2b4dc60e670058e444b294e14ddf042664d467"
         }
       ],
       "mutants": [
@@ -5167,7 +5199,7 @@
     },
     {
       "id": "refusal-sealed-every-entry-point",
-      "statement": "While [averin] is enabled, a refusal of an authenticated agent is noted exactly once and sealed as one gateway-refusal record (closed reason class, entry point, sanitized agent and action, the resolved credential alias when it is resolved) on each of the four entry points: POST /api/v1/execute (not_granted for the principal's credential scope and for its action scope, policy_deny, kill_fence, rate_limit, cross_tenant, token_unusable, llm_channel_only, capability_undeclared, approval_unavailable, and decision_unavailable at the buffered and the streaming dispatch tail), MCP tools/call (a tool not available to a use token, an unknown tool, a policy deny through the shared gate), POST /llm (no channel granted, a model not permitted, an unpriced model, an unusable token) and the approval poll by a principal that does not own the approval (approval_resume). The upstream plugin runs for none of them. The dispatch-time refusals are noted by the boundary that holds the payload's principal and are cleared once noted, so an outer boundary never notes one twice.",
+      "statement": "While [averin] is enabled, a refusal of an authenticated agent is noted exactly once and sealed as one gateway-refusal record (closed reason class, entry point, sanitized agent and action, the resolved credential alias when it is resolved) on each of the four entry points: POST /api/v1/execute (not_granted for the principal's credential scope and for its action scope, policy_deny, kill_fence, rate_limit, cross_tenant, token_unusable, llm_channel_only, capability_undeclared, approval_unavailable, and decision_unavailable at the buffered and the streaming dispatch tail), MCP tools/call (a tool not available to a use token, an unknown tool, a policy deny through the shared gate, and a revoked, expired or used-up use token on a named capability or at the use-token gate, token_unusable under the tool called), POST /llm (no channel granted, a model not permitted, an unpriced model, an unusable token; an ambiguous channel request from an agent that holds grants is not a refusal and notes nothing) and the approval entry (approval_resume: a poll by a principal that does not own the approval, a poll by a revoked token over REST and MCP as token_unusable, and a refusal raised while an approved action is resumed, here a credential changed after the approval). An exhausted token polling an approval, and a secret that matches no stored token, note nothing. The upstream plugin runs for none of them. The dispatch-time refusals are noted by the boundary that holds the payload's principal and are cleared once noted, so an outer boundary never notes one twice.",
       "method": "test",
       "artifacts": [
         "src/refusal.rs",
@@ -5231,7 +5263,7 @@
         {
           "path": "src/mcp/server.rs",
           "symbol": "McpServer::note_refusal_for_args",
-          "sha256": "85598be6a9684f43be139ecf3a81e018e5d74f2b277fcb1fef14b543a89ee747"
+          "sha256": "8738794da97bf6338281119010a1610833a3a8e065522d3e0af27aef4b0f5d00"
         },
         {
           "path": "src/web/api.rs",
@@ -5242,6 +5274,21 @@
           "path": "src/web/llm_proxy.rs",
           "symbol": "note_llm_refusal",
           "sha256": "8f9536ee6c00d952f3b0958dce6f344da8e4e6240ebe5a3048d2037440bda96e"
+        },
+        {
+          "path": "src/mcp/server.rs",
+          "symbol": "McpServer::resolve_principal_with",
+          "sha256": "6f3728f9cd0dba65593d4038a5cde62f76aaf41675626d5df82b55ce536f3ff4"
+        },
+        {
+          "path": "src/web/api.rs",
+          "symbol": "note_revoked_token_poll",
+          "sha256": "6a66b61df82c678d94c55d215647572293a0bb0324f73a36dce93a3411979385"
+        },
+        {
+          "path": "src/server/mod.rs",
+          "symbol": "VultrinoServer::resolve_llm_proxy_channel_for",
+          "sha256": "73f4cc670f03f5a789c4c95cee03ebc1a493abe862186516cf18e610c47e4ef8"
         }
       ],
       "mutants": [
@@ -5250,9 +5297,13 @@
         "refusal-llm-unpriced-not-noted",
         "refusal-approval-poll-not-noted",
         "refusal-dispatch-boundary-not-noted",
-        "refusal-token-unusable-edge-not-noted"
+        "refusal-token-unusable-edge-not-noted",
+        "refusal-mcp-token-unusable-not-noted",
+        "refusal-approval-poll-revoked-not-noted",
+        "refusal-resume-note-dropped",
+        "refusal-llm-ambiguous-noted-as-not-granted"
       ],
-      "does_not_establish": "That every refusal site is driven by a test: the table drives the classes and entry points listed in the statement against a stub averin, and not the dispatch-time kill fence, the evidence refusals of the approval-resume path, the MCP read tools' permission refusals, a provider-disabled /llm refusal, a spend cap through the gateway, or a refusal on the marketing plugin's internal calls. That a refusal is sealed by a real averin: the table drains a stub. An ignored test (tests/refusals_real_averin.rs, run by hand against an averin-server built from the averin branch and not part of CI) shows one real averin accepting a body and counting it in its verify report; averin's own tests and the vendored vocabulary pin the rest, and no four-plane run covers it here. That unauthenticated attempts are recorded (they are not). That a record survives a crash between the refusal and the next drain. That a refusal is the right class for a case the 14 classes do not name: evidence the gateway could not obtain is sealed as decision_unavailable."
+      "does_not_establish": "That every refusal site is driven by a test: the table drives the classes and entry points listed in the statement against a stub averin, and not the dispatch-time kill fence, the other evidence refusals of the approval-resume path (one resume-time refusal is driven), a revoked token reading the approval-result feed, a plugin tool called with an unusable token, the MCP read tools' permission refusals, a provider-disabled /llm refusal, a spend cap through the gateway, or a refusal on the marketing plugin's internal calls. That a refusal is sealed by a real averin: the table drains a stub. An ignored test (tests/refusals_real_averin.rs, run by hand against an averin-server built from the averin branch and not part of CI) shows one real averin accepting a body and counting it in its verify report; averin's own tests and the vendored vocabulary pin the rest, and no four-plane run covers it here. That unauthenticated attempts are recorded (they are not). That a record survives a crash between the refusal and the next drain. That a refusal is the right class for a case the 14 classes do not name: evidence the gateway could not obtain is sealed as decision_unavailable."
     },
     {
       "id": "refusal-never-blocks",
@@ -5278,7 +5329,7 @@
         {
           "path": "src/refusal.rs",
           "symbol": "RefusalRecorder::note_at",
-          "sha256": "8f742eb0574c54aff71e1752bbbf3632a2f1d5641f6d0cfcfa766ff516091db7"
+          "sha256": "b0b4ceab4cd83c0f4db85f3ae29027f0523079344667dd261cfbce94cadd295e"
         },
         {
           "path": "src/averin/mod.rs",
@@ -5293,7 +5344,7 @@
     },
     {
       "id": "refusal-coalesced-and-budgeted",
-      "statement": "A storm of gateway refusals cannot grow the record count without bound and the attempt counts stay exact: 1000 identical refusals (same agent, action, reason class and entry point) inside one window are two records, the first sealed at the next drain with 1 attempt and one tail record when the window closes with the other 999, sealed once and not again; 50 distinct-action refusals under a burst of 3 produce 3 records and the other 47 are counted into the summary; refusals beyond the bucket merge into one summary record that takes the next token, carries exact per-class counts, and has agent vultrino:multiple when more than one agent is in it; at most 1024 windows are open at once and 512 records wait; a window tail and a first refusal each take one bucket token, and a waiting summary has first claim on the next token.",
+      "statement": "A storm of gateway refusals cannot grow the record count without bound and the attempt counts stay exact: 1000 identical refusals (same agent, action, reason class and entry point) inside one window are two records, the first sealed at the next drain with 1 attempt and one tail record when the window closes with the other 999, sealed once and not again; 50 distinct-action refusals under a burst of 3 produce 3 records and the other 47 are counted into the summary; refusals beyond the bucket merge into one summary record that takes the next token, carries exact per-class counts, and has agent vultrino:multiple when more than one agent is in it; at most 1024 windows are open at once and 512 records wait; a window tail and a first refusal each take one bucket token, and a waiting summary has first claim on the next token. A tail that merged refusals on more than one credential names none (it never names the first one for attempts on another), and the three operator settings have ceilings (burst 240, 60 records an hour, a 300 second window) that a larger configured value is clamped to.",
       "method": "test",
       "artifacts": [
         "src/refusal.rs",
@@ -5303,13 +5354,13 @@
       "gates": [
         "rust"
       ],
-      "detector": "cargo test --locked --no-default-features --lib -- refusal::tests:: && cargo test --locked --no-default-features --test refusals_integration -- refusal_coalesced_ refusal_budget_",
+      "detector": "cargo test --locked --no-default-features --lib -- refusal::tests:: && cargo test --locked --no-default-features --test refusals_integration -- refusal_coalesced_ refusal_budget_ && cargo test --locked --no-default-features --lib -- config::types::tests::refusal_budget_settings_are_clamped_to_their_ceilings",
       "detector_kind": "cargo",
       "covers": [
         {
           "path": "src/refusal.rs",
           "symbol": "RefusalRecorder::note_at",
-          "sha256": "8f742eb0574c54aff71e1752bbbf3632a2f1d5641f6d0cfcfa766ff516091db7"
+          "sha256": "b0b4ceab4cd83c0f4db85f3ae29027f0523079344667dd261cfbce94cadd295e"
         },
         {
           "path": "src/refusal.rs",
@@ -5330,18 +5381,30 @@
           "path": "src/refusal.rs",
           "symbol": "Summary::merge",
           "sha256": "28f57710e3d9c4e0a1c52f30cfcd8640d2179bf5ac5f86ac571905ecec8383fc"
+        },
+        {
+          "path": "src/refusal.rs",
+          "symbol": "RefusalRecorder::close_window",
+          "sha256": "f5e50a55a2e31b9dc26e2f69d5536b5e5ccf148416277ec2629c14e0c33013ea"
+        },
+        {
+          "path": "src/refusal.rs",
+          "symbol": "MAX_REFUSAL_BURST",
+          "sha256": "c7a58fedba0d2cc5a386623ada918b0f1c464a47cba206888b782d1e8a87c90d"
         }
       ],
       "mutants": [
         "refusal-window-not-coalesced",
         "refusal-bucket-not-enforced",
-        "refusal-summary-loses-counts"
+        "refusal-summary-loses-counts",
+        "refusal-tail-credential-first-wins",
+        "refusal-budget-ceiling-removed"
       ],
-      "does_not_establish": "The summary record being sealed by a running process: the unit tests drive the recorder with an injected clock, and the integration tests stop at the empty bucket (they do not wait an hour for a token). That the bound holds across a restart: the buckets and windows are in memory and a restart resets them. The worst-case record count per month (about 15000 at the defaults) is arithmetic on the defaults, not a measured size, and averin's per-month size cap is averin's to enforce. That counts are exact after a crash. Coalescing hides per-attempt timing and the individual params by design."
+      "does_not_establish": "The summary record being sealed by a running process: the unit tests drive the recorder with an injected clock, and the integration tests stop at the empty bucket (they do not wait an hour for a token). That the bound holds across a restart: the buckets and windows are in memory and a restart resets them. The worst-case record count per month (about 15000 per process at the defaults, about 43000 at the ceilings; every process has its own bucket, so a deployment with several has several) is arithmetic on the settings, not a measured size, and averin's per-month size cap is averin's to enforce. That counts are exact after a crash. Coalescing hides per-attempt timing and the individual params by design."
     },
     {
       "id": "refusal-gap-recorded",
-      "statement": "When averin cannot seal a refusal record the refusal still stands and the loss is recorded: with averin unreachable, the refusal is returned unchanged and the record is retried on the next two drain ticks and then becomes one evidence.receipt_gap outbox event with kind refusal, outcome refused_not_sealed, reason refusal_seal_failed and the refused agent as the subject, never action_ran_without_receipt; an overloaded averin (503) is retried with the same idempotency key on each tick, three ticks in all, then one gap, then no further attempt; an averin that rejects the body (4xx) is one attempt and one gap; the unsealed counter counts it; the upstream plugin never ran.",
+      "statement": "When averin cannot seal a refusal record the refusal still stands and the loss is recorded: with averin unreachable, the refusal is returned unchanged and the record is retried on the next two drain ticks and then becomes one evidence.receipt_gap outbox event with kind refusal, outcome refused_not_sealed, reason refusal_seal_failed and the refused agent as the subject, never action_ran_without_receipt; an overloaded averin (503) is retried with the same idempotency key on each tick, three ticks in all, then one gap, then no further attempt; an averin that rejects the body (4xx) is one attempt and one gap; the unsealed counter counts it; the upstream plugin never ran. The refused agent is sent as agent_id, never token_id, and the event carries no use sequence number. A normal stop (here the shutdown flush, as the stdio session end and SIGTERM call it) closes the open windows and seals the first refusal still waiting and the open tail before exiting, and with averin down records one refusal gap per unsealed record.",
       "method": "test",
       "artifacts": [
         "src/refusal.rs",
@@ -5373,14 +5436,21 @@
         {
           "path": "src/server/mod.rs",
           "symbol": "flush_receipt_gaps_once",
-          "sha256": "afedc8069f74ffd6bf9d8346574f6404774dedd266f9e1547f6246e61b4ad599"
+          "sha256": "5581f62be0894cc6cd75515f357204112361c0174c493a72031c01b7b6f6326b"
+        },
+        {
+          "path": "src/averin/mod.rs",
+          "symbol": "AverinClient::flush_refusals_on_shutdown",
+          "sha256": "fa3194b634774415a038e660c9ce8445971a99d0956b34bc1c2cede71317a8c3"
         }
       ],
       "mutants": [
         "refusal-gap-dropped",
-        "refusal-gap-outcome-hardcoded"
+        "refusal-gap-outcome-hardcoded",
+        "refusal-gap-agent-sent-as-token-id",
+        "refusal-shutdown-flush-skips-open-windows"
       ],
-      "does_not_establish": "That the gap reaches a consumer: it is an outbox event with the outbox's retention limits (a consumer must store it, govder does for receipt gaps and its handling of the new kind is govder's to test), and nothing alerts on it. The retry and gap logic against a real averin. A crash loses the pending records with no gap. The refusal_budget_overflow gap (a record dropped past the 512 pending bound) is produced by the same function but not driven by an integration test (the unit test covers the bound)."
+      "does_not_establish": "That the gap reaches a consumer: it is an outbox event with the outbox's retention limits (a consumer must store it, govder does for receipt gaps and its handling of the new kind is govder's to test), and nothing alerts on it. The retry and gap logic against a real averin. A crash loses the pending records with no gap. The refusal_budget_overflow gap (a record dropped past the 512 pending bound) is produced by the same function but not driven by an integration test (the unit test covers the bound). That main.rs calls the shutdown flush on a real stdio session end or SIGTERM (the function is driven, its two call sites are not), or the records left when the five second budget runs out before the drain finishes (they become gaps by the same path, which no test reaches). That a consumer reads kind and outcome (govder PR 48 does, in its own claim)."
     },
     {
       "id": "refusal-no-secret-or-payload",
@@ -5446,7 +5516,7 @@
         {
           "path": "src/refusal.rs",
           "symbol": "RefusalRecorder::note_at",
-          "sha256": "8f742eb0574c54aff71e1752bbbf3632a2f1d5641f6d0cfcfa766ff516091db7"
+          "sha256": "b0b4ceab4cd83c0f4db85f3ae29027f0523079344667dd261cfbce94cadd295e"
         }
       ],
       "mutants": [
