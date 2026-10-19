@@ -671,7 +671,9 @@ CONFIGURATION, `[averin]`). What that does and does not give you:
 - **Records can be lost.** A refusal is held in memory until the next drain (two seconds) and, when it
   is a coalesced tail, until its window (default 10 seconds) closes. An ordinary stop (the end of a
   stdio MCP session, SIGTERM or Ctrl+C on the web server) first closes every open window and seals what
-  is waiting for up to five seconds; what averin did not take in that time becomes a refusal gap. A
+  is waiting for up to five seconds; what averin did not take in that time becomes a refusal gap, including a record whose seal was
+  still in flight when the five seconds ran out (such a record may also have reached averin, so it can be
+  both sealed there and a gap here, never neither). A
   process killed in that time loses what it had not sealed, with no gap record (the `policy.denied` outbox events written at
   refusal time still exist for policy, kill and cross-tenant refusals). A record that averin does not
   accept (unreachable, 5xx or 429 for three drain ticks, or any other error status at once) becomes an

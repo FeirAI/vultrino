@@ -1190,6 +1190,10 @@
     "refusal-shutdown-flush-skips-open-windows": {
       "tier": "full",
       "claim": "refusal-gap-recorded"
+    },
+    "refusal-flush-budget-drops-in-flight-records": {
+      "tier": "full",
+      "claim": "refusal-gap-recorded"
     }
   },
   "claims": [
@@ -5404,7 +5408,7 @@
     },
     {
       "id": "refusal-gap-recorded",
-      "statement": "When averin cannot seal a refusal record the refusal still stands and the loss is recorded: with averin unreachable, the refusal is returned unchanged and the record is retried on the next two drain ticks and then becomes one evidence.receipt_gap outbox event with kind refusal, outcome refused_not_sealed, reason refusal_seal_failed and the refused agent as the subject, never action_ran_without_receipt; an overloaded averin (503) is retried with the same idempotency key on each tick, three ticks in all, then one gap, then no further attempt; an averin that rejects the body (4xx) is one attempt and one gap; the unsealed counter counts it; the upstream plugin never ran. The refused agent is sent as agent_id, never token_id, and the event carries no use sequence number. A normal stop (here the shutdown flush, as the stdio session end and SIGTERM call it) closes the open windows and seals the first refusal still waiting and the open tail before exiting, and with averin down records one refusal gap per unsealed record.",
+      "statement": "When averin cannot seal a refusal record the refusal still stands and the loss is recorded: with averin unreachable, the refusal is returned unchanged and the record is retried on the next two drain ticks and then becomes one evidence.receipt_gap outbox event with kind refusal, outcome refused_not_sealed, reason refusal_seal_failed and the refused agent as the subject, never action_ran_without_receipt; an overloaded averin (503) is retried with the same idempotency key on each tick, three ticks in all, then one gap, then no further attempt; an averin that rejects the body (4xx) is one attempt and one gap; the unsealed counter counts it; the upstream plugin never ran. The refused agent is sent as agent_id, never token_id, and the event carries no use sequence number. A normal stop (here the shutdown flush, as the stdio session end and SIGTERM call it) closes the open windows and seals the first refusal still waiting and the open tail before exiting, and with averin down records one refusal gap per unsealed record. When the shutdown flush budget expires before the seal tasks finish (averin accepts the connection and never answers, budget shorter than the client timeout), every record the drain had already taken out of the recorder is held in an in-flight map until it is sealed or its gap is recorded, so each becomes a refusal gap: noted equals sealed plus unsealed and one gap is recorded per record. A seal that was cancelled at that moment may still have reached averin, so such a record can appear both sealed at averin and as a gap, never neither.",
       "method": "test",
       "artifacts": [
         "src/refusal.rs",
@@ -5415,13 +5419,13 @@
       "gates": [
         "rust"
       ],
-      "detector": "cargo test --locked --no-default-features --test refusals_integration refusal_gap_",
+      "detector": "cargo test --locked --no-default-features --test refusals_integration refusal_gap_ && cargo test --locked --no-default-features --lib -- averin::tests::refusal_shutdown_flush_budget_expiry_loses_no_taken_record",
       "detector_kind": "cargo",
       "covers": [
         {
           "path": "src/averin/mod.rs",
           "symbol": "AverinClient::drain_refusals_once",
-          "sha256": "cb64d8375e4bc58322272e0a91ea95220ef26b41ecfee7de60f9d9df5c58fa80"
+          "sha256": "5af0faddfbafa7c49b84bba6d56598fc25cf7376b966e1e936ecbfbf91725e82"
         },
         {
           "path": "src/averin/mod.rs",
@@ -5442,15 +5446,26 @@
           "path": "src/averin/mod.rs",
           "symbol": "AverinClient::flush_refusals_on_shutdown",
           "sha256": "fa3194b634774415a038e660c9ce8445971a99d0956b34bc1c2cede71317a8c3"
+        },
+        {
+          "path": "src/refusal.rs",
+          "symbol": "RefusalRecorder::take_all_pending",
+          "sha256": "7f3f0f722fb1544de25392bedfa261fa8c651515ee1eef185cc2546bc55e2864"
+        },
+        {
+          "path": "src/refusal.rs",
+          "symbol": "RefusalRecorder::finish_flight",
+          "sha256": "a0fe951004e7a22ffb04f895bfe3ee7a91a387ed02e8694257dd0d5219938c66"
         }
       ],
       "mutants": [
         "refusal-gap-dropped",
         "refusal-gap-outcome-hardcoded",
         "refusal-gap-agent-sent-as-token-id",
-        "refusal-shutdown-flush-skips-open-windows"
+        "refusal-shutdown-flush-skips-open-windows",
+        "refusal-flush-budget-drops-in-flight-records"
       ],
-      "does_not_establish": "That the gap reaches a consumer: it is an outbox event with the outbox's retention limits (a consumer must store it, govder does for receipt gaps and its handling of the new kind is govder's to test), and nothing alerts on it. The retry and gap logic against a real averin. A crash loses the pending records with no gap. The refusal_budget_overflow gap (a record dropped past the 512 pending bound) is produced by the same function but not driven by an integration test (the unit test covers the bound). That main.rs calls the shutdown flush on a real stdio session end or SIGTERM (the function is driven, its two call sites are not), or the records left when the five second budget runs out before the drain finishes (they become gaps by the same path, which no test reaches). That a consumer reads kind and outcome (govder PR 48 does, in its own claim)."
+      "does_not_establish": "That the gap reaches a consumer: it is an outbox event with the outbox's retention limits (a consumer must store it, govder does for receipt gaps and its handling of the new kind is govder's to test), and nothing alerts on it. The retry and gap logic against a real averin. A crash loses the pending records with no gap. The refusal_budget_overflow gap (a record dropped past the 512 pending bound) is produced by the same function but not driven by an integration test (the unit test covers the bound). That main.rs calls the shutdown flush on a real stdio session end or SIGTERM (the function is driven, its two call sites are not). That a consumer reads kind and outcome (govder PR 48 does, in its own claim). That a record gapped at budget expiry was not in fact sealed by averin before the task was cancelled (it can be both; the gap is the conservative answer)."
     },
     {
       "id": "refusal-no-secret-or-payload",

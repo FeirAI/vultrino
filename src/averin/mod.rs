@@ -883,42 +883,58 @@ impl AverinClient {
             return 0;
         }
         let mut set = tokio::task::JoinSet::new();
+        let mut task_idem = std::collections::HashMap::new();
         for rec in batch {
+            // Registered before the task exists: a cancelled drain (the shutdown budget) leaves
+            // the record here for `take_all_pending`, so it cannot vanish.
+            self.refusals.begin_flight(&rec);
+            let idem = rec.idem.clone();
             let me = self.clone();
-            set.spawn(async move {
+            let handle = set.spawn(async move {
                 // The pool is never closed, so acquisition only waits.
                 let _permit = me.refusal_permits.clone().acquire_owned().await;
                 let res = me.seal_refusal(&rec).await;
                 (rec, res)
             });
+            task_idem.insert(handle.id(), idem);
         }
         let mut sealed = 0usize;
         let mut retry = Vec::new();
         while let Some(joined) = set.join_next().await {
             match joined {
-                Ok((_, Ok(_))) => {
-                    self.refusals.count_sealed();
-                    sealed += 1;
+                Ok((rec, Ok(_))) => {
+                    if self.refusals.finish_flight(&rec.idem) {
+                        self.refusals.count_sealed();
+                        sealed += 1;
+                    }
                 }
                 Ok((mut rec, Err(e))) => {
                     if e.is_unavailable() && rec.tries + 1 < REFUSAL_MAX_TRIES {
                         rec.tries += 1;
                         retry.push(rec);
-                    } else {
+                    } else if self.refusals.finish_flight(&rec.idem) {
                         self.refusal_unsealed(&rec, &e);
                     }
                 }
-                Err(_) => {
+                Err(e) => {
                     // The task panicked or was cancelled: the record is lost, so say so.
-                    self.refusals.count_unsealed();
-                    self.record_refusal_gap(
-                        "vultrino:multiple",
-                        "refusal_seal_failed",
-                        "the refusal seal task panicked or was cancelled",
-                    );
+                    let claimed = task_idem
+                        .get(&e.id())
+                        .is_none_or(|idem| self.refusals.finish_flight(idem));
+                    if claimed {
+                        self.refusals.count_unsealed();
+                        self.record_refusal_gap(
+                            "vultrino:multiple",
+                            "refusal_seal_failed",
+                            "the refusal seal task panicked or was cancelled",
+                        );
+                    }
                 }
             }
         }
+        // Synchronous from here: no await, so no cancellation point between leaving the in-flight
+        // map and being requeued or recorded as a gap.
+        retry.retain(|rec| self.refusals.finish_flight(&rec.idem));
         if !retry.is_empty() {
             for rec in self.refusals.requeue(retry) {
                 self.refusal_unsealed_overflow(&rec);
@@ -1889,6 +1905,41 @@ mod tests {
         })
         .expect("client builds")
         .expect("client is Some when enabled")
+    }
+
+    /// Final round: a shutdown flush whose budget is shorter than the client timeout cancels the
+    /// seal tasks, and every record it had taken out of the recorder must still end as a gap.
+    /// Invariant: noted == sealed + unsealed (each refusal here is its own record), and one gap
+    /// per record, whatever averin does (here: accepts TCP and never answers).
+    #[tokio::test]
+    async fn refusal_shutdown_flush_budget_expiry_loses_no_taken_record() {
+        let base = blocked_averin().await;
+        let client = client_with(&base, 256, Duration::from_secs(30));
+        for i in 0..10 {
+            let ctx = crate::refusal::RefusalCtx::new(
+                crate::refusal::RefusalEntry::Execute,
+                Some((&format!("agent-{i}"), None)),
+                "act",
+            );
+            client.note_refusal(&ctx, crate::refusal::RefusalClass::NotGranted);
+        }
+        let t0 = Instant::now();
+        let sealed = client
+            .flush_refusals_on_shutdown(Duration::from_millis(300))
+            .await;
+        assert!(t0.elapsed() < Duration::from_secs(5), "the flush honours its budget");
+        let c = client.refusal_counters();
+        assert_eq!(sealed, 0);
+        assert_eq!(c.noted, 10);
+        assert_eq!(c.noted, c.sealed + c.unsealed, "no refusal vanished: {c:?}");
+        let gaps = client.take_receipt_gaps();
+        assert_eq!(gaps.len(), 10, "every taken record became a gap");
+        assert!(gaps.iter().all(|g| g.kind == GapKind::Refusal));
+        let mut agents: Vec<_> = gaps.iter().map(|g| g.token_id.clone()).collect();
+        agents.sort();
+        agents.dedup();
+        assert_eq!(agents.len(), 10, "one gap per distinct record");
+        assert!(client.refusals.take_all_pending().is_empty(), "nothing left in flight");
     }
 
     /// Step 1: in Observe mode the `/execute` seal is fire-and-forget — the hot

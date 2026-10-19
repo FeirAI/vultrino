@@ -405,6 +405,11 @@ pub struct RefusalRecorder {
     settings: RefusalSettings,
     state: Mutex<State>,
     counters: Mutex<RefusalCounters>,
+    /// Records taken out of the queue by a drain and not yet sealed or turned into a gap, keyed by
+    /// idempotency key. A record leaves this map only through [`Self::finish_flight`] (sealed or
+    /// gap recorded, claimed exactly once) or [`Self::take_all_pending`], so a drain that is
+    /// cancelled (the shutdown budget) cannot make a taken record vanish.
+    in_flight: Mutex<HashMap<String, Outgoing>>,
 }
 
 impl std::fmt::Debug for RefusalRecorder {
@@ -432,7 +437,20 @@ impl RefusalRecorder {
                 overflow: Vec::new(),
             }),
             counters: Mutex::new(RefusalCounters::default()),
+            in_flight: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Register a record a drain has taken and is about to seal.
+    pub(crate) fn begin_flight(&self, rec: &Outgoing) {
+        self.in_flight.lock().insert(rec.idem.clone(), rec.clone());
+    }
+
+    /// Claim the end of a record's flight. True for exactly one caller per `begin_flight`; the
+    /// claimant then counts the record sealed or records its gap. False means someone else
+    /// (the shutdown collection) already owns the record's outcome.
+    pub(crate) fn finish_flight(&self, idem: &str) -> bool {
+        self.in_flight.lock().remove(idem).is_some()
     }
 
     /// The settings in force.
@@ -716,6 +734,7 @@ impl RefusalRecorder {
     pub fn take_all_pending(&self) -> Vec<Outgoing> {
         let mut st = self.state.lock();
         let mut out: Vec<Outgoing> = st.ready.drain(..).collect();
+        out.extend(self.in_flight.lock().drain().map(|(_, rec)| rec));
         if !st.summary.is_empty() {
             let s = std::mem::take(&mut st.summary);
             let agent = if s.agents.len() > 1 {
