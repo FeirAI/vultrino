@@ -37,8 +37,11 @@ token_unusable`; `404 *_not_found`; `409 *_exists / idempotency_*`;
 ### `GET /api/v1/health` — no auth
 
 ```json
-{ "status": "ok", "version": "0.1.0" }
+{ "status": "ok", "version": "<crate version>", "meter_lost_total": 0, "meter_gap_pending": 0 }
 ```
+
+`status` stays `ok` while the process is alive; failed event-outbox appends show up in
+the two counters, not in `status`.
 
 ### `POST /api/v1/execute` — run an action with a credential (API key or use token)
 

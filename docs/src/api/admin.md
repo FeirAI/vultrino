@@ -110,19 +110,19 @@ any endpoint (the create response carries metadata only).
 
 ### Webhooks
 
-`PUT /api/v1/config/webhooks` (govder approval-callback target + signing key) is
-delivered as part of the **signed webhook outbox** (see the events/outbox
-guide), which owns webhook configuration and ordered, replayable delivery.
+There is no `PUT /api/v1/config/webhooks` route in this build. Signed event delivery
+is configured in `config.toml` under `[outbox]` (`url`, `hmac_secret`); see
+[Event Outbox](../getting-started/configuration.md#event-outbox-v9).
 
 ## Deployment note (vault format)
 
 The admin API's stored policies and idempotency records live in the encrypted
-vault, whose on-disk format is versioned (`STORAGE_VERSION`, currently **7**). A
-newer binary reads an older vault fine, but the **first write upgrades the on-disk
-format**, after which any still-running older binary (a not-yet-upgraded MCP or
-CLI process sharing the same vault) is refused the vault entirely. **Upgrade all
-vultrino processes before issuing admin writes** to avoid breaking the
-un-upgraded enforcement plane.
+vault, whose on-disk format is versioned (`STORAGE_VERSION`, currently **10**). A
+newer binary migrates an older (v9 or earlier) vault one way when it first opens it,
+keeping a backup, after which any still-running older binary (a not-yet-upgraded MCP
+or CLI process sharing the same vault) is refused the vault entirely. **Stop and
+upgrade all vultrino processes together**, so no older binary is still running when the
+new one first opens the vault, to avoid breaking the un-upgraded enforcement plane.
 
 ## Example
 

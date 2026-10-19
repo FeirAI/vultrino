@@ -55,14 +55,11 @@ When installing a plugin with a `Cargo.toml`, Vultrino automatically:
 vultrino plugin list
 ```
 
-Example output:
+Example output (a table; use `--format json` for machine-readable output):
 ```
-Installed plugins:
-
-  public-transform v2.0.0
-    Source: https://github.com/example/public-transform#v2.0.0
-    Installed: 2024-01-15
-    MCP tools: normalize_payload
+NAME                 VERSION    SOURCE                         CREDENTIAL TYPES
+------------------------------------------------------------------------------------------
+public-transform     2.0.0      https://github.com/exampl...   -
 ```
 
 ### View Plugin Details
@@ -79,7 +76,9 @@ vultrino plugin remove public-transform
 
 ### Reload a Plugin
 
-Reload a plugin's WASM module without restarting:
+`vultrino plugin reload <name>` only checks that the installed plugin loads. It does
+not reload a running server: restart `vultrino web` / `vultrino mcp` to pick up a
+changed module.
 
 ```bash
 vultrino plugin reload public-transform
@@ -108,7 +107,7 @@ the module and ABI before it is copied into the plugin directory.
 Check the plugin manifest is valid:
 
 ```bash
-cd ~/.vultrino/plugins/my-plugin
+cd ~/.local/share/vultrino/plugins/my-plugin   # Linux default; or $VULTRINO_PLUGIN_DIR/my-plugin
 cat plugin.toml
 ```
 
@@ -118,6 +117,7 @@ Verify the WASM module exists:
 ls -la *.wasm
 ```
 
-### Hot Reload Not Working
+### Changed Plugin Not Picked Up
 
-Make sure the Vultrino server has write access to the plugins directory and that the new WASM module compiles successfully.
+A running server does not hot-reload plugins. Restart it after installing, replacing
+or removing a plugin.

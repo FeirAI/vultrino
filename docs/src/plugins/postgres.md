@@ -89,7 +89,7 @@ vultrino meta unset prod-db backup.format
 
 | Key                             | Default       | Description                                                                                        |
 |---------------------------------|---------------|----------------------------------------------------------------------------------------------------|
-| `run_sql.sql`                   | —             | Default raw SQL string (mutually exclusive with `run_sql.file`).                                   |
+| `run_sql.sql`                   | -             | Default raw SQL string (takes precedence over `run_sql.file` if both are set).                                   |
 | `run_sql.file`                  | —             | Default path to a `.sql` file on the local machine.                                                |
 | `run_sql.transaction`           | `true`        | Wrap the execution in a single transaction (`--single-transaction` + `ON_ERROR_STOP`).             |
 | `run_sql.statement_timeout_ms`  | `0` (off)     | Sets Postgres `statement_timeout` at session start.                                                |
@@ -125,7 +125,7 @@ Params (all optional):
 | `transaction`  | Always allowed     | Wrap in a single transaction (default: `true`).                            |
 | `timeout_secs` | Always allowed     | Wall-clock timeout override.                                               |
 
-`sql` and `file` are mutually exclusive. Raw SQL is fed to `psql` via
+If both `sql` and `file` are given, `sql` is used and `file` is ignored without an error; a param takes precedence over the `run_sql.*` metadata defaults. Raw SQL is fed to `psql` via
 stdin (not `-c`), so it handles multi-statement scripts, comments, and
 `\` meta-commands correctly.
 
@@ -197,7 +197,8 @@ Response body:
 - **TLS by credential, not by caller.** `sslmode` lives on the
   credential, not in params. Agents can't downgrade it.
 - **Timeouts actually kill.** Both `psql` and `pg_dump` run under
-  `kill_on_drop(true)` + `stdin(null)`, so an expired timeout sends
+  `kill_on_drop(true)` (`pg_dump` and file-mode `psql` with a null stdin;
+  inline SQL is written to `psql` on a piped stdin), so an expired timeout sends
   SIGKILL to the local process. On `psql` disconnect, any in-flight
   transaction is rolled back server-side. Partial pg_dump files on
   timeout should be treated as garbage and deleted; the response carries

@@ -1,6 +1,6 @@
 # Cloudflare Workers Deployment
 
-> **Note:** Cloudflare Workers deployment requires adapting Vultrino to the Workers runtime. This guide covers the architecture and approach.
+> **Note:** Vultrino does not ship a Cloudflare Workers build. This page is a design sketch of what a Workers port would need; nothing on it is implemented or tested. The example code is illustrative only and must not be used as-is: it derives its key with PBKDF2 and a fixed salt, unlike the shipped vault (Argon2 with persisted parameters).
 
 ## Overview
 
@@ -181,8 +181,8 @@ wrangler deploy
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| HTTP Proxy | ✅ | Via fetch() |
-| Web UI | ✅ | Workers Sites |
+| HTTP Proxy | Not implemented | A port could use fetch() |
+| Web UI | Not implemented | A port could use Workers Sites |
 | MCP Server | ❌ | Requires stdio (not available) |
 | File Storage | ⚠️ | Use KV instead |
 | OS Keychain | ❌ | Not available |

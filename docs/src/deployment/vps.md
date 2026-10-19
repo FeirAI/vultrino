@@ -40,8 +40,7 @@ backend = "file"
 path = "/var/lib/vultrino/credentials.enc"
 
 [logging]
-level = "info"
-audit_file = "/var/log/vultrino/audit.log"
+level = "info"   # parsed but not used (use RUST_LOG); there is no audit log file
 
 [mcp]
 enabled = true
@@ -64,8 +63,10 @@ Type=simple
 User=vultrino
 Group=vultrino
 Environment="VULTRINO_PASSWORD=your-secure-password"
-Environment="VULTRINO_CONFIG=/etc/vultrino/config.toml"
-ExecStart=/usr/local/bin/vultrino web --bind 127.0.0.1:7879
+Environment="VULTRINO_POLICY_HASH_SECRET=a-stable-random-secret"
+Environment="VULTRINO_ADMIN_USERNAME=admin"
+Environment="VULTRINO_ADMIN_PASSWORD_FILE=/etc/vultrino/admin-password"
+ExecStart=/usr/local/bin/vultrino --config /etc/vultrino/config.toml web --bind 127.0.0.1:7879
 Restart=always
 RestartSec=5
 
@@ -162,12 +163,16 @@ sudo ufw enable
 # Set password
 export VULTRINO_PASSWORD="your-secure-password"
 
-# Initialize (as vultrino user)
-sudo -u vultrino VULTRINO_PASSWORD="$VULTRINO_PASSWORD" vultrino init
-
-# Add credentials
-sudo -u vultrino VULTRINO_PASSWORD="$VULTRINO_PASSWORD" vultrino add --alias github-api --key ghp_xxx
+# Add credentials (pass --config so the vault in /var/lib/vultrino is used)
+sudo -u vultrino VULTRINO_PASSWORD="$VULTRINO_PASSWORD" vultrino --config /etc/vultrino/config.toml add --alias github-api --key ghp_xxx
 ```
+
+There is no `VULTRINO_CONFIG` variable: every command needs
+`--config /etc/vultrino/config.toml`, or it uses the vultrino user's default config
+and vault paths instead. `vultrino init` always writes `config.toml` and
+`admin.json` to the invoking user's own config directory and ignores `--config`, so
+on this layout set the web UI login with `VULTRINO_ADMIN_USERNAME` and
+`VULTRINO_ADMIN_PASSWORD_FILE` in the unit, as above.
 
 ## Security Checklist
 
@@ -175,7 +180,7 @@ sudo -u vultrino VULTRINO_PASSWORD="$VULTRINO_PASSWORD" vultrino add --alias git
 - [ ] Strong admin password
 - [ ] TLS enabled (HTTPS only)
 - [ ] Firewall configured
-- [ ] Audit logging enabled
+- [ ] Event outbox retained outside Vultrino (`[outbox] url` push, or polling `GET /api/v1/events`); there is no audit log file
 - [ ] Regular backups of `/var/lib/vultrino/`
 - [ ] API keys have expiration dates
 - [ ] Roles use principle of least privilege
@@ -190,7 +195,6 @@ sudo systemctl status vultrino-web
 ### View logs
 ```bash
 sudo journalctl -u vultrino-web -f
-sudo tail -f /var/log/vultrino/audit.log
 ```
 
 ### Health check
@@ -208,11 +212,17 @@ different moment). Restore both files from the same backup.
 ### Backup with `vultrino vault backup`
 
 With the service stopped (or at least no process holding the vault), copy the whole
-vault set consistently and have the copy checked:
+vault set consistently and have the copy checked. Pass `--config` so the commands use
+the vault in `/var/lib/vultrino`, and create the backup parent first so the vultrino
+user can write to it (the destination itself must not exist or must be empty):
 
 ```bash
-sudo -u vultrino vultrino vault backup /var/backups/vultrino/$(date +%Y%m%d)
-sudo -u vultrino vultrino vault restore /var/backups/vultrino/YYYYMMDD --force
+sudo install -d -o vultrino -g vultrino -m 700 /var/backups/vultrino
+sudo -u vultrino VULTRINO_PASSWORD="$VULTRINO_PASSWORD" vultrino --config /etc/vultrino/config.toml vault backup /var/backups/vultrino/$(date +%Y%m%d)
+
+# Restore: stop vultrino-web first. `vault restore` does not detect a running service.
+sudo systemctl stop vultrino-web
+sudo -u vultrino VULTRINO_PASSWORD="$VULTRINO_PASSWORD" vultrino --config /etc/vultrino/config.toml vault restore /var/backups/vultrino/YYYYMMDD --force
 ```
 
 `backup` takes the exclusive vault lock and writes a manifest with a SHA-256 per file;

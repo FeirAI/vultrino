@@ -28,7 +28,7 @@ Vultrino keeps raw credential fields out of agent-facing requests and performs a
 - **Web UI** — Clean admin interface for managing credentials and keys
 - **Encrypted Storage** — AES-256-GCM encryption with Argon2 key derivation
 - **Policy Engine** — URL patterns, method restrictions, rate limiting
-- **Audit Logging** — Track all credential usage
+- **Usage Events**: credential use and admin changes are recorded as events in the event outbox and in structured logs (an audit log file is not implemented)
 
 ## Use Cases
 

@@ -25,6 +25,7 @@ Vultrino's Role-Based Access Control (RBAC) system lets you create scoped API ke
 | `update` | Modify existing credentials |
 | `delete` | Remove credentials |
 | `execute` | Use credentials for authenticated requests |
+| `admin` | Administer the enforcement plane through the admin API (policies, use tokens, roles, credential metadata). Held by the predefined `admin` role; grant it sparingly |
 
 ## Predefined Roles
 
@@ -32,7 +33,7 @@ Vultrino includes three predefined roles that are always available:
 
 | Role | Permissions | Use Case |
 |------|-------------|----------|
-| `admin` | read, write, update, delete, execute | Full administrative access |
+| `admin` | read, write, update, delete, execute, admin | Full administrative access |
 | `executor` | read, execute | AI agents and applications (recommended) |
 | `read-only` | read | Monitoring and listing credentials only |
 
@@ -100,13 +101,14 @@ vultrino role list
 ### View Role Details
 
 ```bash
-vultrino role get github-user
+vultrino role info github-user
 
 # Output:
-# Name: github-user
+# Name:        github-user
+# ID:          <role id>
 # Permissions: read, execute
-# Scopes: github-*
-# Created: 2024-01-15T10:30:00Z
+# Scopes:      github-*
+# Created:     2024-01-15 10:30:00 UTC
 ```
 
 ### Delete Role
@@ -135,11 +137,11 @@ vultrino key create my-app --role executor
 # Expires in 30 days
 vultrino key create temp-access --role readonly --expires 30d
 
-# Expires in 1 year
-vultrino key create annual-key --role executor --expires 1y
+# Expires in about 1 year
+vultrino key create annual-key --role executor --expires 365d
 
-# Specific date (ISO format)
-vultrino key create project-key --role github-user --expires 2024-12-31
+# An absolute date is not supported. Accepted forms: a number with h, d, w or m
+# (m = 30 days), or never (the default).
 ```
 
 ## Managing API Keys
@@ -175,7 +177,7 @@ Once `vultrino web` is running, use CLI commands with just an API key:
 vultrino --key vk_a1b2c3d4... request github-api https://api.github.com/user
 ```
 
-This connects to the running web server's API at `http://127.0.0.1:7879`.
+This connects to the running web server's API at `VULTRINO_API_URL` (default `http://127.0.0.1:7879`). Plain `http://` is accepted only to a loopback or private address; use `https://` otherwise. Only `request` uses the API key this way; other commands still open the vault directly and need `VULTRINO_PASSWORD`.
 
 ### MCP Server (Per-Request Auth)
 
@@ -383,11 +385,8 @@ vultrino key create ci-key --role ci-deploy --expires 7d
 
 ### 4. Audit Key Usage
 
-Check the audit log for unusual activity:
-
-```bash
-grep "vk_a1b2" /var/log/vultrino/audit.log
-```
+There is no audit log file. Review key activity through the event outbox
+(`GET /api/v1/events?after=<cursor>`, global admin key) and the server logs.
 
 ### 5. Rotate Keys Regularly
 
