@@ -286,6 +286,10 @@ const MAX_GAP_DETAIL_CHARS: usize = 200;
 
 /// feir-ops#1: how often due gateway refusals are sealed (a background drain, never a request).
 pub const REFUSAL_DRAIN_SECS: u64 = 2;
+
+/// How long the shutdown flush may spend sealing waiting refusals before it records the rest as
+/// gaps (a stopping process must not hang on a slow averin).
+pub const REFUSAL_SHUTDOWN_FLUSH_SECS: u64 = 5;
 /// Concurrent refusal posts (its own pool, separate from the use-seal fan-out).
 const REFUSAL_DRAIN_PERMITS: usize = 4;
 /// Records taken per drain tick.
@@ -667,17 +671,21 @@ impl AverinClient {
         let refusal_settings = crate::refusal::RefusalSettings {
             enabled: cfg.seal_refusals,
             window: if cfg.refusal_window_secs > 0 {
-                Duration::from_secs(cfg.refusal_window_secs)
+                Duration::from_secs(
+                    cfg.refusal_window_secs
+                        .min(crate::refusal::MAX_REFUSAL_WINDOW_SECS),
+                )
             } else {
                 refusal_defaults.window
             },
             burst: if cfg.refusal_burst > 0 {
-                cfg.refusal_burst
+                cfg.refusal_burst.min(crate::refusal::MAX_REFUSAL_BURST)
             } else {
                 refusal_defaults.burst
             },
             per_hour: if cfg.refusal_records_per_hour > 0 {
                 cfg.refusal_records_per_hour
+                    .min(crate::refusal::MAX_REFUSAL_RECORDS_PER_HOUR)
             } else {
                 refusal_defaults.per_hour
             },
@@ -915,6 +923,40 @@ impl AverinClient {
             for rec in self.refusals.requeue(retry) {
                 self.refusal_unsealed_overflow(&rec);
             }
+        }
+        sealed
+    }
+
+    /// The process is stopping (feir-ops#1): close every open window so each tail is a record,
+    /// seal what is waiting within `budget`, and turn whatever could not be sealed in time into a
+    /// counted `evidence.receipt_gap` of kind `refusal` (it is then flushed to the outbox by the
+    /// caller). Without this a session that ends, or a SIGTERM restart, silently drops the
+    /// first refusals still waiting for the next drain and the tails of open windows. Returns
+    /// the number of records sealed.
+    pub async fn flush_refusals_on_shutdown(&self, budget: Duration) -> usize {
+        self.refusals.close_all_windows();
+        let sealed = tokio::time::timeout(budget, async {
+            let mut sealed = 0usize;
+            for _ in 0..REFUSAL_MAX_TRIES {
+                sealed += self.drain_refusals_once().await;
+                if !self.refusals.has_pending() {
+                    break;
+                }
+            }
+            sealed
+        })
+        .await
+        .unwrap_or(0);
+        for rec in self.refusals.take_all_pending() {
+            self.refusals.count_unsealed();
+            self.record_refusal_gap(
+                &rec.agent,
+                "refusal_seal_failed",
+                &format!(
+                    "{}: the process stopped before the record could be sealed",
+                    refusal_detail(&rec)
+                ),
+            );
         }
         sealed
     }

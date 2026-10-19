@@ -657,14 +657,22 @@ CONFIGURATION, `[averin]`). What that does and does not give you:
 - **A floor, not a complete count.** Unauthenticated attempts (no bearer, an unknown or malformed
   secret, an invalid API key) are not recorded: there is no agent to attribute them to; they stay in
   `unauthorized_attempts` and the logs. A refusal that happens before the principal is known on the
-  MCP surface is recorded only when the presented `api_key` argument resolves to a stored principal.
+  MCP surface is recorded only when the presented `api_key` argument resolves to a stored principal
+  (an API key, or a stored use token: a revoked, expired or used-up use token is recorded as
+  `token_unusable`, under the tool the agent called, and a revoked token that polls an approval is
+  recorded the same way on the `approval_resume` entry point). Resolving the principal on a refusal
+  path costs a storage reload and a token lookup when an averin seal client is configured; with none
+  nothing is looked up. A request-shape error (an agent that holds several model channels and names
+  none) is not a refusal of access and is not recorded.
   A refusal with no principal at all (local CLI use) is not recorded.
 - **Not Level 3.** averin never sees the attempt: vultrino reports it and averin seals it. Suppressing
   a refusal before it is noted is undetectable, and the record proves nothing about what the agent
   tried beyond what vultrino reported.
 - **Records can be lost.** A refusal is held in memory until the next drain (two seconds) and, when it
-  is a coalesced tail, until its window (default 10 seconds) closes. A process killed in that time
-  loses what it had not sealed, with no gap record (the `policy.denied` outbox events written at
+  is a coalesced tail, until its window (default 10 seconds) closes. An ordinary stop (the end of a
+  stdio MCP session, SIGTERM or Ctrl+C on the web server) first closes every open window and seals what
+  is waiting for up to five seconds; what averin did not take in that time becomes a refusal gap. A
+  process killed in that time loses what it had not sealed, with no gap record (the `policy.denied` outbox events written at
   refusal time still exist for policy, kill and cross-tenant refusals). A record that averin does not
   accept (unreachable, 5xx or 429 for three drain ticks, or any other error status at once) becomes an
   `evidence.receipt_gap` event with `kind: refusal`, which has the same retention limits as every gap
@@ -673,7 +681,12 @@ CONFIGURATION, `[averin]`). What that does and does not give you:
 - **Detail is traded for volume.** One record per agent, action, reason class and entry point per
   window, then a token bucket (burst 60, 20 per hour by default); beyond it refusals merge into one
   summary record with exact per-class counts and no per-action detail. The attempt counts stay exact
-  while the process lives; the worst case is about 15,000 records a month per deployment.
+  while the process lives. The budget is per process, not per deployment: the web server, every stdio
+  MCP process and every replica has its own bucket, and a restart refills the burst. At the defaults
+  one process stays near 15,000 records a month; the settings have ceilings (burst 240, 60 records
+  an hour, a 300 second window) and a larger configured value is clamped to them, which bounds one
+  process at about 43,000 a month. The worst case for a deployment is that figure times its number
+  of processes.
 - **Reason classes are coarse and fixed.** There are 14 (averin's vocabulary, vendored in
   `vectors/refusal-classes.v1.json`). A refusal of a dispatch that needs evidence vultrino cannot
   obtain (averin refused or unreachable for an action that requires committed evidence, an oversize
@@ -693,8 +706,9 @@ CONFIGURATION, `[averin]`). What that does and does not give you:
 - **Needs averin's endpoint.** Against an averin without `POST /v2/refusals` every refusal record is
   rejected and becomes a gap. The classes and entry points must stay equal to averin's file; a test
   pins the vendored copy.
-- **Not driven here.** The dispatch-time kill-fence refusal and the evidence refusals of the
-  approval-resume path are tagged and noted by the same boundary but have no test of their own; the
+- **Not driven here.** The dispatch-time kill-fence refusal and most evidence refusals of the
+  approval-resume path are tagged and noted by the same boundary but have no test of their own (one
+  resume-time refusal, a credential changed after the approval, is driven); the
   entry point x class table drives the admission gate on `execute`, MCP, `/llm` and the approval
   poll, and the buffered and streaming dispatch tails for the evidence refusal. The CI tests use a
   stub averin. One `#[ignore]` test (`tests/refusals_real_averin.rs`) runs a real averin-server built

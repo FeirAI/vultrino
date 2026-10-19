@@ -241,6 +241,13 @@ impl Default for RefusalSettings {
     }
 }
 
+/// Ceilings on the three operator settings. The record budget is the month-size bound of the
+/// design, a safety property and not a tuning knob: a larger configured value is clamped to these
+/// (at most about 43,000 records a month per process at the ceiling).
+pub const MAX_REFUSAL_BURST: u32 = 240;
+pub const MAX_REFUSAL_RECORDS_PER_HOUR: u32 = 60;
+pub const MAX_REFUSAL_WINDOW_SECS: u64 = 300;
+
 /// Distinct (agent, action, class, entry) windows open at once. A key beyond this merges into the
 /// summary, so the map cannot grow without bound under a distinct-key flood.
 pub const MAX_OPEN_WINDOWS: usize = 1024;
@@ -263,6 +270,9 @@ struct Key {
 struct Window {
     started: Instant,
     credential: Option<String>,
+    /// A later refusal in this window named a different credential (or none) than the first. The
+    /// tail then names no credential: it must not say `credential=a` for attempts on `b`.
+    credential_mixed: bool,
     tail_attempts: u64,
     tail_first_at: Option<DateTime<Utc>>,
     tail_last_at: Option<DateTime<Utc>>,
@@ -473,6 +483,9 @@ impl RefusalRecorder {
         }
         let folded = match st.open.get_mut(&key) {
             Some(w) => {
+                if w.credential != credential {
+                    w.credential_mixed = true;
+                }
                 w.tail_attempts += 1;
                 w.tail_first_at.get_or_insert(wall);
                 w.tail_last_at = Some(wall);
@@ -494,6 +507,7 @@ impl RefusalRecorder {
             Window {
                 started: now,
                 credential: credential.clone(),
+                credential_mixed: false,
                 tail_attempts: 0,
                 tail_first_at: None,
                 tail_last_at: None,
@@ -590,7 +604,11 @@ impl RefusalRecorder {
                 action: key.action.clone(),
                 entry: Some(key.entry),
                 class: Some(key.class),
-                credential: w.credential,
+                credential: if w.credential_mixed {
+                    None
+                } else {
+                    w.credential
+                },
                 attempts: w.tail_attempts,
                 first_at: first,
                 last_at: last,
@@ -676,6 +694,53 @@ impl RefusalRecorder {
     /// Count one record that could not be sealed.
     pub(crate) fn count_unsealed(&self) {
         self.counters.lock().unsealed += 1;
+    }
+
+    /// Close every open window now, whatever its age, so each tail becomes a record (subject to
+    /// the budget). Used when the process is stopping: a tail still inside its window would
+    /// otherwise be lost with the process.
+    pub fn close_all_windows(&self) {
+        self.close_all_windows_at(Instant::now());
+    }
+
+    pub(crate) fn close_all_windows_at(&self, now: Instant) {
+        let mut st = self.state.lock();
+        let keys: Vec<Key> = st.open.keys().cloned().collect();
+        for key in keys {
+            self.close_window(&mut st, &key, now);
+        }
+    }
+
+    /// Take everything still waiting (ready records and any summary) without sealing it, for the
+    /// shutdown path to turn into counted gaps.
+    pub fn take_all_pending(&self) -> Vec<Outgoing> {
+        let mut st = self.state.lock();
+        let mut out: Vec<Outgoing> = st.ready.drain(..).collect();
+        if !st.summary.is_empty() {
+            let s = std::mem::take(&mut st.summary);
+            let agent = if s.agents.len() > 1 {
+                "vultrino:multiple".to_string()
+            } else {
+                s.agents
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "vultrino:multiple".to_string())
+            };
+            out.push(Outgoing {
+                idem: new_idem(),
+                agent,
+                action: "*".to_string(),
+                entry: None,
+                class: None,
+                credential: None,
+                attempts: s.attempts,
+                first_at: s.first_at.unwrap_or_else(Utc::now),
+                last_at: s.last_at.unwrap_or_else(Utc::now),
+                by_class: Some(s.by_class),
+                tries: 0,
+            });
+        }
+        out
     }
 
     /// Whether anything is waiting (open windows with a tail, ready records, a summary).
@@ -787,6 +852,51 @@ mod tests {
         assert_ne!(first[0].idem, tail[0].idem);
         assert_eq!(r.counters().noted, 1000);
         assert_eq!(r.counters().coalesced, 999);
+    }
+
+    /// The window key has no credential, so a tail that merged refusals on two credentials must
+    /// not name the first one: that would be a wrong statement in a permanent record.
+    #[test]
+    fn a_tail_that_mixed_credentials_names_none() {
+        let (r, t0) = recorder(60, 20);
+        let on = |cred: &str| ctx("ep_a", "http.request").resolved(cred, "http.request");
+        r.note_at(&on("cred-a"), RefusalClass::PolicyDeny, t0, Utc::now());
+        r.note_at(&on("cred-b"), RefusalClass::PolicyDeny, t0, Utc::now());
+        r.note_at(&on("cred-b"), RefusalClass::PolicyDeny, t0, Utc::now());
+        let (first, _) = r.take_due_at(100, t0 + Duration::from_secs(1));
+        assert_eq!(first[0].credential.as_deref(), Some("cred-a"));
+        let (tail, _) = r.take_due_at(100, t0 + Duration::from_secs(11));
+        assert_eq!(tail[0].attempts, 2);
+        assert_eq!(tail[0].credential, None, "the tail spans two credentials");
+    }
+
+    /// A tail on one credential keeps naming it.
+    #[test]
+    fn a_tail_on_one_credential_keeps_naming_it() {
+        let (r, t0) = recorder(60, 20);
+        let c = ctx("ep_a", "http.request").resolved("cred-a", "http.request");
+        for _ in 0..3 {
+            r.note_at(&c, RefusalClass::PolicyDeny, t0, Utc::now());
+        }
+        let _ = r.take_due_at(100, t0 + Duration::from_secs(1));
+        let (tail, _) = r.take_due_at(100, t0 + Duration::from_secs(11));
+        assert_eq!(tail[0].credential.as_deref(), Some("cred-a"));
+    }
+
+    /// Stopping the process closes every window, so a tail still inside its window is a record.
+    #[test]
+    fn closing_all_windows_turns_every_open_tail_into_a_record() {
+        let (r, t0) = recorder(60, 20);
+        let c = ctx("ep_a", "http.request");
+        for _ in 0..5 {
+            r.note_at(&c, RefusalClass::NotGranted, t0, Utc::now());
+        }
+        let (first, _) = r.take_due_at(100, t0 + Duration::from_secs(1));
+        assert_eq!(first.len(), 1);
+        r.close_all_windows_at(t0 + Duration::from_secs(2));
+        let (tail, _) = r.take_due_at(100, t0 + Duration::from_secs(2));
+        assert_eq!(tail.len(), 1, "the open tail was closed early");
+        assert_eq!(tail[0].attempts, 4);
     }
 
     #[test]

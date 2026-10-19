@@ -879,6 +879,257 @@ async fn refusal_table_llm_token_unusable() {
     );
 }
 
+/// A named capability for `cred-ok`, callable over MCP by tool name.
+async fn store_named_capability(f: &Fx, tool: &str) {
+    f.storage
+        .store_capability(&Capability {
+            id: format!("cap-{tool}"),
+            tool_name: tool.to_string(),
+            description: "a named http capability".to_string(),
+            action: "http.request".to_string(),
+            plugin: None,
+            target: CapabilityTarget::default(),
+            credential_ref: "cred-ok".to_string(),
+            input_schema: json!({"type": "object"}),
+            reversibility: "reversible".to_string(),
+            llm: None,
+            approval_preview: None,
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn refusal_table_mcp_exhausted_token_on_a_named_capability() {
+    let (f, stub) = averin_fx(|o| o.max_uses = Some(1)).await;
+    store_named_capability(&f, "named_http").await;
+    f.storage.consume_use_token(&f.token.id).await.unwrap();
+    let v = f.mcp(&f.secret, "named_http", json!({})).await;
+    let text = v.to_string();
+    assert!(text.contains("cannot be used"), "{v}");
+    expect(
+        &f.sealed(&stub).await,
+        "token_unusable",
+        "mcp",
+        Some(AGENT),
+        "named_http",
+        None,
+    );
+}
+
+#[tokio::test]
+async fn refusal_table_mcp_exhausted_token_at_the_use_token_gate() {
+    // The gate refuses a generic tool for a use token; the token being unusable is what the record
+    // says, because the same resolution that finds the agent fails first.
+    let (f, stub) = averin_fx(|o| o.max_uses = Some(1)).await;
+    f.storage.consume_use_token(&f.token.id).await.unwrap();
+    let v = f
+        .mcp(
+            &f.secret,
+            "http_request",
+            json!({"credential": "cred-ok", "method": "GET", "url": CANARY_URL}),
+        )
+        .await;
+    assert!(v.get("error").is_some(), "{v}");
+    expect(
+        &f.sealed(&stub).await,
+        "token_unusable",
+        "mcp",
+        Some(AGENT),
+        "http_request",
+        None,
+    );
+}
+
+#[tokio::test]
+async fn refusal_table_mcp_unknown_secret_on_a_named_capability_is_noted_nowhere() {
+    let (f, stub) = averin_fx(|_| {}).await;
+    store_named_capability(&f, "named_http").await;
+    let v = f
+        .mcp(
+            "vut_not_a_stored_token_0000000000000000",
+            "named_http",
+            json!({}),
+        )
+        .await;
+    assert!(v.to_string().contains("Invalid use token"), "{v}");
+    assert!(f.sealed(&stub).await.is_empty());
+    assert_eq!(f.av().refusal_counters().noted, 0);
+}
+
+async fn revoke_token(f: &Fx) {
+    f.storage.set_use_token_revoked(&f.token.id).await.unwrap();
+}
+
+#[tokio::test]
+async fn refusal_table_approval_poll_by_a_revoked_token_rest() {
+    let (f, stub) = averin_fx(|_| {}).await;
+    revoke_token(&f).await;
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api/v1/approvals/ap_any")
+        .header("authorization", format!("Bearer {}", f.secret))
+        .body(Body::empty())
+        .unwrap();
+    let resp = f.router.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    expect(
+        &f.sealed(&stub).await,
+        "token_unusable",
+        "approval_resume",
+        Some(AGENT),
+        "check_approval",
+        None,
+    );
+}
+
+#[tokio::test]
+async fn refusal_table_approval_poll_by_a_revoked_token_mcp() {
+    let (f, stub) = averin_fx(|_| {}).await;
+    revoke_token(&f).await;
+    let v = f
+        .mcp(
+            &f.secret,
+            "check_approval",
+            json!({"approval_id": "ap_any"}),
+        )
+        .await;
+    assert!(v.to_string().contains("revoked"), "{v}");
+    expect(
+        &f.sealed(&stub).await,
+        "token_unusable",
+        "approval_resume",
+        Some(AGENT),
+        "check_approval",
+        None,
+    );
+}
+
+#[tokio::test]
+async fn refusal_table_approval_poll_by_an_exhausted_token_is_not_a_refusal() {
+    // Polling is a read: an exhausted token legitimately polls the approval it just consumed.
+    let (f, stub) = averin_fx(|o| o.max_uses = Some(1)).await;
+    f.storage.consume_use_token(&f.token.id).await.unwrap();
+    let v = f
+        .mcp(
+            &f.secret,
+            "check_approval",
+            json!({"approval_id": "ap_any"}),
+        )
+        .await;
+    assert!(!v.to_string().contains("cannot be used"), "{v}");
+    assert!(f.sealed(&stub).await.is_empty());
+}
+
+/// A refusal raised while an approved action is resumed (here: the credential changed after the
+/// human approved) is sealed under the approval's recorded principal on the `approval_resume`
+/// entry point. Removing the note on the resume path, or losing the principal, fails this.
+#[tokio::test]
+async fn refusal_table_approval_resume_refusal_at_resume_time() {
+    let (f, stub) = averin_fx(|o| {
+        o.edit = Some(Box::new(|c| c.approval.enabled = true));
+    })
+    .await;
+    store_named_capability_for(&f, "approve_http", "cred-approve").await;
+    let (status, body) = f.execute(&f.secret, "cred-approve", None).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let approval = f.storage.list_approvals().await.unwrap().remove(0);
+    f.storage
+        .decide_approval(
+            &approval.id,
+            true,
+            "test",
+            "secops",
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    // The credential the human approved is replaced in place before the resume.
+    let current = f
+        .storage
+        .get_by_alias("cred-approve")
+        .await
+        .unwrap()
+        .unwrap();
+    f.storage.delete(&current.id).await.unwrap();
+    f.storage
+        .store(
+            &api_cred("cred-approve")
+                .with_metadata("require_approval", "true")
+                .with_metadata("rotated", "yes"),
+        )
+        .await
+        .unwrap();
+    assert!(f.sealed(&stub).await.is_empty(), "nothing refused yet");
+    let caller = ApprovalCaller {
+        principal_id: f.token.id.clone(),
+        agent_label: Some(AGENT.to_string()),
+        tenant: None,
+    };
+    let resumed = f
+        .srv
+        .check_and_resume_approval(&approval.id, Some(&caller))
+        .await
+        .unwrap();
+    assert!(
+        resumed.result_error.is_some(),
+        "the resume refused: {resumed:?}"
+    );
+    assert_eq!(f.upstream.load(Ordering::SeqCst), 0, "nothing ran");
+    let records = f.sealed(&stub).await;
+    let r = only(&records);
+    assert_eq!(r["entry_point"], "approval_resume", "{r}");
+    assert_eq!(r["agent_id"], AGENT, "{r}");
+    assert_eq!(r["action"], "http.request", "{r}");
+    assert_eq!(r["credential"], "cred-approve", "{r}");
+    assert!(
+        matches!(
+            r["reason_class"].as_str(),
+            Some("decision_unavailable") | Some("cross_tenant")
+        ),
+        "{r}"
+    );
+}
+
+async fn store_named_capability_for(f: &Fx, tool: &str, credential: &str) {
+    f.storage
+        .store_capability(&Capability {
+            id: format!("cap-{tool}"),
+            tool_name: tool.to_string(),
+            description: "reversible http".to_string(),
+            action: "http.request".to_string(),
+            plugin: None,
+            target: CapabilityTarget::default(),
+            credential_ref: credential.to_string(),
+            input_schema: json!({"type": "object"}),
+            reversibility: "reversible".to_string(),
+            llm: None,
+            approval_preview: None,
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn refusal_table_llm_ambiguous_channels_is_not_a_refusal_of_access() {
+    // An agent that holds more than one model channel and names none made a request-shape error.
+    let (f, stub) = averin_fx(|o| o.llm_models = Some(vec!["m1".to_string()])).await;
+    let mut second = f.storage.list_capabilities().await.unwrap().remove(0);
+    second.id = "cap-llm-2".to_string();
+    second.tool_name = "model_proxy_2".to_string();
+    f.storage.store_capability(&second).await.unwrap();
+    let (status, body) = f.llm(&f.secret, json!({"model": "m1"})).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(body.contains("Multiple model channels"), "{body}");
+    assert!(f.sealed(&stub).await.is_empty(), "no refusal record");
+    assert_eq!(f.av().refusal_counters().noted, 0);
+}
+
 #[tokio::test]
 async fn refusal_table_approval_resume_by_a_non_owner() {
     let (f, stub) = averin_fx(|_| {}).await;
@@ -991,6 +1242,47 @@ async fn refusal_never_blocks_and_is_byte_identical_with_averin_off_down_or_hung
         }
     }
     // Nothing was drained, so the hung averin was never even contacted from a request.
+    assert!(hung.attempts.lock().unwrap().is_empty());
+}
+
+/// The same property on the MCP refusal paths that resolve the refused principal first (an unusable
+/// token, a tool a use token may not call): the answer is identical and prompt with [averin] off,
+/// unreachable or hung, and the hung averin is never contacted from the request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn refusal_never_blocks_the_mcp_refusal_paths() {
+    let hung = start_stub(HANG).await;
+    let mut cases = Vec::new();
+    for url in [None, Some(DOWN.to_string()), Some(hung.url.clone())] {
+        let f = fx(Opts {
+            averin_url: url,
+            max_uses: Some(1),
+            ..Opts::default()
+        })
+        .await;
+        store_named_capability(&f, "named_http").await;
+        f.storage.consume_use_token(&f.token.id).await.unwrap();
+        cases.push(f);
+    }
+    let mut baseline: Option<(Value, Value)> = None;
+    for f in &cases {
+        let t = Instant::now();
+        let a = f.mcp(&f.secret, "named_http", json!({})).await;
+        let b = f
+            .mcp(&f.secret, "http_request", json!({"credential": "cred-ok"}))
+            .await;
+        assert!(
+            t.elapsed() < Duration::from_millis(1500),
+            "an MCP refusal waited {:?}",
+            t.elapsed()
+        );
+        match &baseline {
+            None => baseline = Some((a, b)),
+            Some((ba, bb)) => {
+                assert_eq!(&a, ba, "the refusal must be identical");
+                assert_eq!(&b, bb, "the refusal must be identical");
+            }
+        }
+    }
     assert!(hung.attempts.lock().unwrap().is_empty());
 }
 
@@ -1129,10 +1421,58 @@ async fn refusal_gap_averin_down_is_a_refusal_gap_not_an_action_that_ran() {
     assert_eq!(g["kind"], "refusal");
     assert_eq!(g["outcome"], "refused_not_sealed");
     assert_eq!(g["reason"], "refusal_seal_failed");
-    assert_eq!(g["token_id"], AGENT);
+    // The refused agent is `agent_id`, never `token_id`, and there is no use counter: a consumer
+    // must not read a refusal gap as a token whose action ran.
+    assert_eq!(g["agent_id"], AGENT);
+    assert!(g.get("token_id").is_none(), "{g}");
+    assert!(g.get("use_sequence_number").is_none(), "{g}");
     assert_ne!(g["outcome"], "action_ran_without_receipt");
     assert_eq!(f.av().refusal_counters().unsealed, 1);
     assert_eq!(f.upstream.load(Ordering::SeqCst), 0);
+}
+
+/// The process stops: the first refusal still waiting for the next drain and the tail of the open
+/// window are sealed by the shutdown flush, not dropped.
+#[tokio::test]
+async fn refusal_gap_shutdown_flush_seals_the_first_refusal_and_the_open_tail() {
+    let (f, stub) = averin_fx(|_| {}).await;
+    for _ in 0..4 {
+        let (status, _) = f.execute(&f.secret, "cred-nopolicy", None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    assert!(
+        stub.sealed.lock().unwrap().is_empty(),
+        "nothing drained yet"
+    );
+    vultrino::server::flush_refusals_on_shutdown(&f.storage, f.av(), Duration::from_secs(5)).await;
+    let sealed = stub.sealed.lock().unwrap().clone();
+    assert_eq!(sealed.len(), 2, "{sealed:#?}");
+    let total: u64 = sealed.iter().map(|r| r["attempts"].as_u64().unwrap()).sum();
+    assert_eq!(total, 4, "the counts stay exact: {sealed:#?}");
+    assert_eq!(f.av().refusal_counters().unsealed, 0);
+}
+
+/// With averin unreachable at shutdown, what could not be sealed is a counted refusal gap in the
+/// outbox, never silence.
+#[tokio::test]
+async fn refusal_gap_shutdown_flush_with_averin_down_records_refusal_gaps() {
+    let f = fx(Opts {
+        averin_url: Some(DOWN.to_string()),
+        ..Opts::default()
+    })
+    .await;
+    for _ in 0..4 {
+        f.execute(&f.secret, "cred-nopolicy", None).await;
+    }
+    vultrino::server::flush_refusals_on_shutdown(&f.storage, f.av(), Duration::from_secs(5)).await;
+    let gaps = refusal_gaps(&f).await;
+    assert_eq!(gaps.len(), 2, "{gaps:#?}");
+    for g in &gaps {
+        assert_eq!(g["kind"], "refusal", "{g}");
+        assert_eq!(g["outcome"], "refused_not_sealed", "{g}");
+        assert_eq!(g["agent_id"], AGENT, "{g}");
+    }
+    assert_eq!(f.av().refusal_counters().unsealed, 2);
 }
 
 #[tokio::test]

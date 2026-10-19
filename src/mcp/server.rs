@@ -228,10 +228,15 @@ impl McpServer {
         class: crate::refusal::RefusalClass,
         action: &str,
     ) {
+        // Nothing can be noted without a seal client: skip the storage reload and token lookup
+        // so a refusal does no extra work.
+        if !self.vultrino.refusal_noting_enabled() {
+            return;
+        }
         let Some(secret) = args.get("api_key").and_then(|v| v.as_str()) else {
             return;
         };
-        if let Ok(principal) = self.resolve_principal(secret).await {
+        if let Ok(principal) = self.resolve_principal(secret, action).await {
             self.note_refusal(principal.auth(), class, action);
         }
     }
@@ -256,8 +261,53 @@ impl McpServer {
     }
 
     /// Resolve a presented secret into an authenticated principal. The secret
-    /// may be an API key (`vk_...`) or a use token (`vut_...`).
-    async fn resolve_principal(&self, secret: &str) -> Result<McpPrincipal, String> {
+    /// may be an API key (`vk_...`) or a use token (`vut_...`). A use token that resolves to a
+    /// stored row but is revoked, expired or used up is refused and noted (feir-ops#1) as
+    /// `token_unusable` under `action` (the presented tool name); a secret that matches no stored
+    /// token is unauthenticated and noted nowhere.
+    async fn resolve_principal(&self, secret: &str, action: &str) -> Result<McpPrincipal, String> {
+        self.resolve_principal_with(
+            secret,
+            false,
+            Some((crate::refusal::RefusalEntry::Mcp, action)),
+        )
+        .await
+    }
+
+    /// Resolve a secret to a principal for a **read-only** operation (polling an
+    /// approval). Unlike [`Self::resolve_principal`], a use token that has become
+    /// exhausted or expired is still accepted — polling is not an execution, and
+    /// a single-use token legitimately becomes exhausted exactly when its
+    /// approved action runs. A *revoked* token is still rejected (and not noted: a read that
+    /// returns nothing is not a refused action).
+    async fn resolve_principal_for_read(&self, secret: &str) -> Result<McpPrincipal, String> {
+        self.resolve_principal_with(secret, true, None).await
+    }
+
+    /// As [`Self::resolve_principal_for_read`] for an approval poll (`check_approval`): a revoked
+    /// token is refused and noted as `token_unusable` on the `approval_resume` entry.
+    async fn resolve_principal_for_approval(
+        &self,
+        secret: &str,
+        action: &str,
+    ) -> Result<McpPrincipal, String> {
+        self.resolve_principal_with(
+            secret,
+            true,
+            Some((crate::refusal::RefusalEntry::ApprovalResume, action)),
+        )
+        .await
+    }
+
+    /// The shared resolution. `read` accepts an exhausted or expired use token (only revoked is
+    /// refused); otherwise `check_usable` decides. `note` names the entry and action to note an
+    /// unusable token under, from the stored row (never from the request).
+    async fn resolve_principal_with(
+        &self,
+        secret: &str,
+        read: bool,
+        note: Option<(crate::refusal::RefusalEntry, &str)>,
+    ) -> Result<McpPrincipal, String> {
         if UseToken::looks_like_token(secret) {
             // Use tokens live in storage; reload so a token minted by the web UI
             // or CLI after this server started is visible.
@@ -270,40 +320,30 @@ impl McpServer {
                 .map_err(|e| format!("Storage error: {}", e))?
                 .ok_or_else(|| "Invalid use token".to_string())?;
 
-            token
-                .check_usable()
-                .map_err(|e| format!("Use token cannot be used: {}", e))?;
-
-            let auth = AuthResult::for_use_token(&token);
-            Ok(McpPrincipal::UseToken {
-                auth,
-                token: Box::new(token),
-            })
-        } else {
-            let auth = self.validate_api_key(secret).await?;
-            Ok(McpPrincipal::ApiKey(auth))
-        }
-    }
-
-    /// Resolve a secret to a principal for a **read-only** operation (polling an
-    /// approval). Unlike [`Self::resolve_principal`], a use token that has become
-    /// exhausted or expired is still accepted — polling is not an execution, and
-    /// a single-use token legitimately becomes exhausted exactly when its
-    /// approved action runs. A *revoked* token is still rejected.
-    async fn resolve_principal_for_read(&self, secret: &str) -> Result<McpPrincipal, String> {
-        if UseToken::looks_like_token(secret) {
-            let vultrino = &self.vultrino;
-            let _ = vultrino.storage().reload().await;
-            let token = vultrino
-                .storage()
-                .get_use_token_by_hash(&UseToken::hash(secret))
-                .await
-                .map_err(|e| format!("Storage error: {}", e))?
-                .ok_or_else(|| "Invalid use token".to_string())?;
-
-            if token.revoked {
-                return Err("Use token has been revoked".to_string());
+            let refused = if read {
+                token
+                    .revoked
+                    .then(|| "Use token has been revoked".to_string())
+            } else {
+                token
+                    .check_usable()
+                    .err()
+                    .map(|e| format!("Use token cannot be used: {}", e))
+            };
+            if let Some(message) = refused {
+                if let Some((entry, action)) = note {
+                    self.vultrino.note_gateway_refusal(
+                        &crate::refusal::RefusalCtx::new(
+                            entry,
+                            Some((token.id.as_str(), token.agent_label.as_deref())),
+                            action,
+                        ),
+                        crate::refusal::RefusalClass::TokenUnusable,
+                    );
+                }
+                return Err(message);
             }
+
             let auth = AuthResult::for_use_token(&token);
             Ok(McpPrincipal::UseToken {
                 auth,
@@ -931,7 +971,7 @@ impl McpServer {
             None => return Some(Err("Missing 'api_key' argument".to_string())),
         };
 
-        let principal = match self.resolve_principal(secret).await {
+        let principal = match self.resolve_principal(secret, tool_name).await {
             Ok(p) => p,
             Err(e) => return Some(Err(e)),
         };
@@ -1044,7 +1084,9 @@ impl McpServer {
             None => return Err("Missing 'api_key' argument".to_string()),
         };
 
-        let principal = self.resolve_principal(&secret).await?;
+        let principal = self
+            .resolve_principal(&secret, &capability.tool_name)
+            .await?;
         let exec_auth = Self::build_exec_auth(&principal);
 
         // Strip the bearer secret out of the args BEFORE mapping them into the
@@ -1192,7 +1234,9 @@ impl McpServer {
             .map_err(|e| format!("Invalid arguments: {}. api_key is required.", e))?;
 
         // Authenticate (API key or use token) and check permission.
-        let principal = self.resolve_principal(&args.api_key).await?;
+        let principal = self
+            .resolve_principal(&args.api_key, "list_credentials")
+            .await?;
         let auth = principal.auth();
         Self::check_permission(auth, Permission::Read).inspect_err(|_| {
             self.note_refusal(
@@ -1254,7 +1298,9 @@ impl McpServer {
             .map_err(|e| format!("Invalid arguments: {}. api_key is required.", e))?;
 
         // Resolve the caller (API key or use token) and build the auth context.
-        let principal = self.resolve_principal(&args.api_key).await?;
+        let principal = self
+            .resolve_principal(&args.api_key, "http_request")
+            .await?;
         let exec_auth = Self::build_exec_auth(&principal);
 
         // Build execute request
@@ -1313,7 +1359,9 @@ impl McpServer {
             .map_err(|e| format!("Invalid arguments: {}. api_key is required.", e))?;
 
         // Authenticate (API key or use token) and check permissions.
-        let principal = self.resolve_principal(&args.api_key).await?;
+        let principal = self
+            .resolve_principal(&args.api_key, "get_credential_info")
+            .await?;
         let auth = principal.auth();
         Self::check_permission(auth, Permission::Read)
             .and_then(|()| Self::check_credential_access(auth, &args.credential))
@@ -1389,7 +1437,9 @@ impl McpServer {
 
         // Authenticate the caller (API key or use token). Polling is a read, so
         // an exhausted/expired use token is still allowed — only revoked is not.
-        let principal = self.resolve_principal_for_read(&args.api_key).await?;
+        let principal = self
+            .resolve_principal_for_approval(&args.api_key, "check_approval")
+            .await?;
         // Built from the STORED record the presented secret resolved to, never
         // from `args`: the agent names the approval, never its own identity.
         let caller = crate::server::ApprovalCaller::from_auth(principal.auth());

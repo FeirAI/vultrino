@@ -1429,14 +1429,11 @@ async fn llm_proxy_impl(
         .await
     {
         Ok(c) => c,
-        Err(message) => {
-            note_llm_refusal(
-                &state,
-                &exec_auth,
-                None,
-                crate::refusal::RefusalClass::NotGranted,
-            );
-            return llm_error(StatusCode::FORBIDDEN, "permission_error", &message);
+        Err(refusal) => {
+            if let Some(class) = refusal.class {
+                note_llm_refusal(&state, &exec_auth, None, class);
+            }
+            return llm_error(StatusCode::FORBIDDEN, "permission_error", &refusal.message);
         }
     };
     let llm = capability

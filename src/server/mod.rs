@@ -434,6 +434,14 @@ impl ExecAuth {
     }
 }
 
+/// Why [`VultrinoServer::resolve_llm_proxy_channel_for`] resolved no model channel, and the
+/// refusal class to seal for it (`None`: a request-shape error, nothing to seal).
+#[derive(Debug, Clone)]
+pub struct LlmChannelRefusal {
+    pub message: String,
+    pub class: Option<RefusalClass>,
+}
+
 /// The authenticated caller of an approval poll, for the ownership check in
 /// [`VultrinoServer::check_and_resume_approval`].
 ///
@@ -1432,6 +1440,13 @@ impl VultrinoServer {
     /// directly. Returns a cheap `Arc` clone so the caller can `await` off it.
     pub fn averin(&self) -> Option<Arc<crate::averin::AverinClient>> {
         self.averin.clone()
+    }
+
+    /// Whether a gateway refusal can be noted at all (an averin seal client exists). A refusal
+    /// path that must look up the refused principal first (a storage reload and a token lookup)
+    /// checks this, so it does no extra I/O when nothing can be noted.
+    pub fn refusal_noting_enabled(&self) -> bool {
+        self.averin.is_some()
     }
 
     /// Plan 087 FIX 2 — the SINGLE grant-before-issue seal for EVERY in-process mint
@@ -5319,13 +5334,29 @@ impl VultrinoServer {
 
     /// Resolve an explicit model channel by stable capability id or channel
     /// name. With no name, compatibility `/llm` is accepted only for one channel.
+    ///
+    /// The error carries the refusal class to seal (feir-ops#1): `NotGranted` when the principal
+    /// holds no such grant, `DecisionUnavailable` when the capability catalog cannot be read, and
+    /// `None` for an ambiguous request from an agent that does hold grants (a request-shape
+    /// error, not a refusal of access).
     pub async fn resolve_llm_proxy_channel_for(
         &self,
         auth: Option<&AuthResult>,
         channel: Option<&str>,
-    ) -> Result<crate::capability::Capability, String> {
+    ) -> Result<crate::capability::Capability, LlmChannelRefusal> {
+        use crate::refusal::RefusalClass;
         let _ = self.storage.reload().await;
-        let all = self.storage.list_capabilities().await.unwrap_or_default();
+        let all = match self.storage.list_capabilities().await {
+            Ok(all) => all,
+            Err(_) => {
+                return Err(LlmChannelRefusal {
+                    message: "The capability catalog could not be read; no model channel can be \
+                              resolved"
+                        .to_string(),
+                    class: Some(RefusalClass::DecisionUnavailable),
+                })
+            }
+        };
         let mut allowed = Vec::new();
         for capability in all {
             if capability.is_llm_proxy() && self.capability_allowed_for(auth, &capability).await {
@@ -5336,14 +5367,20 @@ impl VultrinoServer {
             Some(name) => allowed
                 .into_iter()
                 .find(|c| c.id == name || c.tool_name == name)
-                .ok_or_else(|| format!("Model channel '{name}' is not granted")),
+                .ok_or_else(|| LlmChannelRefusal {
+                    message: format!("Model channel '{name}' is not granted"),
+                    class: Some(RefusalClass::NotGranted),
+                }),
             None if allowed.len() == 1 => Ok(allowed.remove(0)),
-            None if allowed.is_empty() => {
-                Err("No LLM-proxy capability is provisioned for this principal".to_string())
-            }
-            None => {
-                Err("Multiple model channels are granted; use /llm/channels/{channel}".to_string())
-            }
+            None if allowed.is_empty() => Err(LlmChannelRefusal {
+                message: "No LLM-proxy capability is provisioned for this principal".to_string(),
+                class: Some(RefusalClass::NotGranted),
+            }),
+            None => Err(LlmChannelRefusal {
+                message: "Multiple model channels are granted; use /llm/channels/{channel}"
+                    .to_string(),
+                class: None,
+            }),
         }
     }
 
@@ -5770,11 +5807,9 @@ pub async fn flush_receipt_gaps_once(
     let mut recorded = 0usize;
     while !gaps.is_empty() {
         let gap = gaps.remove(0);
-        let payload = serde_json::json!({
-            "token_id": gap.token_id,
+        let mut payload = serde_json::json!({
             "project_id": gap.project_id,
             "request_id": gap.request_id,
-            "use_sequence_number": gap.use_sequence_number,
             "reason": gap.reason,
             "detail": gap.detail,
             "at": gap.at.to_rfc3339(),
@@ -5783,6 +5818,23 @@ pub async fn flush_receipt_gaps_once(
             "kind": gap.kind.as_str(),
             "outcome": gap.kind.outcome(),
         });
+        // A receipt gap names the use token whose action ran; a refusal gap names the refused
+        // agent under its own key, never `token_id` (a consumer would read that as a token whose
+        // action ran) and carries no use counter.
+        if let Some(obj) = payload.as_object_mut() {
+            match gap.kind {
+                crate::averin::GapKind::Receipt => {
+                    obj.insert("token_id".into(), serde_json::json!(gap.token_id));
+                    obj.insert(
+                        "use_sequence_number".into(),
+                        serde_json::json!(gap.use_sequence_number),
+                    );
+                }
+                crate::averin::GapKind::Refusal => {
+                    obj.insert("agent_id".into(), serde_json::json!(gap.token_id));
+                }
+            }
+        }
         match storage
             .append_event(
                 &gap.token_id,
@@ -5820,6 +5872,19 @@ pub async fn drain_refusals_periodically(
         tokio::time::sleep(interval).await;
         averin.drain_refusals_once().await;
     }
+}
+
+/// feir-ops#1: the process is stopping. Seal the refusals still waiting (first refusals not yet
+/// drained, tails of open windows) within `budget`, record the ones that could not be sealed as
+/// refusal gaps, and append those gaps to the outbox, so an ordinary session end or a SIGTERM
+/// restart does not lose a refusal silently.
+pub async fn flush_refusals_on_shutdown(
+    storage: &Arc<dyn StorageBackend>,
+    averin: &crate::averin::AverinClient,
+    budget: std::time::Duration,
+) {
+    averin.flush_refusals_on_shutdown(budget).await;
+    flush_receipt_gaps_once(storage, averin).await;
 }
 
 /// FEI-33: the background loop around [`flush_receipt_gaps_once`].

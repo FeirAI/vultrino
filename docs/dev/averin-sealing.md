@@ -724,7 +724,18 @@ How vultrino feeds it:
    a token bucket bounds the record count and beyond it refusals merge into one summary record with
    exact per-class counts.
 4. A record averin does not accept becomes an `evidence.receipt_gap` event of `kind: refusal`, outcome
-   `refused_not_sealed`. A refusal gap never reads as an action that ran.
+   `refused_not_sealed`, with the refused agent as `agent_id` (never `token_id`, and no use counter).
+   A refusal gap never reads as an action that ran; a consumer must key on `kind` or `outcome`
+   (govder counts it separately and logs it as a refusal).
+5. A normal stop (the end of a stdio MCP session, SIGTERM or Ctrl+C on the web server) closes every
+   open window and seals what is waiting for up to five seconds; what averin did not take is a gap.
+
+| Entry point | Refusals recorded (class) |
+|---|---|
+| `execute` | the admission gate (not_granted, policy_deny, kill_fence, rate_limit, cross_tenant, capability_undeclared, approval_unavailable, decision_unavailable) and a revoked, expired or used-up use token (token_unusable) |
+| `mcp` | the same gate through every tool, and a revoked, expired or used-up use token on a named capability, a generic tool or a plugin tool (token_unusable, under the tool called) |
+| `llm` | no channel granted, a model not permitted or unpriced, an unusable token, an unreadable capability catalog (decision_unavailable); not an ambiguous channel request |
+| `approval_resume` | a non-owner poll, a revoked token polling an approval (REST, MCP and the result feed: token_unusable), and a refusal raised while an approved action is resumed |
 
 The record names the agent (the enforcement label, else `vultrino:<principal id>`), a sanitized action,
 the resolved credential alias when there is one, the reason class, the entry point (`mcp`, `execute`,

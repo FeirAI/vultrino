@@ -212,6 +212,20 @@ fn resolve_inbound_principal(
     state.server.resolve_identity(value, signature, bearer)
 }
 
+/// feir-ops#1: a revoked use token that polls an approval (or reads the approval-result feed) is
+/// a refusal of the agent it belongs to, noted from the stored row as `token_unusable` on the
+/// `approval_resume` entry. Synchronous and O(1): the 403 is returned as before.
+fn note_revoked_token_poll(state: &AppState, token: &UseToken, action: &str) {
+    state.server.note_gateway_refusal(
+        &crate::refusal::RefusalCtx::new(
+            crate::refusal::RefusalEntry::ApprovalResume,
+            Some((token.id.as_str(), token.agent_label.as_deref())),
+            action,
+        ),
+        crate::refusal::RefusalClass::TokenUnusable,
+    );
+}
+
 /// Authenticate a caller and return its approval-ownership identity (without
 /// action scoping), for read-only operations like polling an approval.
 ///
@@ -236,11 +250,14 @@ async fn resolve_approval_caller(
                 agent_label: t.agent_label,
                 tenant: t.tenant,
             }),
-            Ok(Some(_)) => Err(error_response(
-                StatusCode::FORBIDDEN,
-                "token_revoked",
-                "Use token has been revoked",
-            )),
+            Ok(Some(t)) => {
+                note_revoked_token_poll(state, &t, "check_approval");
+                Err(error_response(
+                    StatusCode::FORBIDDEN,
+                    "token_revoked",
+                    "Use token has been revoked",
+                ))
+            }
             _ => Err(error_response(
                 StatusCode::UNAUTHORIZED,
                 "invalid_token",
@@ -314,11 +331,14 @@ async fn resolve_caller_channel_identity(
             .get_use_token_by_hash(&UseToken::hash(secret))
             .await
         {
-            Ok(Some(token)) if token.revoked => Err(error_response(
-                StatusCode::FORBIDDEN,
-                "token_revoked",
-                "Use token has been revoked",
-            )),
+            Ok(Some(token)) if token.revoked => {
+                note_revoked_token_poll(state, &token, "approval_results");
+                Err(error_response(
+                    StatusCode::FORBIDDEN,
+                    "token_revoked",
+                    "Use token has been revoked",
+                ))
+            }
             Ok(Some(token)) => channel_identity(token.agent_label, token.tenant),
             _ => Err(error_response(
                 StatusCode::UNAUTHORIZED,

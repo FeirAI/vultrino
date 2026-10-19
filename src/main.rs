@@ -1381,10 +1381,23 @@ async fn run_mcp_server(config: Config) -> Result<(), Box<dyn std::error::Error>
         std::time::Duration::from_secs(vultrino::server::PENDING_DRAIN_SECS),
     ));
 
+    let shutdown_averin = server.averin();
+    let shutdown_storage = server.storage().clone();
     let vultrino = Arc::new(server);
     let mut mcp = McpServer::new(vultrino, auth_manager);
 
-    mcp.run_stdio().await?;
+    let result = mcp.run_stdio().await;
+
+    // feir-ops#1: the session is over; seal the refusals still waiting rather than dropping them.
+    if let Some(av) = shutdown_averin {
+        vultrino::server::flush_refusals_on_shutdown(
+            &shutdown_storage,
+            &av,
+            std::time::Duration::from_secs(vultrino::averin::REFUSAL_SHUTDOWN_FLUSH_SECS),
+        )
+        .await;
+    }
+    result?;
 
     Ok(())
 }
@@ -1492,6 +1505,8 @@ async fn run_web_server(
         bind,
         enabled: true,
     };
+    let shutdown_averin = exec_server.averin();
+    let shutdown_storage = exec_server.storage().clone();
 
     // FEI-16: attribute Telegram button presses to the person who pressed them. Only when
     // `[approvals.telegram] callback_decisions = true`; outbound long-poll, nothing exposed.
@@ -1542,10 +1557,18 @@ async fn run_web_server(
     );
     println!("Press Ctrl+C to stop");
 
-    web_server
-        .run()
-        .await
-        .map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })
+    let served = web_server.run().await;
+
+    // feir-ops#1: SIGTERM or Ctrl+C: seal the refusals still waiting rather than dropping them.
+    if let Some(av) = shutdown_averin {
+        vultrino::server::flush_refusals_on_shutdown(
+            &shutdown_storage,
+            &av,
+            std::time::Duration::from_secs(vultrino::averin::REFUSAL_SHUTDOWN_FLUSH_SECS),
+        )
+        .await;
+    }
+    served.map_err(|e| -> Box<dyn std::error::Error> { e.to_string().into() })
 }
 
 /// Load admin auth from storage or prompt for setup

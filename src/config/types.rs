@@ -745,15 +745,18 @@ impl TryFrom<RawAverinConfig> for crate::averin::AverinConfig {
             refusal_window_secs: raw
                 .refusal_window_secs
                 .filter(|&n| n > 0)
-                .unwrap_or(d.refusal_window_secs),
+                .unwrap_or(d.refusal_window_secs)
+                .min(crate::refusal::MAX_REFUSAL_WINDOW_SECS),
             refusal_burst: raw
                 .refusal_burst
                 .filter(|&n| n > 0)
-                .unwrap_or(d.refusal_burst),
+                .unwrap_or(d.refusal_burst)
+                .min(crate::refusal::MAX_REFUSAL_BURST),
             refusal_records_per_hour: raw
                 .refusal_records_per_hour
                 .filter(|&n| n > 0)
-                .unwrap_or(d.refusal_records_per_hour),
+                .unwrap_or(d.refusal_records_per_hour)
+                .min(crate::refusal::MAX_REFUSAL_RECORDS_PER_HOUR),
         })
     }
 }
@@ -1715,6 +1718,24 @@ action = "deny"
         .unwrap();
         assert!(cfg.averin.durable);
         assert_eq!(cfg.averin.mode, crate::averin::AverinMode::Observe);
+    }
+
+    /// The refusal record budget is the month-size bound, not a tuning knob: an operator value
+    /// above a ceiling is clamped to it, and the posture reports the value in force.
+    #[test]
+    fn refusal_budget_settings_are_clamped_to_their_ceilings() {
+        let cfg = Config::parse(
+            "[averin]\nrefusal_burst = 4000000000\nrefusal_records_per_hour = 4000000000\nrefusal_window_secs = 99999999",
+        )
+        .unwrap();
+        assert_eq!(cfg.averin.refusal_burst, 240);
+        assert_eq!(cfg.averin.refusal_records_per_hour, 60);
+        assert_eq!(cfg.averin.refusal_window_secs, 300);
+        // A value under the ceiling is kept.
+        let cfg =
+            Config::parse("[averin]\nrefusal_burst = 100\nrefusal_records_per_hour = 30").unwrap();
+        assert_eq!(cfg.averin.refusal_burst, 100);
+        assert_eq!(cfg.averin.refusal_records_per_hour, 30);
     }
 
     // ---- FEI-16: Telegram callback decisions ------------------------------------------

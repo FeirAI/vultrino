@@ -610,7 +610,9 @@ first refusal of an agent, action, reason class and entry point in a window is s
 (every two seconds); later ones in the same window are sealed together when it closes, with an exact
 attempt count. Past the budget (`refusal_burst` records, refilled at `refusal_records_per_hour`) refusals
 merge into one summary record carrying exact per-class counts and no per-action detail. A `0` for a
-number falls back to its default. The settings are reported in `GET /api/v1/posture` under `averin`.
+number falls back to its default, and a number above its ceiling (`refusal_burst` 240,
+`refusal_records_per_hour` 60, `refusal_window_secs` 300) is clamped to it; the budget is per process.
+On a normal stop the process seals what it still holds before exiting. The settings are reported in `GET /api/v1/posture` under `averin`.
 The record uses the same `[averin]` project and session as use receipts, and the same
 `AVERIN_API_KEY`, so any holder of that key can also submit a refusal to averin.
 
