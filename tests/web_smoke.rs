@@ -9487,3 +9487,259 @@ async fn events_envelope_reports_oldest_and_last_sequence() {
     assert_eq!(emptied["last_sequence"], 5, "{emptied}");
     assert_eq!(emptied["events"].as_array().unwrap().len(), 0);
 }
+
+/// Router holding BOTH a global admin key and a tenant-scoped admin key over one
+/// store, so a test can show the same request refused for one and served for the other.
+async fn build_global_and_tenant_admin_router(
+    tenant: &str,
+) -> (axum::Router, Arc<dyn StorageBackend>, String, String) {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("store.enc");
+    std::mem::forget(dir);
+    let password = SecretString::from("test-password");
+    let storage: Arc<dyn StorageBackend> =
+        Arc::new(FileStorage::new(&path, &password).await.unwrap());
+    let seed = AuthManager::new();
+    let (global_plain, global_key) = seed.create_api_key("op", "admin", None).unwrap();
+    let (tenant_plain, tenant_base) = seed.create_api_key("agg", "admin", None).unwrap();
+    let mut tenant_key = tenant_base.clone();
+    tenant_key.tenant = Some(tenant.to_string());
+    let auth_manager = AuthManager::from_data(
+        seed.list_roles(),
+        vec![global_key.clone(), tenant_key.clone()],
+    );
+    storage.store_api_key(&global_key).await.unwrap();
+    storage.store_api_key(&tenant_key).await.unwrap();
+    let admin = AdminAuth::new("admin", "password123").unwrap();
+    let resolver = vultrino::router::CredentialResolver::new(storage.clone());
+    let exec_server = Arc::new(vultrino::server::VultrinoServer::new(
+        Config::default(),
+        storage.clone(),
+        resolver,
+    ));
+    let router = WebServer::new(
+        WebConfig {
+            bind: "127.0.0.1:0".to_string(),
+            enabled: true,
+        },
+        Config::default(),
+        storage.clone(),
+        auth_manager,
+        admin,
+        exec_server,
+    )
+    .into_router();
+    (router, storage, global_plain, tenant_plain)
+}
+
+fn capability_body(tool: &str, credential_ref: &str) -> serde_json::Value {
+    serde_json::json!({
+        "tool_name": tool,
+        "description": "d",
+        "action": "http.request",
+        "plugin": "http",
+        "target": { "url_glob": "https://api.example.test/v1/*", "methods": ["POST"] },
+        "credential_ref": credential_ref,
+        "input_schema": { "type": "object" }
+    })
+}
+
+async fn capabilities_snapshot(storage: &Arc<dyn StorageBackend>) -> serde_json::Value {
+    let mut caps = storage.list_capabilities().await.unwrap();
+    caps.sort_by(|a, b| a.id.cmp(&b.id));
+    serde_json::to_value(&caps).unwrap()
+}
+
+/// Capabilities carry no tenant (a shared enforcement catalog), so POST/PUT/DELETE are
+/// operator-only: a tenant-scoped admin key gets 403 `operator_key_required` and the
+/// catalog is unchanged; a global key still succeeds; the GET list stays open to the
+/// tenant key.
+#[tokio::test]
+async fn capability_writes_refuse_a_tenant_scoped_key() {
+    let (router, storage, global, tenant) = build_global_and_tenant_admin_router("team-a").await;
+
+    // Seed two capabilities with the global key (PUT create, so the ids are known).
+    for (id, tool) in [("cap-put-target", "tool_put"), ("cap-del-target", "tool_del")] {
+        let resp = router
+            .clone()
+            .oneshot(admin_req(
+                "PUT",
+                &format!("/api/v1/capabilities/{id}"),
+                &global,
+                capability_body(tool, "cred-orig"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "global PUT create");
+    }
+    let before = capabilities_snapshot(&storage).await;
+    assert_eq!(before.as_array().unwrap().len(), 2);
+
+    let assert_refused = |resp: axum::response::Response| async move {
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+        assert_eq!(body["code"], "operator_key_required");
+    };
+
+    // POST
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            "/api/v1/capabilities",
+            &tenant,
+            capability_body("tool_new", "cred-evil"),
+        ))
+        .await
+        .unwrap();
+    assert_refused(resp).await;
+    // PUT over an existing id, and PUT creating a new id
+    for id in ["cap-put-target", "cap-brand-new"] {
+        let resp = router
+            .clone()
+            .oneshot(admin_req(
+                "PUT",
+                &format!("/api/v1/capabilities/{id}"),
+                &tenant,
+                capability_body("tool_evil", "cred-evil"),
+            ))
+            .await
+            .unwrap();
+        assert_refused(resp).await;
+    }
+    // DELETE
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "DELETE",
+            "/api/v1/capabilities/cap-del-target",
+            &tenant,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_refused(resp).await;
+
+    // Catalog byte-for-byte unchanged: nothing created, replaced or deleted.
+    assert_eq!(capabilities_snapshot(&storage).await, before);
+    assert!(storage.get_capability("cap-put-target").await.unwrap().is_some());
+    assert!(storage.get_capability("cap-del-target").await.unwrap().is_some());
+
+    // GET list is still served to the tenant-scoped key.
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "GET",
+            "/api/v1/capabilities",
+            &tenant,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // A global key still succeeds on all three.
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            "/api/v1/capabilities",
+            &global,
+            capability_body("tool_new", "cred-ok"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "PUT",
+            "/api/v1/capabilities/cap-put-target",
+            &global,
+            capability_body("tool_put", "cred-replaced"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        storage
+            .get_capability("cap-put-target")
+            .await
+            .unwrap()
+            .unwrap()
+            .credential_ref,
+        "cred-replaced"
+    );
+    let resp = router
+        .oneshot(admin_req(
+            "DELETE",
+            "/api/v1/capabilities/cap-del-target",
+            &global,
+            serde_json::json!({}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(storage.get_capability("cap-del-target").await.unwrap().is_none());
+}
+
+/// The refusal runs before the idempotency machinery: a tenant-scoped key reusing an
+/// Idempotency-Key a global key already used gets 403, never the cached 2xx.
+#[tokio::test]
+async fn capability_write_idempotency_replay_cannot_bypass_the_operator_gate() {
+    let (router, storage, global, tenant) = build_global_and_tenant_admin_router("team-a").await;
+
+    // POST (at-most-once class).
+    let body = capability_body("tool_idem", "cred-1");
+    let resp = router
+        .clone()
+        .oneshot(admin_req_idem(
+            "POST",
+            "/api/v1/capabilities",
+            &global,
+            "idem-cap-post",
+            body.clone(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let resp = router
+        .clone()
+        .oneshot(admin_req_idem(
+            "POST",
+            "/api/v1/capabilities",
+            &tenant,
+            "idem-cap-post",
+            body,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(storage.list_capabilities().await.unwrap().len(), 1);
+
+    // PUT (convergent class).
+    let body = capability_body("tool_idem_put", "cred-1");
+    let resp = router
+        .clone()
+        .oneshot(admin_req_idem(
+            "PUT",
+            "/api/v1/capabilities/cap-idem",
+            &global,
+            "idem-cap-put",
+            body.clone(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let resp = router
+        .oneshot(admin_req_idem(
+            "PUT",
+            "/api/v1/capabilities/cap-idem",
+            &tenant,
+            "idem-cap-put",
+            body,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}

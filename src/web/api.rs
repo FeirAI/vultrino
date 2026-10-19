@@ -2718,11 +2718,16 @@ async fn store_capability_and_emit(
 
 /// `POST /api/v1/capabilities` — create a capability (id generated).
 pub async fn api_create_capability(
-    _admin: AdminApiAuth,
+    admin: AdminApiAuth,
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Json(req): Json<CapabilityUpsertRequest>,
 ) -> Response {
+    // Operator-only: capabilities carry no tenant (shared enforcement catalog), so a
+    // tenant-scoped key must not create, replace or delete one. See `require_global_admin`.
+    if let Err(resp) = require_global_admin(&admin).await {
+        return resp;
+    }
     let key = extract_idempotency_key(&headers);
     let body_hash = idempotency_body_hash(&req);
     let st = state.clone();
@@ -2742,12 +2747,17 @@ pub async fn api_create_capability(
 
 /// `PUT /api/v1/capabilities/{id}` — create or replace the capability with this id.
 pub async fn api_put_capability(
-    _admin: AdminApiAuth,
+    admin: AdminApiAuth,
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: axum::http::HeaderMap,
     Json(req): Json<CapabilityUpsertRequest>,
 ) -> Response {
+    // Operator-only: capabilities carry no tenant (shared enforcement catalog), so a
+    // tenant-scoped key must not create, replace or delete one. See `require_global_admin`.
+    if let Err(resp) = require_global_admin(&admin).await {
+        return resp;
+    }
     let key = extract_idempotency_key(&headers);
     // Bind the hash to the path id (same as policies) so the same body PUT to a
     // different id under one Idempotency-Key isn't replayed as the first.
@@ -2794,10 +2804,15 @@ pub async fn api_list_capabilities(
 
 /// `DELETE /api/v1/capabilities/{id}` — remove a stored capability.
 pub async fn api_delete_capability(
-    _admin: AdminApiAuth,
+    admin: AdminApiAuth,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Response {
+    // Operator-only: capabilities carry no tenant (shared enforcement catalog), so a
+    // tenant-scoped key must not create, replace or delete one. See `require_global_admin`.
+    if let Err(resp) = require_global_admin(&admin).await {
+        return resp;
+    }
     match state.storage.delete_capability(&id).await {
         Ok(()) => {
             state
