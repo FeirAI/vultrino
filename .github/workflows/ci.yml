@@ -30,7 +30,8 @@ jobs:
           key: kani-0.67.0-nightly-2025-11-21-${{ runner.os }}
       - name: install pinned Kani
         run: |
-          if ! cargo kani --version 2>/dev/null | grep -q ' 0.67.0$'; then
+          kani_ver=$(cargo kani --version 2>/dev/null || true)
+          if ! grep -q ' 0.67.0$' <<<"$kani_ver"; then
             cargo install --locked kani-verifier@0.67.0
           fi
           # Always run setup: ~/.kani holds a toolchain link into ~/.rustup, so a
@@ -176,7 +177,8 @@ jobs:
           key: kani-0.67.0-nightly-2025-11-21-${{ runner.os }}
       - name: install pinned Kani
         run: |
-          if ! cargo kani --version 2>/dev/null | grep -q ' 0.67.0$'; then
+          kani_ver=$(cargo kani --version 2>/dev/null || true)
+          if ! grep -q ' 0.67.0$' <<<"$kani_ver"; then
             cargo install --locked kani-verifier@0.67.0
           fi
           cargo kani setup
