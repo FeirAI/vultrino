@@ -9559,7 +9559,10 @@ async fn capability_writes_refuse_a_tenant_scoped_key() {
     let (router, storage, global, tenant) = build_global_and_tenant_admin_router("team-a").await;
 
     // Seed two capabilities with the global key (PUT create, so the ids are known).
-    for (id, tool) in [("cap-put-target", "tool_put"), ("cap-del-target", "tool_del")] {
+    for (id, tool) in [
+        ("cap-put-target", "tool_put"),
+        ("cap-del-target", "tool_del"),
+    ] {
         let resp = router
             .clone()
             .oneshot(admin_req(
@@ -9622,8 +9625,16 @@ async fn capability_writes_refuse_a_tenant_scoped_key() {
 
     // Catalog byte-for-byte unchanged: nothing created, replaced or deleted.
     assert_eq!(capabilities_snapshot(&storage).await, before);
-    assert!(storage.get_capability("cap-put-target").await.unwrap().is_some());
-    assert!(storage.get_capability("cap-del-target").await.unwrap().is_some());
+    assert!(storage
+        .get_capability("cap-put-target")
+        .await
+        .unwrap()
+        .is_some());
+    assert!(storage
+        .get_capability("cap-del-target")
+        .await
+        .unwrap()
+        .is_some());
 
     // GET list is still served to the tenant-scoped key.
     let resp = router
@@ -9680,7 +9691,11 @@ async fn capability_writes_refuse_a_tenant_scoped_key() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    assert!(storage.get_capability("cap-del-target").await.unwrap().is_none());
+    assert!(storage
+        .get_capability("cap-del-target")
+        .await
+        .unwrap()
+        .is_none());
 }
 
 /// The refusal runs before the idempotency machinery: a tenant-scoped key reusing an
