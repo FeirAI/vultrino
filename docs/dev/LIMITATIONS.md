@@ -407,8 +407,8 @@ noninterference. Honest scope:
   Rust server (see `formal/lean/README.md`).
 - **Kani (`formal/run-kani.sh`)** runs pure-kernel harnesses with
   `--no-default-features` (no `wasm-plugins` / wasmtime). Kani 0.67 ships rustc
-  **1.93** nightly; the production default feature set pulls wasmtime **47**,
-  which declares rust-version **1.95**. So Kani does **not** verify the WASM
+  **1.93** nightly; the production default feature set pulls wasmtime **49**,
+  which declares rust-version **1.96**. So Kani does **not** verify the WASM
   plugin host, and a default-features build is outside that proof job.
 - **Permit kernel (`src/formal_kernel.rs`, VUL-05).** A direct permit is minted
   only from an `AdmissionWitness` that the pure admission gate builds from the
@@ -643,7 +643,7 @@ kernels.
 - Outbox push fan-out (today a single push subscriber; additional consumers poll).
 - A transactional storage layer for exactly-once idempotency.
 - A Kani toolchain that can verify the default `wasm-plugins` feature set (today
-  Kani 0.67’s rustc 1.93 cannot compile wasmtime 48’s rustc-1.95 MSRV — proofs
+  Kani 0.67’s rustc 1.93 cannot compile wasmtime 49’s rustc-1.96 MSRV — proofs
   stay on `--no-default-features`).
 - Migrating the Askama axum integration off `askama_axum = "0.4"` — crates.io’s
   `0.5.0+deprecated` is an empty hard-`compile_error!` stub; stay on 0.4 until a

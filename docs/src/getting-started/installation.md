@@ -2,7 +2,7 @@
 
 ## Requirements
 
-- Rust **1.95.0** (pinned in [`rust-toolchain.toml`](../../../rust-toolchain.toml); `rustup` installs it)
+- Rust **1.96.0** (pinned in [`rust-toolchain.toml`](../../../rust-toolchain.toml); `rustup` installs it)
 - No system OpenSSL packages — TLS uses **rustls**
 
 ## From Source (Recommended)

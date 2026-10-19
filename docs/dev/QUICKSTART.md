@@ -8,11 +8,11 @@ authoritative record of how the binary is actually built, configured, and run.
 
 ## Prerequisites
 
-- **Rust 1.95.0** (edition 2021; pinned in `rust-toolchain.toml` — `rustup`
-  installs it). Matches the CI / wasmtime-47 MSRV floor.
+- **Rust 1.96.0** (edition 2021; pinned in `rust-toolchain.toml` — `rustup`
+  installs it). Matches the CI / wasmtime-49 MSRV floor.
 - **TLS:** reqwest is built with `rustls-tls` — no system OpenSSL development
   packages are required for a normal build.
-- Default build features include **`wasm-plugins`** (wasmtime 47). Production
+- Default build features include **`wasm-plugins`** (wasmtime 49). Production
   binaries keep that default; Kani proofs deliberately build with
   `--no-default-features` (see [LIMITATIONS.md](LIMITATIONS.md)).
 - For the **web UI login record** (`admin.json`), the `init` flow prompts
