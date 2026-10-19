@@ -22,9 +22,12 @@ denial never reaches). Both the immediate path and the post-approval
 `resume_approved` path funnel through `run_action`, so an admitted action is
 metered exactly once however it was admitted.
 
-The emit is **off the latency path and fail-open**: a failed outbox append (logs a
-`warn!`) never fails the calling operation, and a consumer/outbox outage does **not**
-block or fail `/execute`. A failed append is **counted**, though: see "Failed appends
+The emit is **fail-open, but not off the latency path**: `run_action` awaits the
+outbox append (one event, or two when a token count was parsed; each append takes the
+outbox file lock and rewrites the encrypted outbox file) after the action ran and before
+the response is returned, so append latency adds to `/execute`. A failed outbox append
+(logs a `warn!`) never fails the calling operation, and a consumer outage does **not**
+fail `/execute` (push delivery runs separately from the append). A failed append is **counted**, though: see "Failed appends
 are counted and announced" below.
 
 The event carries **no secrets/PII** — ids + a count only. It is test-asserted
@@ -60,7 +63,7 @@ kebab-case enum values):
 | `cost_source` | Constant `gateway-observed` (Vultrino's tier). |
 | `confidence` | Constant `low` (the gateway-observed data-quality band). |
 | `occurred_at` | The action's request timestamp. |
-| `dims` | `tenant` (V11) + `credential` alias; absent keys omitted (no phantom dims). `model` is **always omitted** for V13a — it does not parse the body. |
+| `dims` | `tenant` (V11) + `credential` alias, plus `provider`, `region` and `channel` when the call carried them (LLM-proxy calls always carry `provider` and `channel`, and `region` when the capability sets `llm.region`); absent keys omitted (no phantom dims). `model` is **always omitted** for V13a — it does not parse the body. |
 
 V13a reads **no body bytes** (a count of 1), so it emits *after* `scrub_response`
 safely.
@@ -126,7 +129,9 @@ bytes and **under-count** — the dangerous direction (a low token count keeps a
 cumulative ceiling below its limit → budgets never fire → unbounded spend). The
 *emit* still happens post-scrub at the V13a hook; only the *read* is moved earlier.
 
-Two provider shapes are recognized (both nested under top-level `usage`):
+Four provider shapes are recognized: OpenAI-style, Anthropic-style and Bedrock Converse
+(camelCase `usage.inputTokens` / `usage.outputTokens`) under top-level `usage`, and
+Gemini/Vertex under top-level `usageMetadata`:
 
 - **OpenAI-style:** `usage.{prompt_tokens, completion_tokens}` → input/output.
 - **Anthropic-style:** `usage.{input_tokens, output_tokens}` → input/output. Anthropic's

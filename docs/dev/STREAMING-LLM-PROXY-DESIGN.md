@@ -1,6 +1,9 @@
 # Vultrino SSE / Streaming LLM-Proxy — Design & Phased Implementation Plan
 
-> **Status:** Proposed (design only, not yet implemented). Produced 2026-06-23 from a
+> **Status:** Historical design record. Streaming has since been implemented; where this
+> plan differs from the code (names, file paths, provider coverage, the follow-up scope
+> and non-goals), the code and [SECURITY.md](SECURITY.md) / [LIMITATIONS.md](LIMITATIONS.md)
+> win. Produced 2026-06-23 from a
 > multi-lens design workshop (transport · incremental egress · streamed metering · API
 > compatibility · adversarial security · testing) + an adversarial critic pass, each
 > grounded against the real code. All lens contradictions and the critic's must-resolve

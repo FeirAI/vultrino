@@ -1,0 +1,17 @@
+diff --git a/src/web/api.rs b/src/web/api.rs
+index bb143fd..421e93d 100644
+--- a/src/web/api.rs
++++ b/src/web/api.rs
+@@ -2723,11 +2723,7 @@ pub async fn api_create_capability(
+     headers: axum::http::HeaderMap,
+     Json(req): Json<CapabilityUpsertRequest>,
+ ) -> Response {
+-    // Operator-only: capabilities carry no tenant (shared enforcement catalog), so a
+-    // tenant-scoped key must not create, replace or delete one. See `require_global_admin`.
+-    if let Err(resp) = require_global_admin(&admin).await {
+-        return resp;
+-    }
++    let _ = &admin;
+     let key = extract_idempotency_key(&headers);
+     let body_hash = idempotency_body_hash(&req);
+     let st = state.clone();
