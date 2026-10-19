@@ -17,7 +17,7 @@
 pub mod pop;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -870,6 +870,14 @@ impl AverinClient {
     /// (`refusal_seal_failed`). The refusal itself was returned long before. Returns the number of
     /// records sealed.
     pub async fn drain_refusals_once(&self) -> usize {
+        let sealed = AtomicUsize::new(0);
+        self.drain_refusals_counted(&sealed).await;
+        sealed.load(Ordering::Relaxed)
+    }
+
+    /// [`Self::drain_refusals_once`] counting each sealed record into `sealed` as it happens, so
+    /// the count survives the drain being cancelled (the shutdown budget).
+    async fn drain_refusals_counted(&self, sealed: &AtomicUsize) {
         let (batch, overflow) = self.refusals.take_due(REFUSAL_BATCH);
         for (class, attempts, agent) in overflow {
             self.refusals.count_unsealed();
@@ -880,14 +888,13 @@ impl AverinClient {
             );
         }
         if batch.is_empty() {
-            return 0;
+            return;
         }
         let mut set = tokio::task::JoinSet::new();
         let mut task_idem = std::collections::HashMap::new();
         for rec in batch {
-            // Registered before the task exists: a cancelled drain (the shutdown budget) leaves
-            // the record here for `take_all_pending`, so it cannot vanish.
-            self.refusals.begin_flight(&rec);
+            // `take_due` already registered the record in flight under the recorder's lock: a
+            // cancelled drain (the shutdown budget) leaves it there for `take_all_pending`.
             let idem = rec.idem.clone();
             let me = self.clone();
             let handle = set.spawn(async move {
@@ -898,14 +905,13 @@ impl AverinClient {
             });
             task_idem.insert(handle.id(), idem);
         }
-        let mut sealed = 0usize;
         let mut retry = Vec::new();
         while let Some(joined) = set.join_next().await {
             match joined {
                 Ok((rec, Ok(_))) => {
                     if self.refusals.finish_flight(&rec.idem) {
                         self.refusals.count_sealed();
-                        sealed += 1;
+                        sealed.fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 Ok((mut rec, Err(e))) => {
@@ -932,15 +938,13 @@ impl AverinClient {
                 }
             }
         }
-        // Synchronous from here: no await, so no cancellation point between leaving the in-flight
-        // map and being requeued or recorded as a gap.
-        retry.retain(|rec| self.refusals.finish_flight(&rec.idem));
+        // One atomic recorder step (no await): each retry record leaves the in-flight map and
+        // re-enters the queue together, so the shutdown collection never sees it in neither.
         if !retry.is_empty() {
-            for rec in self.refusals.requeue(retry) {
+            for rec in self.refusals.requeue_in_flight(retry) {
                 self.refusal_unsealed_overflow(&rec);
             }
         }
-        sealed
     }
 
     /// The process is stopping (feir-ops#1): close every open window so each tail is a record,
@@ -951,18 +955,17 @@ impl AverinClient {
     /// the number of records sealed.
     pub async fn flush_refusals_on_shutdown(&self, budget: Duration) -> usize {
         self.refusals.close_all_windows();
-        let sealed = tokio::time::timeout(budget, async {
-            let mut sealed = 0usize;
+        // Shared with the drain so records sealed before the budget expired still count.
+        let sealed = AtomicUsize::new(0);
+        let _ = tokio::time::timeout(budget, async {
             for _ in 0..REFUSAL_MAX_TRIES {
-                sealed += self.drain_refusals_once().await;
+                self.drain_refusals_counted(&sealed).await;
                 if !self.refusals.has_pending() {
                     break;
                 }
             }
-            sealed
         })
-        .await
-        .unwrap_or(0);
+        .await;
         for rec in self.refusals.take_all_pending() {
             self.refusals.count_unsealed();
             self.record_refusal_gap(
@@ -974,7 +977,7 @@ impl AverinClient {
                 ),
             );
         }
-        sealed
+        sealed.load(Ordering::Relaxed)
     }
 
     async fn seal_refusal(
@@ -1927,7 +1930,10 @@ mod tests {
         let sealed = client
             .flush_refusals_on_shutdown(Duration::from_millis(300))
             .await;
-        assert!(t0.elapsed() < Duration::from_secs(5), "the flush honours its budget");
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "the flush honours its budget"
+        );
         let c = client.refusal_counters();
         assert_eq!(sealed, 0);
         assert_eq!(c.noted, 10);
@@ -1939,7 +1945,98 @@ mod tests {
         agents.sort();
         agents.dedup();
         assert_eq!(agents.len(), 10, "one gap per distinct record");
-        assert!(client.refusals.take_all_pending().is_empty(), "nothing left in flight");
+        assert!(
+            client.refusals.take_all_pending().is_empty(),
+            "nothing left in flight"
+        );
+    }
+
+    /// An averin that answers every request 503 (a transient failure, so records are retried).
+    async fn unavailable_averin() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 8192];
+                    loop {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => {}
+                        }
+                        let resp = "HTTP/1.1 503 X\r\nContent-Length: 2\r\n\r\n{}";
+                        if stream.write_all(resp.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// The periodic drain runs on another thread while the shutdown flush runs. Every record must
+    /// be in exactly one place at every moment (ready, in flight, sealed or gapped), so after the
+    /// flush `noted == sealed + unsealed`, one gap per unsealed record, and nothing is left in
+    /// the queue or in flight. Pre-fix, a record taken but not yet registered in flight, or
+    /// removed from flight but not yet requeued, was missed by the shutdown collection.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn refusal_shutdown_flush_concurrent_with_periodic_drain_loses_nothing() {
+        let rounds = 600usize;
+        let down_503 = unavailable_averin().await;
+        let refused = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = l.local_addr().unwrap();
+            drop(l);
+            format!("http://{addr}")
+        };
+        let (mut lost_rounds, mut lost_total) = (0u64, 0u64);
+        for i in 0..rounds {
+            let base = if i % 2 == 0 { &down_503 } else { &refused };
+            let client = Arc::new(client_with(base, 256, Duration::from_secs(30)));
+            for n in 0..10 {
+                let ctx = crate::refusal::RefusalCtx::new(
+                    crate::refusal::RefusalEntry::Execute,
+                    Some((&format!("pc{i}-{n}"), None)),
+                    "act",
+                );
+                client.note_refusal(&ctx, crate::refusal::RefusalClass::NotGranted);
+            }
+            let periodic = {
+                let c = client.clone();
+                tokio::spawn(async move {
+                    loop {
+                        c.drain_refusals_once().await;
+                        tokio::task::yield_now().await;
+                    }
+                })
+            };
+            tokio::time::sleep(Duration::from_micros((i as u64 % 7) * 150)).await;
+            client
+                .flush_refusals_on_shutdown(Duration::from_secs(2))
+                .await;
+            periodic.abort();
+            let _ = periodic.await;
+            let c = client.refusal_counters();
+            let gaps = client.take_receipt_gaps().len() as u64;
+            let left = client.refusals.take_all_pending().len();
+            let in_flight = client.refusals.in_flight_len();
+            let lost = c.noted.saturating_sub(c.sealed + c.unsealed);
+            if lost > 0 || left > 0 || in_flight > 0 || gaps != c.unsealed {
+                lost_rounds += 1;
+                lost_total += lost;
+                println!(
+                    "round {i}: noted={} sealed={} unsealed={} gaps={gaps} left={left} in_flight={in_flight}",
+                    c.noted, c.sealed, c.unsealed
+                );
+            }
+        }
+        println!("rounds={rounds} rounds_with_loss={lost_rounds} records_lost={lost_total}");
+        assert_eq!(
+            lost_rounds, 0,
+            "records lost in {lost_rounds} of {rounds} rounds ({lost_total} records)"
+        );
     }
 
     /// Step 1: in Observe mode the `/execute` seal is fire-and-forget — the hot

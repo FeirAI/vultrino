@@ -1359,6 +1359,7 @@ async fn run_mcp_server(config: Config) -> Result<(), Box<dyn std::error::Error>
     // AND this process actually owns the durable queue (Step 3a's single-writer-process lock) —
     // default OFF, byte-identical to every build before this plan.
     let _ = spawn_averin_worker_if_enabled(&server, averin_enabled, averin_durable);
+    let mut refusal_drain: Option<tokio::task::JoinHandle<()>> = None;
     if let Some(av) = server.averin() {
         let av_for_refusals = av.clone();
         // FEI-33: every Observe receipt that did not reach Averin becomes an individual
@@ -1369,10 +1370,10 @@ async fn run_mcp_server(config: Config) -> Result<(), Box<dyn std::error::Error>
             std::time::Duration::from_secs(vultrino::server::RECEIPT_GAP_FLUSH_SECS),
         ));
         // feir-ops#1: gateway refusals noted on the hot path are sealed here, never in a request.
-        tokio::spawn(vultrino::server::drain_refusals_periodically(
+        refusal_drain = Some(tokio::spawn(vultrino::server::drain_refusals_periodically(
             av_for_refusals,
             std::time::Duration::from_secs(vultrino::averin::REFUSAL_DRAIN_SECS),
-        ));
+        )));
     }
     // Reconcile any intent-staged events an inline drain left behind (D1 safety net) so a committed
     // approval decision's signed event is delivered within a tick, not only on the next restart.
@@ -1389,6 +1390,11 @@ async fn run_mcp_server(config: Config) -> Result<(), Box<dyn std::error::Error>
     let result = mcp.run_stdio().await;
 
     // feir-ops#1: the session is over; seal the refusals still waiting rather than dropping them.
+    // Stop the periodic drain first so it cannot run beside the flush.
+    if let Some(handle) = refusal_drain.take() {
+        handle.abort();
+        let _ = handle.await;
+    }
     if let Some(av) = shutdown_averin {
         vultrino::server::flush_refusals_on_shutdown(
             &shutdown_storage,
@@ -1481,6 +1487,7 @@ async fn run_web_server(
     // default OFF, byte-identical to every build before this plan.
     let _ =
         spawn_averin_worker_if_enabled(&exec_server, config.averin.enabled, config.averin.durable);
+    let mut refusal_drain: Option<tokio::task::JoinHandle<()>> = None;
     if let Some(av) = exec_server.averin() {
         let av_for_refusals = av.clone();
         // FEI-33: see the other call site.
@@ -1490,10 +1497,10 @@ async fn run_web_server(
             std::time::Duration::from_secs(vultrino::server::RECEIPT_GAP_FLUSH_SECS),
         ));
         // feir-ops#1: gateway refusals noted on the hot path are sealed here, never in a request.
-        tokio::spawn(vultrino::server::drain_refusals_periodically(
+        refusal_drain = Some(tokio::spawn(vultrino::server::drain_refusals_periodically(
             av_for_refusals,
             std::time::Duration::from_secs(vultrino::averin::REFUSAL_DRAIN_SECS),
-        ));
+        )));
     }
     // Reconcile any intent-staged events an inline drain left behind (D1 safety net).
     tokio::spawn(vultrino::server::drain_pending_events_periodically(
@@ -1560,6 +1567,11 @@ async fn run_web_server(
     let served = web_server.run().await;
 
     // feir-ops#1: SIGTERM or Ctrl+C: seal the refusals still waiting rather than dropping them.
+    // Stop the periodic drain first so it cannot run beside the flush.
+    if let Some(handle) = refusal_drain.take() {
+        handle.abort();
+        let _ = handle.await;
+    }
     if let Some(av) = shutdown_averin {
         vultrino::server::flush_refusals_on_shutdown(
             &shutdown_storage,

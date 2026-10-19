@@ -441,12 +441,7 @@ impl RefusalRecorder {
         }
     }
 
-    /// Register a record a drain has taken and is about to seal.
-    pub(crate) fn begin_flight(&self, rec: &Outgoing) {
-        self.in_flight.lock().insert(rec.idem.clone(), rec.clone());
-    }
-
-    /// Claim the end of a record's flight. True for exactly one caller per `begin_flight`; the
+    /// Claim the end of a record's flight. True for exactly one caller per taken record (`take_due` registers it); the
     /// claimant then counts the record sealed or records its gap. False means someone else
     /// (the shutdown collection) already owns the record's outcome.
     pub(crate) fn finish_flight(&self, idem: &str) -> bool {
@@ -685,16 +680,33 @@ impl RefusalRecorder {
         }
         let n = max.min(st.ready.len());
         let batch: Vec<Outgoing> = st.ready.drain(..n).collect();
+        // Atomic hand-off: the batch enters `in_flight` while the state lock is still held (lock
+        // order: state, then in_flight, as in `take_all_pending`), so a concurrent
+        // `take_all_pending` always finds each record in `ready` or in `in_flight`, never neither.
+        {
+            let mut flight = self.in_flight.lock();
+            for rec in &batch {
+                flight.insert(rec.idem.clone(), rec.clone());
+            }
+        }
         let overflow = std::mem::take(&mut st.overflow);
         (batch, overflow)
     }
 
-    /// Put records back at the front of the queue after a failed attempt (they keep their
-    /// idempotency key). The bound is the same: past [`MAX_READY`] they are returned as dropped.
-    pub fn requeue(&self, recs: Vec<Outgoing>) -> Vec<Outgoing> {
+    /// Put records that are in flight back at the front of the queue after a failed attempt (they
+    /// keep their idempotency key). One step under the state lock (then the in-flight lock, the
+    /// same order as [`Self::take_all_pending`]): each record is removed from `in_flight` and,
+    /// only if this call removed it, pushed onto `ready`, so a record is in exactly one place at
+    /// every moment. A record already claimed by the shutdown collection is skipped. Past
+    /// [`MAX_READY`] the removed records are returned as dropped (the caller records their gaps).
+    pub(crate) fn requeue_in_flight(&self, recs: Vec<Outgoing>) -> Vec<Outgoing> {
         let mut st = self.state.lock();
+        let mut flight = self.in_flight.lock();
         let mut dropped = Vec::new();
         for rec in recs.into_iter().rev() {
+            if flight.remove(&rec.idem).is_none() {
+                continue;
+            }
             if st.ready.len() >= MAX_READY {
                 dropped.push(rec);
             } else {
@@ -702,6 +714,12 @@ impl RefusalRecorder {
             }
         }
         dropped
+    }
+
+    /// Records currently in flight (taken by a drain, not yet sealed or gapped).
+    #[cfg(test)]
+    pub(crate) fn in_flight_len(&self) -> usize {
+        self.in_flight.lock().len()
     }
 
     /// Count one record sealed.
