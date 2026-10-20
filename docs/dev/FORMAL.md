@@ -50,7 +50,7 @@ named harness to be satisfiable). The scratch tree is reset after every run;
 | Job | When | What |
 |---|---|---|
 | `formal-fast` | every push and pull request, required by `ci-required` | kit unit tests, `check_claims.py`, fast-tier mutants |
-| `formal-nightly` | schedule and manual dispatch only | all mutants, including Kani and Lean ones; JSON report kept as an artifact for 90 days |
+| `formal-nightly` | schedule and manual dispatch only | all mutants, including Kani and Lean ones, in 4 parallel shards (`scripts/ci/shard_register.py` narrows each job's register to its shard; `formal-nightly-all` fails unless every shard passed); one JSON report per shard (`formal-full-report-shard-N`) kept as an artifact for 90 days |
 | `iana-snapshot-drift` | schedule and manual dispatch only | compares the committed IANA special-purpose registry CSV snapshots in `formal/vectors/` byte for byte with the live files (`formal/vectors/check-iana-drift.sh`) |
 
 The whole `ci` workflow also accepts `workflow_dispatch`, so `formal-nightly` and

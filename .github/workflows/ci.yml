@@ -156,11 +156,26 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
+  # The whole mutant set (--tier full runs fast and full tier mutants), split into 4 parallel shards
+  # because one job could not finish it: 248 mutants took 157 minutes (run 39117030526, 2026-10-18:
+  # 22 minutes of baselines for 73 detectors, then 135 minutes for the mutants, 0.54 minute each),
+  # and with the register at 365 mutants the single job was cancelled at its 180 minute limit
+  # (scheduled run 39243101077, 2026-10-19). scripts/ci/shard_register.py deals the mutants, grouped
+  # by detector so a proof's baseline is paid in few shards, deterministically from formal/claims.json
+  # (shard sizes 93, 92, 90, 90), and narrows the checkout's register to the shard. Each shard
+  # uploads its own JSON report.
   formal-nightly:
-    name: formal full-tier mutants (scheduled)
+    name: formal full-tier mutants (shard ${{ matrix.shard }} of 4)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    # 120: a shard holds about 92 mutants, so about 50 minutes of mutants at 0.54 minute each, plus
+    # its share of the baselines, the Kani install and a cold dependency build: an estimated 70
+    # minutes. 120 is about 1.7 times that. Re-measure from the first scheduled sharded run.
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target
       CARGO_PROFILE_DEV_DEBUG: "0"
@@ -192,17 +207,40 @@ jobs:
           test: false
           lint: false
           use-mathlib-cache: false
-      - name: all mutants must be killed
+      - name: narrow the register to this shard
+        run: |
+          python3 -I scripts/ci/shard_register.py --shards 4 --list | grep -v '^  '
+          python3 -I scripts/ci/shard_register.py --shards 4 --index ${{ matrix.shard }} --write
+          # The kit builds its scratch tree from HEAD and relocks the scratch claims after each
+          # mutant, so the narrowed register must be committed. This commit stays in the job's
+          # checkout and is never pushed.
+          git -c user.name=ci -c user.email=ci@invalid commit --quiet -am "ci: formal register narrowed to nightly shard ${{ matrix.shard }}"
+      - name: all mutants of this shard must be killed
         env:
           CARGO_INCREMENTAL: "1"
         run: python3 scripts/formal/check_mutants.py --tier full --timeout 1500 --cargo-target-dir "$CARGO_TARGET_DIR" --json formal-full.json
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
-          name: formal-full-report
+          name: formal-full-report-shard-${{ matrix.shard }}
           path: formal-full.json
           if-no-files-found: ignore
           retention-days: 90
+
+  # Fails unless every shard succeeded: a failed, cancelled or skipped shard is a failure here.
+  formal-nightly-all:
+    name: formal full-tier mutants (all shards)
+    if: always() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    needs: [formal-nightly]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: every shard passed
+        env:
+          RESULT: ${{ needs.formal-nightly.result }}
+        run: |
+          echo "formal-nightly shards: $RESULT"
+          [ "$RESULT" = "success" ]
 
   iana-snapshot-drift:
     name: IANA special-purpose registry snapshots match the live files (scheduled)
