@@ -9,7 +9,7 @@ The web interface offers:
 - Credential management (add, view, delete)
 - Role-based access control configuration
 - API key generation and management
-- Audit log viewing
+- An Audit Log page (a placeholder: it always shows an empty list)
 
 ## Starting the Web UI
 
@@ -40,15 +40,20 @@ Sessions expire after 24 hours of inactivity.
 
 Currently, to change the admin password:
 
-1. Delete the admin configuration:
+1. Delete `admin.json` from the config directory (next to `config.toml`), e.g. on Linux:
    ```bash
-   rm ~/.vultrino/admin.json
+   rm ~/.config/vultrino/admin.json
    ```
 
-2. Reinitialize:
+2. Reinitialize (`--force` is needed because `config.toml` exists; it also rewrites
+   `config.toml` with the defaults, so back it up first and restore your settings after):
    ```bash
-   vultrino init
+   vultrino init --force
    ```
+
+For headless deployments, instead set `VULTRINO_ADMIN_USERNAME` and
+`VULTRINO_ADMIN_PASSWORD_FILE` (or `VULTRINO_ADMIN_PASSWORD_HASH_FILE`); they are used
+only when no `admin.json` exists.
 
 ## Pages
 
@@ -58,7 +63,7 @@ The main dashboard displays:
 - Total credentials stored
 - Number of roles configured
 - Active API keys
-- Recent audit activity
+- A recent-requests count, currently always 0 (usage history is not shown in the UI)
 
 ### Credentials
 
@@ -111,29 +116,25 @@ The main dashboard displays:
 ### Audit Log
 
 **View** (`/audit`)
-- Recent credential usage events
-- Shows timestamp, action, credential used
-- IP address and user agent when available
+- Placeholder page: it always renders an empty list
+- For usage and admin-change history use the event outbox (`GET /api/v1/events`) and the server logs
 
 ## Configuration
 
 ### Session Settings
 
-Configure in `config.toml`:
-
-```toml
-[web]
-session_timeout = 86400  # 24 hours in seconds
-cookie_secure = true     # Require HTTPS for cookies
-```
+There is no `[web]` section. Sessions expire after 24 hours of inactivity, which is not
+configurable. The session cookie is always HttpOnly and SameSite=Strict; it is marked
+Secure, and HSTS is sent, only when `[server] mode = "server"` (which assumes a
+TLS-terminating reverse proxy in front).
 
 ### Binding
 
-For production, always bind to localhost and use a reverse proxy:
+For production, bind to localhost and use a reverse proxy. The address is set on the
+command line (default `127.0.0.1:7879`):
 
-```toml
-[web]
-bind = "127.0.0.1:7879"
+```bash
+vultrino web --bind 127.0.0.1:7879
 ```
 
 ## Security Considerations
@@ -215,12 +216,12 @@ Login attempts are rate-limited to prevent brute force attacks.
 ### "Invalid credentials" error
 
 - Verify username and password match those set during `vultrino init`
-- Check that admin.json exists in the data directory
+- Check that `admin.json` exists in the config directory (next to `config.toml`), or that the `VULTRINO_ADMIN_*` variables are set
 
 ### Session expires immediately
 
 - Ensure cookies are enabled in your browser
-- If using HTTPS, verify `cookie_secure` matches your setup
+- The session cookie is marked Secure only when `[server] mode = "server"`; in that mode, reach the UI over HTTPS through the reverse proxy
 
 ### Cannot access from external machine
 

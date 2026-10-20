@@ -53,5 +53,6 @@ When a gated action opens an [approval](./action-approvals.md), the approval is 
 
 Where this is wired today:
 
-- **Admin metrics** (`GET /api/v1/metrics`) scopes its approval counts to the **calling admin key's `tenant`** (and echoes the `tenant_scope` it applied) — so a tenant-scoped admin key sees only its own (+ shared) approvals in the read-back.
-- **The web admin panel is a global console** (the session admin carries no tenant): it lists and decides across all tenants. Per-tenant *decision* scoping is therefore an API concern — the `visible_to_tenant` primitive is the gate a tenant-scoped decision endpoint uses; the panel itself is intentionally global.
+- **Admin metrics** (`GET /api/v1/metrics`) scopes its approval counts to the **calling admin key's `tenant`** (and echoes the `tenant_scope` it applied), so a tenant-scoped admin key sees only its own (+ shared) approvals in the read-back.
+- **The approvals JSON API** (`GET /api/v1/approvals` and `POST /api/v1/approvals/{id}/decision`) is partitioned by the calling admin key's tenant and refuses a global (untenanted) admin key with `403`. The delegate-decision route applies the partition with the tenant of the `vap_` approval token.
+- **The web admin panel is a global console** (the session admin carries no tenant): it lists and decides across all tenants.

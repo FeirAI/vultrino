@@ -25,9 +25,14 @@ The `web` process serves the JSON API (`/api/v1/…`), the connector routes
 
 ```bash
 export VULTRINO_PASSWORD="your-password"
+export VULTRINO_POLICY_HASH_SECRET="a-stable-random-secret"
 vultrino web
 # Access at http://127.0.0.1:7879
 ```
+
+`vultrino web` refuses to start without `VULTRINO_POLICY_HASH_SECRET` (keep it the
+same across restarts); set it in the Quick Setup, launchd and systemd examples on
+this page too.
 
 ### MCP Server Only
 
@@ -38,8 +43,8 @@ export VULTRINO_PASSWORD="your-password"
 vultrino mcp   # equivalently: vultrino serve --mcp
 ```
 
-> `vultrino serve` on its own does **not** start an API server (it's a stub that
-> redirects you to `vultrino web`). Use `vultrino web` for HTTP.
+> `vultrino serve` without `--mcp` does **not** start an API server: it exits with an
+> error that points you to `vultrino web`. Use `vultrino web` for HTTP.
 
 ## Configuration for Local Use
 
@@ -134,9 +139,8 @@ systemctl --user start vultrino-web
 
 ## Tips
 
-1. **Store password in keychain** — Use OS keychain to avoid plaintext passwords
-2. **Use aliases** — Add `alias vreq='vultrino request'` to your shell
-3. **Tab completion** — Generate with `vultrino completions bash > /etc/bash_completion.d/vultrino`
+1. **Keep the password in a file**: prefer `VULTRINO_PASSWORD_FILE` (a file only you can read, mode 600) over an inline `VULTRINO_PASSWORD`; there is no OS keychain support
+2. **Use aliases**: add `alias vreq='vultrino request'` to your shell
 
 ## Troubleshooting
 

@@ -11,9 +11,12 @@ vultrino init
 ```
 
 You'll be prompted to:
-1. Set a **storage password** (encrypts your credentials at rest)
-2. Create an **admin username** for the web UI
-3. Set an **admin password** for the web UI
+1. Create an **admin username** for the web UI (default `admin`)
+2. Set and confirm an **admin password** for the web UI (at least 4 characters)
+
+`init` does not ask for a storage password. The vault is created on first use, and
+you are prompted for its password then unless `VULTRINO_PASSWORD` (or
+`VULTRINO_PASSWORD_FILE`) is set.
 
 > **Tip:** Set the `VULTRINO_PASSWORD` environment variable to avoid password prompts:
 > ```bash
@@ -51,6 +54,15 @@ my-service           basic_auth      e5f6g7h8-...                        -
 
 Use the `request` command to make API calls with your stored credentials:
 
+> **Note:** the config written by `vultrino init` is default-deny and turns on strict
+> capability enforcement (`require_declared_capabilities = true`), so on a fresh
+> install this request is refused. It needs an allow policy for the credential (see
+> [Policy Configuration](./configuration.md#policy-configuration)) and a stored
+> capability declaration for the action. For quick local CLI use only,
+> `[enforcement] default_action = "allow"` (fail-open) and
+> `require_declared_capabilities = false` remove both checks; `vultrino web` always
+> requires declared capabilities.
+
 ```bash
 vultrino request github-api https://api.github.com/user
 ```
@@ -62,8 +74,12 @@ The credential is automatically injected — you never need to expose the actual
 Launch the admin dashboard:
 
 ```bash
+export VULTRINO_POLICY_HASH_SECRET="a-stable-random-secret"
 vultrino web
 ```
+
+`vultrino web` refuses to start unless `VULTRINO_POLICY_HASH_SECRET` is set. Use a
+random value and keep it the same across restarts (step 7 needs it too).
 
 Open http://127.0.0.1:7879 and log in with your admin credentials.
 

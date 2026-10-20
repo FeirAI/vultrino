@@ -163,7 +163,7 @@ Authorization: Bearer <vultrino-api-key>
 
 ### Environment Variables
 - `VULTRINO_PASSWORD` — Storage encryption password (required)
-- `VULTRINO_CONFIG` — Config file path
+- `VULTRINO_POLICY_HASH_SECRET`: required by `vultrino web` (a stable random secret). There is no `VULTRINO_CONFIG`; use `--config <path>`
 - `RUST_LOG` — Log level
 
 ### Default Ports
@@ -180,7 +180,7 @@ Authorization: Bearer <vultrino-api-key>
 2. **Aliases only** — Raw credential fields are absent from the LLM-facing schema
 3. **RBAC** — Role-based access control via API keys
 4. **Policies** — URL/method restrictions
-5. **Audit logging** — Track all usage
+5. **Usage events**: credential use and admin changes are recorded in the event outbox and structured logs (no audit log file)
 
 ## API Key Authentication
 

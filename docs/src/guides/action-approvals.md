@@ -7,7 +7,7 @@ Some actions are too consequential to let an agent run unsupervised — a produc
 An action is gated if **any** of these match:
 
 - The credential is flagged: `vultrino meta set <alias> require_approval true`
-- The request is authorized by a [use token](./use-tokens.md) created with `--require-approval`
+- The request is a write (any HTTP method other than `GET` or `HEAD`, or an action with no HTTP verb) authorized by a [use token](./use-tokens.md) created with `--require-approval`
 - A [policy](./policies.md) rule matches with `action = "prompt"`
 
 ## What the agent experiences
@@ -36,7 +36,7 @@ approval_preview:
     - { label: "Memo",   path: body.memo, format: text }   # wrapped block (a body)
 ```
 
-- **`path`** is a dot-path into the tool's call params — `body.to` reads `params["body"]["to"]`. Only scalar leaves (string / number / bool) are shown; objects, arrays, and missing keys are skipped, and arrays are never indexed into.
+- **`path`** is a dot-path into the tool's call params: `body.to` reads `params["body"]["to"]`. Only scalar leaves (string / number / bool) are shown; a path that ends at an object or array, or a missing key, is skipped. A path segment may be a non-negative array index (for example `body.items.0.name`).
 - **`format`** is `text` for a wrapped block (a message body, a reason) or omitted / `inline` for a one-line value. Fields render in the order listed.
 - Omit the block entirely and the approval falls back to its one-line summary — no change from today.
 
@@ -45,6 +45,8 @@ approval_preview:
 No code changes are needed to give a new action type its detail view: declaring the fields is the whole job. See `PreviewFieldSpec` / `extract_preview` in `src/capability/mod.rs`.
 
 ## Configuration
+
+Approvals are off unless `enabled = true` is set or a notifier section (`[approvals.telegram]` or `[approvals.webhook]`) is present. While they are off, an action that needs approval is refused with a `400` instead of being held for a human (Vultrino logs a warning at startup). A `dual_control_approvers` value below 2 is treated as 2.
 
 Enable approvals and configure out-of-band notifiers under `[approvals]` in `config.toml`:
 

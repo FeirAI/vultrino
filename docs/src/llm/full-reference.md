@@ -18,7 +18,7 @@ Vultrino is a credential proxy for the AI era. It allows AI agents and applicati
 
 Lists all credentials you have access to.
 
-**Input:** None required
+**Input:** `api_key` (required), `pattern` (optional)
 
 **Output:**
 ```json
@@ -265,7 +265,7 @@ Parse it according to the content-type:
 
 1. **Never ask for actual secrets** - only use aliases
 2. **Credential payload fields are absent** - listing endpoints return metadata
-3. **All requests are logged** - audit trail exists
+3. **Usage is recorded as events** - there is no audit log file
 4. **Policies may restrict access** - some URLs/methods may be blocked
 5. **Scopes limit visibility** - you may not see all credentials
 
@@ -276,7 +276,7 @@ Parse it according to the content-type:
 | Variable | Purpose |
 |----------|---------|
 | VULTRINO_PASSWORD | Decryption password (required) |
-| VULTRINO_CONFIG | Config file path |
+| VULTRINO_POLICY_HASH_SECRET | Required by `vultrino web` (there is no VULTRINO_CONFIG; use `--config <path>`) |
 | RUST_LOG | Log level |
 
 | Port | Service |

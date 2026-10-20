@@ -23,7 +23,7 @@ The plaintext token is shown **once** at creation. Vultrino stores only a hash, 
 | `--action <glob>` | Restrict to a single action (`http.request`) or a plugin glob (`postgres.*`). Omit for any action. |
 | `--uses <N>` | Cap total executions. `--uses 1` is single-use; omit for unlimited. |
 | `--expires <dur>` | Time window: `30m`, `24h`, `7d`. Omit for no expiry. |
-| `--require-approval` | Gate **every** use behind a human decision — see [Action Approvals](./action-approvals.md). |
+| `--require-approval` | Gate every write behind a human decision: any HTTP method other than `GET` or `HEAD`, and any action with no HTTP verb (ssh, postgres). `GET` and `HEAD` are not gated by this flag (a credential flag, a policy `prompt` rule or a dual-control token still gates them). See [Action Approvals](./action-approvals.md). |
 
 Both scopes are enforced **authoritatively in the server** at execution time, not just at the edge — a token narrowed to `github-*` / `http.request` is rejected for any other credential or action even if a caller tries to use it directly.
 
@@ -60,4 +60,4 @@ Tokens are also listed and revocable in the **Use Tokens** page of the web admin
 
 ## Relationship to approvals
 
-Add `--require-approval` to make a token's every use pause for a human. The use is **not** consumed when the approval is opened — only when the approved action actually runs. A use token's *pending* approvals are bounded so it can never open more outstanding approvals than it has remaining capacity (`uses + pending ≤ max_uses`). See [Action Approvals](./action-approvals.md).
+Add `--require-approval` to make a token's writes pause for a human (`GET` and `HEAD` requests are not gated by this flag). The use is consumed when the approval is opened, not when the approved action runs: a denial, an expiry or a later failure does not give it back, so a `--uses 1` token can open at most one approval. Approved execution does not consume or depend on the bearer token again. See [Action Approvals](./action-approvals.md).
