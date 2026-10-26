@@ -61,7 +61,11 @@ ring = "0.17"
 
 # WASM runtime for plugins (optional so Kani 0.67's rustc 1.93 can verify
 # pure-kernel harnesses without pulling wasmtime's rustc-1.96 MSRV).
-wasmtime = { version = "49.0.3", optional = true }
+# default-features = false drops only the "cache" feature (wasmtime-internal-cache,
+# which pulls zstd 0.13 / zstd-safe 7: RUSTSEC-2026-0391/0398/0403). vultrino never
+# configures wasmtime's compilation cache. Every other wasmtime 49 default feature
+# is listed explicitly so nothing else changes; re-sync on wasmtime upgrades.
+wasmtime = { version = "49.0.3", optional = true, default-features = false, features = ["anyhow", "async", "backtrace", "gc", "gc-copying", "gc-drc", "gc-null", "wat", "profiling", "parallel-compilation", "cranelift", "pooling-allocator", "demangle", "addr2line", "coredump", "debug-builtins", "runtime", "component-model", "component-model-async", "threads", "stack-switching", "std", "debug", "compile-time-builtins", "wit-parser"] }
 wasmtime-wasi = { version = "49.0.3", optional = true }
 
 # OS integration (for future keychain support)
