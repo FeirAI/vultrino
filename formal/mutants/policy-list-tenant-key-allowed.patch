@@ -1,0 +1,15 @@
+diff --git a/src/web/api.rs b/src/web/api.rs
+index fd74e4c..56a3e34 100644
+--- a/src/web/api.rs
++++ b/src/web/api.rs
+@@ -2527,9 +2527,7 @@ impl PolicyListItem {
+ /// Operator-only: policies carry no tenant field, so a tenant-scoped key (admin or
+ /// read-only) is refused 403 `operator_key_required` before the engine is read.
+ pub async fn api_list_policies(read: ReadApiAuth, State(state): State<AppState>) -> Response {
+-    if let Err(resp) = require_global_reader(&read).await {
+-        return resp;
+-    }
++    let _ = &read;
+     let mut policies = state.server.policy_engine().list_policies();
+     policies.sort_by(|a, b| a.id.cmp(&b.id));
+     let secret = state.config.policy_hash_secret.as_deref();

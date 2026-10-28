@@ -152,9 +152,9 @@ vultrino key create annual-key --role executor --expires 365d
 vultrino key list
 
 # Output:
-# Prefix      Name         Role          Expires        Last Used
-# vk_a1b2... my-app       executor      never          2024-01-15
-# vk_x9y8... temp-access  readonly      2024-02-14     2024-01-16
+# Name         Key prefix   Role        Tenant     Expires      Last Used
+# my-app       vk_a1b2...   executor    <global>   Never        2024-01-15 09:30
+# temp-access  vk_x9y8...   readonly    <global>   2024-02-14   2024-01-16 11:02
 ```
 
 ### Revoke Key

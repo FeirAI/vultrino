@@ -1,0 +1,15 @@
+diff --git a/src/web/api.rs b/src/web/api.rs
+index fd74e4c..db8c223 100644
+--- a/src/web/api.rs
++++ b/src/web/api.rs
+@@ -3782,9 +3782,7 @@ pub async fn api_unhalt_agent(
+ /// (per-process and in-memory, like the rate-limit counters). Operator-only: a
+ /// session entry carries no tenant, so a tenant-scoped key is refused 403.
+ pub async fn api_list_sessions(admin: AdminApiAuth, State(state): State<AppState>) -> Response {
+-    if let Err(resp) = require_global_admin(&admin).await {
+-        return resp;
+-    }
++    let _ = &admin;
+     let sessions = state.server.sessions().list();
+     (
+         StatusCode::OK,

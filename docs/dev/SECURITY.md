@@ -85,12 +85,18 @@ upstream.
    **tenant-scoped** (`tenant == Some(t)`; e.g. a product aggregator like
    feir-os). Capability writes
    (`POST`, `PUT` and `DELETE /api/v1/capabilities`) are operator-only: a tenant-scoped
-   key gets `403 operator_key_required`. The list routes are not partitioned:
-   `GET /api/v1/capabilities` and `GET /api/v1/sessions` list every
-   tenant's entries; `GET /api/v1/tokens` and `GET /api/v1/policies` need only `read` and are not tenant-filtered either (so the policy read is not operator-only). Treat a tenant-scoped admin key as operator-trusted for those
-   read routes. The partitioned surfaces are:
-   - **Operator-only surfaces** — resources with no tenant field (policy CRUD,
-     capability writes, role CRUD, the shared signed event outbox: list/dead-letters/replay) and the
+   key gets `403 operator_key_required`. Of the list routes, `GET /api/v1/tokens`
+   returns a tenant-scoped key only the tokens tagged with exactly its own tenant
+   (untenanted tokens are not listed), and `GET /api/v1/policies`,
+   `GET /api/v1/capabilities` and `GET /api/v1/sessions` are operator-only (the
+   policy and token lists need only `read`, and the same rules apply to a
+   tenant-scoped read-only key). **Known gap:** `GET /api/v1/credentials` is filtered
+   by the key's role credential scopes, not by tenant, so a tenant-scoped key can
+   still list other tenants' credential aliases, descriptions and bindings that its
+   role scope matches. Treat a tenant-scoped key as operator-trusted for that read
+   route. The partitioned surfaces are:
+   - **Operator-only surfaces** - resources with no tenant field (policy CRUD and
+     list, capability writes and list, role CRUD, the session list, the shared signed event outbox: list/dead-letters/replay) and the
      label-addressed kill switch (agent `halt`/`unhalt`) — reject a tenant-scoped
      key with `403 operator_key_required`. They require the global operator key.
    - **Tenant-scoped surfaces** — resources that carry a tenant (use-token revoke,
@@ -101,6 +107,10 @@ upstream.
      re-checked **under the storage lock** (no read-then-act TOCTOU). A use token's
      `tenant` resolves to that tenant's principal at execution, so cross-tenant mint
      is blocked to prevent cross-tenant credential access.
+   - **Tenant-filtered listing** - `GET /api/v1/tokens` returns only tokens whose
+     tenant equals the key's tenant. This is stricter than the write rule above: a
+     tenant-scoped key can still revoke an untenanted token by id but does not see
+     it in the list. The tenant comes only from the authenticated key.
    - The **global operator key is unrestricted** (govder's cross-plane kill/revoke
      and the operator console depend on this). The tenant partition is the same
      `tenant_may_act` primitive the approvals JSON API uses.

@@ -1,0 +1,15 @@
+diff --git a/src/web/api.rs b/src/web/api.rs
+index fd74e4c..1a00d59 100644
+--- a/src/web/api.rs
++++ b/src/web/api.rs
+@@ -2819,9 +2819,7 @@ pub async fn api_put_capability(
+ /// Operator-only: the catalog is shared and carries no tenant field, so a
+ /// tenant-scoped key is refused 403 (same gate as the capability writes).
+ pub async fn api_list_capabilities(admin: AdminApiAuth, State(state): State<AppState>) -> Response {
+-    if let Err(resp) = require_global_admin(&admin).await {
+-        return resp;
+-    }
++    let _ = &admin;
+     match state.storage.list_capabilities().await {
+         Ok(mut caps) => {
+             caps.sort_by(|a, b| a.tool_name.cmp(&b.tool_name));

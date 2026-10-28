@@ -1,0 +1,13 @@
+diff --git a/src/web/api.rs b/src/web/api.rs
+index fd74e4c..8046c30 100644
+--- a/src/web/api.rs
++++ b/src/web/api.rs
+@@ -2927,7 +2927,7 @@ pub async fn api_list_tokens(read: ReadApiAuth, State(state): State<AppState>) -
+     match state.storage.list_use_tokens().await {
+         Ok(mut tokens) => {
+             let acting = read.0.api_key.tenant.as_deref();
+-            tokens.retain(|t| tenant_owns(acting, t.tenant.as_deref()));
++            tokens.retain(|t| acting.is_none() || t.tenant.is_none() || t.tenant.as_deref() == acting);
+             tokens.sort_by(|a, b| a.id.cmp(&b.id));
+             let metadata: Vec<UseTokenMetadata> =
+                 tokens.iter().map(UseTokenMetadata::from).collect();
