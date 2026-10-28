@@ -2575,10 +2575,10 @@ async fn list_api_keys(config: Config, format: String) -> Result<(), Box<dyn std
         }
         _ => {
             println!(
-                "{:<20} {:<12} {:<20} {:<20} LAST USED",
-                "NAME", "KEY PREFIX", "ROLE", "EXPIRES"
+                "{:<20} {:<12} {:<20} {:<16} {:<20} LAST USED",
+                "NAME", "KEY PREFIX", "ROLE", "TENANT", "EXPIRES"
             );
-            println!("{}", "-".repeat(90));
+            println!("{}", "-".repeat(106));
             for key in keys {
                 let role_name = auth_manager
                     .get_role(&key.role_id)
@@ -2593,11 +2593,13 @@ async fn list_api_keys(config: Config, format: String) -> Result<(), Box<dyn std
                     .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
                     .unwrap_or_else(|| "Never".to_string());
 
+                let tenant = key.tenant.as_deref().unwrap_or("<global>");
                 println!(
-                    "{:<20} {:<12} {:<20} {:<20} {}",
+                    "{:<20} {:<12} {:<20} {:<16} {:<20} {}",
                     key.name,
                     format!("{}...", key.key_prefix),
                     role_name,
+                    tenant,
                     expires,
                     last_used
                 );
