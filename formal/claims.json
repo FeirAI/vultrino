@@ -489,6 +489,26 @@
       "tier": "full",
       "claim": "posture-report-live"
     },
+    "token-list-tenant-filter-dropped": {
+      "tier": "fast",
+      "claim": "tenant-key-reads-partitioned"
+    },
+    "token-list-admits-untenanted": {
+      "tier": "fast",
+      "claim": "tenant-key-reads-partitioned"
+    },
+    "policy-list-tenant-key-allowed": {
+      "tier": "fast",
+      "claim": "tenant-key-reads-partitioned"
+    },
+    "capability-list-tenant-key-allowed": {
+      "tier": "fast",
+      "claim": "tenant-key-reads-partitioned"
+    },
+    "session-list-tenant-key-allowed": {
+      "tier": "fast",
+      "claim": "tenant-key-reads-partitioned"
+    },
     "capability-put-tenant-key-allowed": {
       "tier": "fast",
       "claim": "capability-writes-operator-only"
@@ -5784,7 +5804,7 @@
     },
     {
       "id": "capability-writes-operator-only",
-      "statement": "POST /api/v1/capabilities, PUT /api/v1/capabilities/{id} and DELETE /api/v1/capabilities/{id} answer only to a global (untenanted) admin key: a tenant-scoped admin key gets 403 operator_key_required before any read, write or idempotency lookup, so the capability catalog is unchanged afterwards (nothing created, replaced or deleted), a tenant key cannot replay a 2xx cached under an Idempotency-Key a global key used, a global key still succeeds on all three, and the GET list is still served to a tenant-scoped key.",
+      "statement": "POST /api/v1/capabilities, PUT /api/v1/capabilities/{id} and DELETE /api/v1/capabilities/{id} answer only to a global (untenanted) admin key: a tenant-scoped admin key gets 403 operator_key_required before any read, write or idempotency lookup, so the capability catalog is unchanged afterwards (nothing created, replaced or deleted), a tenant key cannot replay a 2xx cached under an Idempotency-Key a global key used, and a global key still succeeds on all three.",
       "method": "test",
       "artifacts": [
         "src/web/api.rs",
@@ -5816,7 +5836,55 @@
         "capability-post-tenant-key-allowed",
         "capability-delete-tenant-key-allowed"
       ],
-      "does_not_establish": "That the GET capability list is tenant-filtered: it is not, a tenant-scoped key sees the whole shared catalog. That any other route is operator-only (each carries its own gate). That a global key is held only by operators: who holds one is deployment configuration. The detector drives an in-memory test router, not a deployed binary. The capability body is not validated by this claim, only who may write it."
+      "does_not_establish": "The GET capability list (see tenant-key-reads-partitioned). That any other route is operator-only (each carries its own gate). That a global key is held only by operators: who holds one is deployment configuration. The detector drives an in-memory test router, not a deployed binary. The capability body is not validated by this claim, only who may write it."
+    },
+    {
+      "id": "tenant-key-reads-partitioned",
+      "statement": "GET /api/v1/tokens returns a tenant-scoped key (admin or read-only) only the use tokens tagged with exactly its own tenant: another tenant's tokens and untenanted tokens are absent from the body, and a tenant with no tokens gets 200 with an empty list. GET /api/v1/policies, GET /api/v1/capabilities and GET /api/v1/sessions answer a tenant-scoped key 403 operator_key_required with a fixed error body that lists no entry. A global key (admin or read-only) still gets every token, and the full policy, capability and session lists.",
+      "method": "test",
+      "artifacts": [
+        "src/web/api.rs",
+        "tests/web_smoke.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --test web_smoke -- --exact tenant_key_token_list_is_partitioned tenant_key_policy_list_is_operator_only tenant_key_capability_list_is_operator_only tenant_key_session_list_is_operator_only",
+      "covers": [
+        {
+          "path": "src/web/api.rs",
+          "symbol": "api_list_tokens",
+          "sha256": "8b21fd4e6c8bb2ce7245f2efa8e19d849d1afb46b035f1c9b66dbbb9a210df61"
+        },
+        {
+          "path": "src/web/api.rs",
+          "symbol": "api_list_policies",
+          "sha256": "5304d10d542b3dc223254224fcd8f32e006eb40aa00f5ad60442ab8bac153c03"
+        },
+        {
+          "path": "src/web/api.rs",
+          "symbol": "api_list_capabilities",
+          "sha256": "1567aea7fb6e25b5b0d13327bf01ca76dc6632061ad7a6a1cb33121336b98ae2"
+        },
+        {
+          "path": "src/web/api.rs",
+          "symbol": "api_list_sessions",
+          "sha256": "c1015a640b733212c20d8f6d8b0d2a34f605ad0c5b411ebbd69dee616a0d7bdc"
+        },
+        {
+          "path": "src/web/api.rs",
+          "symbol": "require_global_reader",
+          "sha256": "d6d2b591b14a50c9c3e923669def9e420e5e5dae4f1342a4a2ed1ad254a2da6e"
+        }
+      ],
+      "mutants": [
+        "token-list-tenant-filter-dropped",
+        "token-list-admits-untenanted",
+        "policy-list-tenant-key-allowed",
+        "capability-list-tenant-key-allowed",
+        "session-list-tenant-key-allowed"
+      ],
+      "does_not_establish": "That GET /api/v1/credentials or any other route is tenant-partitioned: the credentials list is filtered by role credential scopes, not by tenant. That keys and tokens carry the right tenant: that is provisioning. The HTML console and MCP tools/list. That the list routes are the only way to read this data. That a global key is held only by operators: who holds one is deployment configuration. The detector drives an in-memory test router, not a deployed binary."
     }
   ]
 }

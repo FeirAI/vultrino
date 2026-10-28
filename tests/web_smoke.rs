@@ -9552,8 +9552,8 @@ async fn capabilities_snapshot(storage: &Arc<dyn StorageBackend>) -> serde_json:
 
 /// Capabilities carry no tenant (a shared enforcement catalog), so POST/PUT/DELETE are
 /// operator-only: a tenant-scoped admin key gets 403 `operator_key_required` and the
-/// catalog is unchanged; a global key still succeeds; the GET list stays open to the
-/// tenant key.
+/// catalog is unchanged; a global key still succeeds; the GET list is refused to the
+/// tenant key as well.
 #[tokio::test]
 async fn capability_writes_refuse_a_tenant_scoped_key() {
     let (router, storage, global, tenant) = build_global_and_tenant_admin_router("team-a").await;
@@ -9636,7 +9636,8 @@ async fn capability_writes_refuse_a_tenant_scoped_key() {
         .unwrap()
         .is_some());
 
-    // GET list is still served to the tenant-scoped key.
+    // The GET list is operator-only too (see
+    // `tenant_key_capability_list_is_operator_only`).
     let resp = router
         .clone()
         .oneshot(admin_req(
@@ -9647,7 +9648,7 @@ async fn capability_writes_refuse_a_tenant_scoped_key() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
+    assert_refused(resp).await;
 
     // A global key still succeeds on all three.
     let resp = router
@@ -9757,4 +9758,269 @@ async fn capability_write_idempotency_replay_cannot_bypass_the_operator_gate() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+// ---------------------------------------------------------------------------
+// Tenant partition of the read-gated list routes (feir-ops#17).
+// ---------------------------------------------------------------------------
+
+/// Plaintext keys of the multi-tenant read router.
+struct MtKeys {
+    global_admin: String,
+    global_read: String,
+    a_admin: String,
+    a_read: String,
+    b_admin: String,
+    c_admin: String,
+}
+
+/// One store and one exec server behind a router holding a global admin key, a
+/// global read-only key, team-a admin and read-only keys, a team-b admin key and a
+/// team-c admin key (a tenant with no data).
+async fn build_multi_tenant_read_router() -> (
+    axum::Router,
+    Arc<dyn StorageBackend>,
+    Arc<vultrino::server::VultrinoServer>,
+    MtKeys,
+) {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("store.enc");
+    std::mem::forget(dir);
+    let password = SecretString::from("test-password");
+    let storage: Arc<dyn StorageBackend> =
+        Arc::new(FileStorage::new(&path, &password).await.unwrap());
+    let seed = AuthManager::new();
+    let mut keys = Vec::new();
+    let mut mint = |name: &str, role: &str, tenant: Option<&str>| {
+        let (plain, mut k) = seed.create_api_key(name, role, None).unwrap();
+        k.tenant = tenant.map(|t| t.to_string());
+        keys.push(k);
+        plain
+    };
+    let ro = vultrino::auth::ROLE_READ_ONLY;
+    let mt = MtKeys {
+        global_admin: mint("op", "admin", None),
+        global_read: mint("op-ro", ro, None),
+        a_admin: mint("a-admin", "admin", Some("team-a")),
+        a_read: mint("a-ro", ro, Some("team-a")),
+        b_admin: mint("b-admin", "admin", Some("team-b")),
+        c_admin: mint("c-admin", "admin", Some("team-c")),
+    };
+    let auth_manager = AuthManager::from_data(seed.list_roles(), keys.clone());
+    for k in &keys {
+        storage.store_api_key(k).await.unwrap();
+    }
+    let admin = AdminAuth::new("admin", "password123").unwrap();
+    let resolver = vultrino::router::CredentialResolver::new(storage.clone());
+    let exec_server = Arc::new(vultrino::server::VultrinoServer::new(
+        Config::default(),
+        storage.clone(),
+        resolver,
+    ));
+    let router = WebServer::new(
+        WebConfig {
+            bind: "127.0.0.1:0".to_string(),
+            enabled: true,
+        },
+        Config::default(),
+        storage.clone(),
+        auth_manager,
+        admin,
+        exec_server.clone(),
+    )
+    .into_router();
+    (router, storage, exec_server, mt)
+}
+
+/// GET `uri` with `key`; returns (status, raw body).
+async fn mt_get(router: &axum::Router, uri: &str, key: &str) -> (StatusCode, String) {
+    let resp = router
+        .clone()
+        .oneshot(admin_req("GET", uri, key, serde_json::json!({})))
+        .await
+        .unwrap();
+    let status = resp.status();
+    (status, body_string(resp).await)
+}
+
+fn token_ids(body: &str) -> Vec<String> {
+    let v: serde_json::Value = serde_json::from_str(body).unwrap();
+    let mut ids: Vec<String> = v["tokens"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["id"].as_str().unwrap().to_string())
+        .collect();
+    ids.sort();
+    ids
+}
+
+fn sorted(mut v: Vec<String>) -> Vec<String> {
+    v.sort();
+    v
+}
+
+/// The refusal body is the fixed error object and carries no entries.
+fn assert_operator_refusal(status: StatusCode, body: &str, absent: &[&str]) {
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let v: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert_eq!(v["code"], "operator_key_required", "{body}");
+    for k in ["tokens", "policies", "capabilities", "sessions"] {
+        assert!(v.get(k).is_none(), "refusal must carry no `{k}`: {body}");
+    }
+    for needle in absent {
+        assert!(!body.contains(needle), "refusal leaked {needle}: {body}");
+    }
+}
+
+#[tokio::test]
+async fn tenant_key_token_list_is_partitioned() {
+    let (router, storage, _server, k) = build_multi_tenant_read_router().await;
+    let a1 = store_tenant_use_token(&storage, "a1-name", "agent-a1", Some("team-a")).await;
+    let a2 = store_tenant_use_token(&storage, "a2-name", "agent-a2", Some("team-a")).await;
+    let b1 = store_tenant_use_token(&storage, "b1-name", "agent-b1-secret", Some("team-b")).await;
+    let u1 = store_tenant_use_token(&storage, "u1-name", "agent-u1-secret", None).await;
+    let own_a = sorted(vec![a1.clone(), a2.clone()]);
+
+    // team-a admin and team-a read-only see exactly their own tenant's tokens.
+    for key in [&k.a_admin, &k.a_read] {
+        let (status, body) = mt_get(&router, "/api/v1/tokens", key).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(token_ids(&body), own_a, "{body}");
+        for leak in [
+            b1.as_str(),
+            u1.as_str(),
+            "b1-name",
+            "agent-b1-secret",
+            "u1-name",
+            "agent-u1-secret",
+        ] {
+            assert!(!body.contains(leak), "leaked {leak}: {body}");
+        }
+    }
+
+    // team-b sees only its own token.
+    let (status, body) = mt_get(&router, "/api/v1/tokens", &k.b_admin).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(token_ids(&body), vec![b1.clone()]);
+    assert!(!body.contains(&a1) && !body.contains(&u1), "{body}");
+
+    // A tenant with no tokens gets 200 with an empty list, never 404.
+    let (status, body) = mt_get(&router, "/api/v1/tokens", &k.c_admin).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["tokens"], serde_json::json!([]), "{body}");
+
+    // Global keys (admin and read-only) still see everything.
+    let all = sorted(vec![a1, a2, b1, u1]);
+    for key in [&k.global_admin, &k.global_read] {
+        let (status, body) = mt_get(&router, "/api/v1/tokens", key).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(token_ids(&body), all, "{body}");
+    }
+}
+
+#[tokio::test]
+async fn tenant_key_policy_list_is_operator_only() {
+    let (router, _storage, _server, k) = build_multi_tenant_read_router().await;
+    let resp = router
+        .clone()
+        .oneshot(admin_req(
+            "POST",
+            "/api/v1/policies",
+            &k.global_admin,
+            serde_json::json!({"name":"mt-allow-gh","credential_pattern":"github-*","default_action":"allow"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let created: serde_json::Value = serde_json::from_str(&body_string(resp).await).unwrap();
+    let id = created["id"].as_str().unwrap().to_string();
+
+    for key in [&k.a_admin, &k.a_read, &k.c_admin] {
+        let (status, body) = mt_get(&router, "/api/v1/policies", key).await;
+        assert_operator_refusal(status, &body, &[&id, "mt-allow-gh"]);
+    }
+    for key in [&k.global_admin, &k.global_read] {
+        let (status, body) = mt_get(&router, "/api/v1/policies", key).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(
+            v["policies"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| p["id"] == id.as_str()),
+            "{body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn tenant_key_capability_list_is_operator_only() {
+    let (router, _storage, _server, k) = build_multi_tenant_read_router().await;
+    for (id, tool, cred) in [
+        ("cap-mt-1", "tool_mt_one", "cred-mt-one"),
+        ("cap-mt-2", "tool_mt_two", "cred-mt-two"),
+    ] {
+        let resp = router
+            .clone()
+            .oneshot(admin_req(
+                "PUT",
+                &format!("/api/v1/capabilities/{id}"),
+                &k.global_admin,
+                capability_body(tool, cred),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+    for key in [&k.a_admin, &k.b_admin, &k.c_admin] {
+        let (status, body) = mt_get(&router, "/api/v1/capabilities", key).await;
+        assert_operator_refusal(
+            status,
+            &body,
+            &[
+                "tool_mt_one",
+                "tool_mt_two",
+                "cred-mt-one",
+                "cred-mt-two",
+                "api.example.test",
+            ],
+        );
+    }
+    let (status, body) = mt_get(&router, "/api/v1/capabilities", &k.global_admin).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.contains("tool_mt_one") && body.contains("tool_mt_two"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn tenant_key_session_list_is_operator_only() {
+    let (router, _storage, server, k) = build_multi_tenant_read_router().await;
+    let _inflight = server.sessions().begin(vultrino::session::SessionEntry {
+        session_id: "sess-mt-1".to_string(),
+        agent_label: Some("agent-mt-distinct".to_string()),
+        principal_id: None,
+        token_id: None,
+        credential: "cred-mt-session".to_string(),
+        action: "mock.echo".to_string(),
+        started_at: chrono::Utc::now(),
+    });
+    for key in [&k.a_admin, &k.b_admin, &k.c_admin] {
+        let (status, body) = mt_get(&router, "/api/v1/sessions", key).await;
+        assert_operator_refusal(
+            status,
+            &body,
+            &["sess-mt-1", "agent-mt-distinct", "cred-mt-session"],
+        );
+    }
+    let (status, body) = mt_get(&router, "/api/v1/sessions", &k.global_admin).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.contains("sess-mt-1") && body.contains("agent-mt-distinct"),
+        "{body}"
+    );
 }

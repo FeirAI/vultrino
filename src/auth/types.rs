@@ -248,6 +248,9 @@ pub struct ApiKeyMetadata {
     pub last_used_at: Option<DateTime<Utc>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_label: Option<String>,
+    /// Tenant the key is scoped to; `None` for a global (operator) key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
 }
 
 impl From<&ApiKey> for ApiKeyMetadata {
@@ -261,6 +264,7 @@ impl From<&ApiKey> for ApiKeyMetadata {
             created_at: key.created_at,
             last_used_at: key.last_used_at,
             agent_label: key.agent_label.clone(),
+            tenant: key.tenant.clone(),
         }
     }
 }
@@ -364,6 +368,31 @@ mod tests {
         let executor = executor_role();
         assert!(executor.has_permission(Permission::Execute));
         assert!(!executor.has_permission(Permission::Write));
+    }
+
+    #[test]
+    fn api_key_metadata_carries_tenant_and_omits_it_when_global() {
+        let mut key = ApiKey {
+            id: "k".to_string(),
+            key_prefix: "vk_abc12".to_string(),
+            key_hash: "hash".to_string(),
+            name: "k".to_string(),
+            role_id: "role".to_string(),
+            expires_at: None,
+            created_at: Utc::now(),
+            last_used_at: None,
+            agent_label: None,
+            owner_identity: None,
+            tenant: Some("team-a".to_string()),
+            workload_id: None,
+        };
+        let meta = ApiKeyMetadata::from(&key);
+        assert_eq!(meta.tenant.as_deref(), Some("team-a"));
+        assert_eq!(serde_json::to_value(&meta).unwrap()["tenant"], "team-a");
+        key.tenant = None;
+        let meta = ApiKeyMetadata::from(&key);
+        assert!(meta.tenant.is_none());
+        assert!(serde_json::to_value(&meta).unwrap().get("tenant").is_none());
     }
 
     #[test]

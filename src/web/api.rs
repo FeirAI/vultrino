@@ -1064,6 +1064,35 @@ async fn require_global_admin(admin: &AdminApiAuth) -> Result<(), Response> {
     Ok(())
 }
 
+/// Read-key counterpart of [`require_global_admin`]: refuse a TENANT-scoped key
+/// (403 `operator_key_required`) on a read-gated, operator-only listing, before
+/// anything is read. A read-only or admin key passes `ReadApiAuth`; this then
+/// requires it to be global. Same `async` reasoning as `require_global_admin`.
+async fn require_global_reader(read: &ReadApiAuth) -> Result<(), Response> {
+    if read.0.api_key.tenant.is_some() {
+        return Err(error_response(
+            StatusCode::FORBIDDEN,
+            "operator_key_required",
+            "This endpoint is operator-only; it requires a global (untenanted) API key. \
+             A tenant-scoped key cannot read cross-tenant or shared resources here.",
+        ));
+    }
+    Ok(())
+}
+
+/// Whether a key scoped to `acting` may LIST a resource tagged `resource`.
+/// `None` (a global operator key) sees everything. A tenant key sees only
+/// resources tagged with exactly its own tenant. This differs on purpose from
+/// `crate::approval::tenant_may_act`: writes and approvals also admit untenanted
+/// (shared) resources, but a read listing is exact-tenant only, so an untenanted
+/// resource is never enumerated to a tenant key.
+fn tenant_owns(acting: Option<&str>, resource: Option<&str>) -> bool {
+    match acting {
+        None => true,
+        Some(a) => resource == Some(a),
+    }
+}
+
 /// Constrain a CREATE that carries a caller-supplied tenant tag to the acting
 /// key's own tenant. A tenant-scoped key (`acting == Some`) may create a resource
 /// that is untenanted (shared) OR tagged with its OWN tenant, but never one tagged
@@ -1965,7 +1994,9 @@ async fn require_admin(
 /// key can enumerate state without holding the admin authority that mints/revokes
 /// tokens or rewrites/deletes policies. An admin key still passes (admin holds
 /// `Permission::Read`); a `read-only` key passes the GETs but not the mutating
-/// admin routes; use tokens are rejected exactly as on the admin surface.
+/// admin routes; use tokens are rejected exactly as on the admin surface. The
+/// extractor checks permission only, not tenant: a tenant-scoped read key sees only
+/// its own tenant's tokens and is refused (403) on the policy list.
 pub struct ReadApiAuth(#[allow(dead_code)] pub AuthResult);
 
 impl FromRequestParts<AppState> for ReadApiAuth {
@@ -2492,7 +2523,13 @@ impl PolicyListItem {
 /// tracked provision records to flag an orphan policy (enforced but untracked), a
 /// missing one (tracked but not enforced — a containment gap), or a semantic drift
 /// (content_hash != the value captured at author time).
-pub async fn api_list_policies(_read: ReadApiAuth, State(state): State<AppState>) -> Response {
+///
+/// Operator-only: policies carry no tenant field, so a tenant-scoped key (admin or
+/// read-only) is refused 403 `operator_key_required` before the engine is read.
+pub async fn api_list_policies(read: ReadApiAuth, State(state): State<AppState>) -> Response {
+    if let Err(resp) = require_global_reader(&read).await {
+        return resp;
+    }
     let mut policies = state.server.policy_engine().list_policies();
     policies.sort_by(|a, b| a.id.cmp(&b.id));
     let secret = state.config.policy_hash_secret.as_deref();
@@ -2779,10 +2816,12 @@ pub async fn api_put_capability(
 }
 
 /// `GET /api/v1/capabilities` — list all stored capabilities (metadata; no secret).
-pub async fn api_list_capabilities(
-    _admin: AdminApiAuth,
-    State(state): State<AppState>,
-) -> Response {
+/// Operator-only: the catalog is shared and carries no tenant field, so a
+/// tenant-scoped key is refused 403 (same gate as the capability writes).
+pub async fn api_list_capabilities(admin: AdminApiAuth, State(state): State<AppState>) -> Response {
+    if let Err(resp) = require_global_admin(&admin).await {
+        return resp;
+    }
     match state.storage.list_capabilities().await {
         Ok(mut caps) => {
             caps.sort_by(|a, b| a.tool_name.cmp(&b.tool_name));
@@ -2879,9 +2918,16 @@ pub struct TokenCreateRequest {
 /// govder cross-plane reconciliation sweep: govder enumerates live tokens and
 /// flags any whose id has no governance index row (an orphan token = an
 /// uncontainable agent → revoke fail-closed + alert).
-pub async fn api_list_tokens(_read: ReadApiAuth, State(state): State<AppState>) -> Response {
+///
+/// Tenant partition: a global key lists every token; a tenant-scoped key lists
+/// only tokens tagged with exactly its own tenant (untenanted tokens are not
+/// listed). The tenant comes only from the authenticated key. The feir-os broker
+/// reads this with a tenant key to label activity.
+pub async fn api_list_tokens(read: ReadApiAuth, State(state): State<AppState>) -> Response {
     match state.storage.list_use_tokens().await {
         Ok(mut tokens) => {
+            let acting = read.0.api_key.tenant.as_deref();
+            tokens.retain(|t| tenant_owns(acting, t.tenant.as_deref()));
             tokens.sort_by(|a, b| a.id.cmp(&b.id));
             let metadata: Vec<UseTokenMetadata> =
                 tokens.iter().map(UseTokenMetadata::from).collect();
@@ -3733,8 +3779,12 @@ pub async fn api_unhalt_agent(
 }
 
 /// `GET /api/v1/sessions` — the in-flight execution registry for **this process**
-/// (per-process and in-memory, like the rate-limit counters).
-pub async fn api_list_sessions(_admin: AdminApiAuth, State(state): State<AppState>) -> Response {
+/// (per-process and in-memory, like the rate-limit counters). Operator-only: a
+/// session entry carries no tenant, so a tenant-scoped key is refused 403.
+pub async fn api_list_sessions(admin: AdminApiAuth, State(state): State<AppState>) -> Response {
+    if let Err(resp) = require_global_admin(&admin).await {
+        return resp;
+    }
     let sessions = state.server.sessions().list();
     (
         StatusCode::OK,
@@ -4691,6 +4741,19 @@ pub async fn api_delete_credential(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tenant_owns_is_exact_tenant_for_a_tenant_key() {
+        // A global key sees everything.
+        assert!(tenant_owns(None, None));
+        assert!(tenant_owns(None, Some("a")));
+        // A tenant key sees only its own tenant's resources.
+        assert!(tenant_owns(Some("a"), Some("a")));
+        assert!(!tenant_owns(Some("a"), None));
+        assert!(!tenant_owns(Some("a"), Some("b")));
+        assert!(!tenant_owns(Some("a"), Some("")));
+        assert!(!tenant_owns(Some(""), None));
+    }
 
     /// Build a minimal `ApprovalRequest` for `ApprovalSummary` serialization tests
     /// (V041 governance chips): only the fields that drive `risk_tier` /

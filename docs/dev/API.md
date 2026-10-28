@@ -228,8 +228,9 @@ is confined to its own tenant on the routes listed below, with the exceptions in
 last bullet:
 
 - **Operator-only routes** — no tenant field on the resource, or a label-addressed
-  action: policy CRUD, capability writes (`POST`/`PUT`/`DELETE
-  /api/v1/capabilities[/{id}]`), role CRUD, the event outbox (`/events`, `/events/dead`,
+  action: policy CRUD and list (`GET /api/v1/policies`, a read-gated route that
+  is still refused to a tenant-scoped key), capability writes and list
+  (`/api/v1/capabilities[/{id}]`), the session list (`GET /api/v1/sessions`), role CRUD, the event outbox (`/events`, `/events/dead`,
   `/events/{seq}/replay`), and agent `halt`/`unhalt`. A tenant-scoped key gets
   `403 operator_key_required`; use the global operator key.
 - **Tenant-scoped routes** — resource carries a tenant: use-token revoke,
@@ -238,12 +239,14 @@ last bullet:
   untenanted/shared resource); a cross-tenant id returns `404` (no oracle) and a
   mint for a **different** tenant returns `403 cross_tenant_denied`. The tenant is
   re-checked under the storage lock.
+- **Tenant-filtered list** - `GET /api/v1/tokens` returns a tenant-scoped key (admin or
+  read-only) only the tokens tagged with exactly its own tenant, sorted by id; an
+  untenanted token is not listed, and a tenant with no tokens gets `200 {"tokens":[]}`.
+  This differs from the "own or untenanted" rule for writes above.
 - The **global operator key is unrestricted** across tenants.
-- **Not partitioned:** some list routes carry no tenant check. `GET /api/v1/capabilities`
-  and `GET /api/v1/sessions` return every tenant's entries (capability writes are
-  operator-only, above; the capability list is not tenant-filtered). `GET /api/v1/tokens` and
-  `GET /api/v1/policies` need only `read` and are not tenant-filtered either. Treat a
-  tenant-scoped key as operator-trusted on these read routes.
+- **Not partitioned:** `GET /api/v1/credentials` is filtered by the key's role
+  credential scopes, not by tenant. Treat a tenant-scoped key as operator-trusted on
+  this read route.
 
 ### Policies
 
@@ -366,7 +369,7 @@ response carries **metadata only** — the secret is never echoed.
 |--------|------|--------|
 | `POST` | `/api/v1/agents/{label}/halt` | `200 HaltOutcome` (revoked tokens, kill-policy id, in-flight sessions, callbacks fired) / `400 halt_failed`. |
 | `DELETE` | `/api/v1/agents/{label}/halt` | `200 { agent_label, halt_lifted }`. |
-| `GET` | `/api/v1/sessions` | `200 { sessions: [...], process_scope: true }` — in-flight executions in **this** process. |
+| `GET` | `/api/v1/sessions` | `200 { sessions: [...], process_scope: true }` - in-flight executions in **this** process. Operator-only: a tenant-scoped key gets `403 operator_key_required`. |
 
 `label` must be a literal identifier (`[A-Za-z0-9._-]`, ≤128) — globs are rejected.
 The halt also revokes every use token matching the target's `agent_label` (or token
