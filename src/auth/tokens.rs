@@ -90,6 +90,13 @@ pub struct UseToken {
     /// tenant-tagged credentials.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<String>,
+    /// Generation id of the workload exchange that minted this token. Set only by
+    /// the workload exchange, with the same value on every token one exchange mints;
+    /// never taken from a request. `None` for every other mint. The
+    /// `max_live_generations` cap counts distinct ids, and a live token without one
+    /// counts as a generation of its own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload_generation: Option<String>,
 }
 
 /// Why a use token is not currently usable.
@@ -183,6 +190,7 @@ impl UseToken {
             dual_control: false,
             owner_identity: None,
             tenant: None,
+            workload_generation: None,
         };
 
         (full_token, token)

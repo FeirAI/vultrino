@@ -2888,22 +2888,17 @@ impl StorageBackend for FileStorage {
         .await
     }
 
-    async fn count_live_workload_tokens(
+    async fn count_live_workload_generations(
         &self,
         tenant: &str,
         agent_label: &str,
     ) -> Result<usize, StorageError> {
-        Ok(self
-            .list_use_tokens()
-            .await?
-            .into_iter()
-            .filter(|t| {
-                t.tenant.as_deref() == Some(tenant)
-                    && t.agent_label.as_deref() == Some(agent_label)
-                    && !t.revoked
-                    && !t.is_expired()
-            })
-            .count())
+        let tokens = self.list_use_tokens().await?;
+        Ok(super::live_workload_generations(
+            &tokens,
+            tenant,
+            agent_label,
+        ))
     }
 
     async fn set_use_token_revoked_scoped(

@@ -367,16 +367,25 @@ pub trait StorageBackend: Send + Sync {
         ))
     }
 
-    /// Count LIVE (unrevoked, unexpired) use tokens bound to one workload agent,
-    /// without mutating anything. This is the read the `max_live_generations`
-    /// backstop is evaluated against BEFORE a mint, so an exchange can be refused
-    /// instead of adding to an already-unbounded set.
-    async fn count_live_workload_tokens(
+    /// Count LIVE workload generations bound to one agent, without mutating
+    /// anything. A generation is the set of use tokens one workload exchange minted
+    /// (they share `UseToken::workload_generation`); it is live while any of its
+    /// tokens is unrevoked and unexpired. A live token without a generation id
+    /// counts as one generation of its own. This is the read the
+    /// `max_live_generations` backstop is evaluated against BEFORE a mint, so an
+    /// exchange can be refused instead of adding to an already-unbounded set. The
+    /// read is not atomic with the following mint.
+    ///
+    /// The default returns an error, never `Ok(0)`: a backend that does not
+    /// implement the count must fail the exchange closed rather than run with no cap.
+    async fn count_live_workload_generations(
         &self,
         _tenant: &str,
         _agent_label: &str,
     ) -> Result<usize, StorageError> {
-        Ok(0)
+        Err(StorageError::Unavailable(
+            "live generation count not supported by this storage backend".to_string(),
+        ))
     }
 
     /// Atomically consume a workload-identity assertion JTI. Returns false for
@@ -1035,5 +1044,132 @@ pub trait StorageBackend: Send + Sync {
     /// Default implementation does nothing (for in-memory stores)
     async fn reload(&self) -> Result<(), StorageError> {
         Ok(())
+    }
+}
+
+/// Count the live generations among `tokens` for one `(tenant, agent_label)`.
+///
+/// Kept tokens are exactly those with that tenant and agent label (both set),
+/// unrevoked and unexpired. Distinct non-blank `workload_generation` ids count one
+/// each; every kept token with no id, or a blank one, counts one by itself (fail
+/// closed: such a token counts exactly as it would under a per-token count).
+pub(crate) fn live_workload_generations<'a>(
+    tokens: impl IntoIterator<Item = &'a UseToken>,
+    tenant: &str,
+    agent_label: &str,
+) -> usize {
+    let mut ids: std::collections::HashSet<&'a str> = std::collections::HashSet::new();
+    let mut unstamped = 0usize;
+    for t in tokens {
+        if t.tenant.as_deref() != Some(tenant)
+            || t.agent_label.as_deref() != Some(agent_label)
+            || t.revoked
+            || t.is_expired()
+        {
+            continue;
+        }
+        match t.workload_generation.as_deref().map(str::trim) {
+            Some(id) if !id.is_empty() => {
+                ids.insert(id);
+            }
+            _ => unstamped += 1,
+        }
+    }
+    ids.len() + unstamped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::live_workload_generations;
+    use crate::auth::{NewUseToken, UseToken};
+    use chrono::Duration;
+
+    fn tok(
+        tenant: Option<&str>,
+        agent: Option<&str>,
+        generation: Option<&str>,
+        revoked: bool,
+        ttl_secs: i64,
+    ) -> UseToken {
+        let (_, mut t) = UseToken::create(NewUseToken {
+            name: "t".to_string(),
+            credential_scope: "*".to_string(),
+            action_scope: None,
+            max_uses: None,
+            require_approval: false,
+            expires_in: Some(Duration::seconds(ttl_secs)),
+        });
+        t.tenant = tenant.map(str::to_string);
+        t.agent_label = agent.map(str::to_string);
+        t.workload_generation = generation.map(str::to_string);
+        t.revoked = revoked;
+        t
+    }
+
+    fn live(generation: Option<&str>) -> UseToken {
+        tok(Some("t1"), Some("a"), generation, false, 300)
+    }
+
+    fn count(tokens: &[UseToken]) -> usize {
+        live_workload_generations(tokens, "t1", "a")
+    }
+
+    #[test]
+    fn stamped_generations_count_once_each() {
+        let mut v = vec![];
+        for _ in 0..4 {
+            v.push(live(Some("wg_a")));
+        }
+        for _ in 0..2 {
+            v.push(live(Some("wg_b")));
+        }
+        assert_eq!(count(&v), 2);
+    }
+
+    #[test]
+    fn unstamped_tokens_count_one_each() {
+        let v = vec![live(None), live(None), live(None)];
+        assert_eq!(count(&v), 3);
+        let v = vec![live(Some("wg_a")), live(None), live(None)];
+        assert_eq!(count(&v), 3);
+    }
+
+    #[test]
+    fn blank_ids_count_per_token() {
+        let v = vec![live(Some("")), live(Some("  ")), live(Some(""))];
+        assert_eq!(count(&v), 3);
+    }
+
+    #[test]
+    fn revoked_and_expired_are_excluded() {
+        let v = vec![
+            tok(Some("t1"), Some("a"), Some("wg_a"), false, 300),
+            tok(Some("t1"), Some("a"), Some("wg_a"), true, 300),
+            tok(Some("t1"), Some("a"), Some("wg_a"), true, 300),
+            tok(Some("t1"), Some("a"), Some("wg_a"), true, 300),
+        ];
+        assert_eq!(count(&v), 1);
+        let v = vec![
+            tok(Some("t1"), Some("a"), Some("wg_a"), true, 300),
+            tok(Some("t1"), Some("a"), Some("wg_a"), true, 300),
+        ];
+        assert_eq!(count(&v), 0);
+        let v = vec![
+            tok(Some("t1"), Some("a"), Some("wg_a"), false, -10),
+            tok(Some("t1"), Some("a"), Some("wg_a"), false, -10),
+        ];
+        assert_eq!(count(&v), 0);
+    }
+
+    #[test]
+    fn other_owners_are_excluded() {
+        let v = vec![
+            tok(Some("t2"), Some("a"), Some("wg_a"), false, 300),
+            tok(Some("t1"), Some("b"), Some("wg_b"), false, 300),
+            tok(None, Some("a"), Some("wg_c"), false, 300),
+            tok(Some("t1"), None, Some("wg_d"), false, 300),
+        ];
+        assert_eq!(count(&v), 0);
+        assert_eq!(count(&[]), 0);
     }
 }

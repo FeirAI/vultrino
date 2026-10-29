@@ -681,3 +681,237 @@ async fn live_tokens(
         })
         .collect()
 }
+
+// ---------------------------------------------------------------------------
+// GENERATION COUNTING (feir-ops#18): the cap counts exchanges, not tokens.
+
+/// Author a grant for `agent` from a JSON object over the real admin PUT route.
+async fn author_grant_json(
+    router: &axum::Router,
+    admin_key: &str,
+    agent: &str,
+    extra: serde_json::Value,
+) {
+    let mut grant = serde_json::json!({
+        "tenant": "t1", "agent_label": agent, "issuer": "https://issuer",
+        "subject": "workload", "audience": "vultrino", "mcp_credential_scope": "cred-*",
+        "mcp_action_scope": "tool.*", "ttl_secs": 300
+    });
+    for (k, v) in extra.as_object().unwrap() {
+        grant[k] = v.clone();
+    }
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/v1/workload-grants/{agent}"))
+                .header("authorization", format!("Bearer {admin_key}"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&grant).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "grant author must succeed");
+}
+
+/// A model-channels JSON object with `n` channels.
+fn channels(n: usize) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    for i in 0..n {
+        m.insert(
+            format!("ch{i}"),
+            serde_json::json!({"credential_scope": format!("model-{i}"), "action_scope": "llm.*"}),
+        );
+    }
+    serde_json::Value::Object(m)
+}
+
+/// Claims bound to `agent` with a caller-chosen `jti`.
+fn claims_for(agent: &str, jti: &str) -> serde_json::Value {
+    let mut c = valid_claims(jti);
+    c["agent_label"] = serde_json::json!(agent);
+    c
+}
+
+/// Exchange once for `agent`, returning the status and the response body.
+async fn exchange_for(router: &axum::Router, agent: &str, jti: &str) -> (StatusCode, String) {
+    let a = mint_assertion(VERIFIER_SECRET, claims_for(agent, jti));
+    let resp = router.clone().oneshot(exchange_req(&a)).await.unwrap();
+    let status = resp.status();
+    let body = String::from_utf8(
+        axum::body::to_bytes(resp.into_body(), 256 * 1024)
+            .await
+            .unwrap()
+            .to_vec(),
+    )
+    .unwrap();
+    (status, body)
+}
+
+/// Store one extra live generation of `n` tokens directly, standing in for a
+/// predecessor that retire failed to collect.
+async fn store_generation(
+    storage: &Arc<dyn StorageBackend>,
+    agent: &str,
+    generation: Option<&str>,
+    n: usize,
+) {
+    for _ in 0..n {
+        let (_, mut t) = vultrino::auth::UseToken::create(vultrino::auth::NewUseToken {
+            name: "injected".to_string(),
+            credential_scope: "cred-*".to_string(),
+            action_scope: None,
+            max_uses: None,
+            require_approval: false,
+            expires_in: Some(chrono::Duration::seconds(300)),
+        });
+        t.tenant = Some("t1".to_string());
+        t.agent_label = Some(agent.to_string());
+        t.workload_generation = generation.map(str::to_string);
+        storage.store_use_token(&t).await.unwrap();
+    }
+}
+
+/// The #18 regression: with 3 or 7 model channels and the default cap, an agent
+/// re-exchanges repeatedly. A per-token count refused the second exchange.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn model_channels_re_exchange_at_the_default_cap() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    enable_exchange();
+    let (router, storage, admin_key) = build_router().await;
+    author_grant_json(
+        &router,
+        &admin_key,
+        "ep_agent",
+        serde_json::json!({"model_channels": channels(3)}),
+    )
+    .await;
+    author_grant_json(
+        &router,
+        &admin_key,
+        "wide_agent",
+        serde_json::json!({"model_channels": channels(7)}),
+    )
+    .await;
+
+    let mut prev_ids: Vec<String> = vec![];
+    let mut prev_gen: Option<String> = None;
+    for i in 0..3 {
+        let (status, body) = exchange_for(&router, "ep_agent", &format!("jti-gen3-{i}")).await;
+        assert_eq!(status, StatusCode::OK, "exchange {i} must succeed: {body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["model_tokens"].as_object().unwrap().len(), 3);
+        let live = live_tokens(&storage, "t1", "ep_agent").await;
+        assert_eq!(
+            live.len(),
+            4,
+            "1 MCP + 3 model tokens live after exchange {i}"
+        );
+        let g = live[0].workload_generation.clone().expect("stamped");
+        assert!(g.starts_with("wg_"));
+        assert!(live
+            .iter()
+            .all(|t| t.workload_generation.as_deref() == Some(g.as_str())));
+        assert_ne!(
+            prev_gen.as_deref(),
+            Some(g.as_str()),
+            "a fresh id per exchange"
+        );
+        for id in &prev_ids {
+            let t = storage.get_use_token(id).await.unwrap().unwrap();
+            assert!(t.revoked, "the previous generation must be retired");
+        }
+        prev_ids = live.iter().map(|t| t.id.clone()).collect();
+        prev_gen = Some(g);
+    }
+
+    for i in 0..2 {
+        let (status, body) = exchange_for(&router, "wide_agent", &format!("jti-gen7-{i}")).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "wide exchange {i} must succeed: {body}"
+        );
+        assert_eq!(live_tokens(&storage, "t1", "wide_agent").await.len(), 8);
+    }
+}
+
+/// The bound is still a bound: with cap 2, two generations fit and a third is
+/// refused with nothing minted.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn generation_cap_counts_exchanges_and_still_refuses_at_the_limit() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    enable_exchange();
+    let (router, storage, admin_key) = build_router().await;
+    author_grant_json(
+        &router,
+        &admin_key,
+        "ep_agent",
+        serde_json::json!({"model_channels": channels(3), "max_live_generations": 2}),
+    )
+    .await;
+
+    for i in 0..2 {
+        let (status, body) = exchange_for(&router, "ep_agent", &format!("jti-capg-{i}")).await;
+        assert_eq!(status, StatusCode::OK, "exchange {i} must succeed: {body}");
+    }
+    store_generation(&storage, "ep_agent", Some("wg_injected"), 4).await;
+    let before: Vec<String> = {
+        let mut v: Vec<String> = live_tokens(&storage, "t1", "ep_agent")
+            .await
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(before.len(), 8);
+
+    let (status, body) = exchange_for(&router, "ep_agent", "jti-capg-3").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert!(body.contains("live_generation_cap"), "got: {body}");
+    let mut after: Vec<String> = live_tokens(&storage, "t1", "ep_agent")
+        .await
+        .into_iter()
+        .map(|t| t.id)
+        .collect();
+    after.sort();
+    assert_eq!(after, before, "a refused exchange must mint nothing");
+}
+
+/// Live tokens without a generation id count one generation each (fail closed).
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn unmarked_live_tokens_count_one_generation_each() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    enable_exchange();
+    let (router, storage, admin_key) = build_router().await;
+    author_grant_json(
+        &router,
+        &admin_key,
+        "ep_agent",
+        serde_json::json!({"max_live_generations": 2}),
+    )
+    .await;
+    author_grant_json(
+        &router,
+        &admin_key,
+        "other_agent",
+        serde_json::json!({"max_live_generations": 2}),
+    )
+    .await;
+
+    store_generation(&storage, "ep_agent", None, 2).await;
+    let (status, body) = exchange_for(&router, "ep_agent", "jti-unm-1").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
+    assert_eq!(live_tokens(&storage, "t1", "ep_agent").await.len(), 2);
+
+    store_generation(&storage, "other_agent", None, 1).await;
+    let (status, body) = exchange_for(&router, "other_agent", "jti-unm-2").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(live_tokens(&storage, "t1", "other_agent").await.len(), 1);
+}
