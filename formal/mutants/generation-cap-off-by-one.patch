@@ -1,0 +1,13 @@
+diff --git a/src/web/workload_exchange.rs b/src/web/workload_exchange.rs
+index 2fbfd91..cfb8532 100644
+--- a/src/web/workload_exchange.rs
++++ b/src/web/workload_exchange.rs
+@@ -543,7 +543,7 @@ pub async fn exchange_workload_token(
+         .count_live_workload_generations(&template.tenant, &template.agent_label)
+         .await
+     {
+-        Ok(live_generations) if live_generations >= gen_cap => {
++        Ok(live_generations) if live_generations > gen_cap => {
+             return error(
+                 StatusCode::TOO_MANY_REQUESTS,
+                 "live_generation_cap",
