@@ -327,8 +327,10 @@ hidden in the other docs; this collects them. Vultrino is **alpha** (`0.1.0`).
   workload an error for a mint that succeeded — which produces *more* generations, the
   opposite of the goal. The failure is logged at `warn` and backstopped by
   `max_live_generations` (grant-declared; `None` means the default **4**, never
-  "unbounded"), which **refuses** the next exchange once that many live, unrevoked,
-  unexpired generations exist. That refusal is fail-closed and self-healing: expired
+  "unbounded"), which **refuses** the next exchange once that many live
+  generations exist. A generation is the set of tokens one exchange minted (they share one
+  server-drawn id); it is live while any of its tokens is unrevoked and unexpired, and a
+  live token without an id counts as one generation. The check is not atomic with the mint. That refusal is fail-closed and self-healing: expired
   tokens do not count, so the cap clears within one TTL. Steady state is 1; the default
   leaves headroom for a pod restarting while its predecessor is still unexpired.
   Why the bound exists at all, measured: an unbounded live set grows **linearly in
@@ -850,10 +852,18 @@ pre-check run before the kill tier, so a halted principal with an unparseable
 URL gets the unparseable reason instead of the halt reason; the outcome is still
 Deny.
 
-## Workload-exchange generation cap counts tokens
+## Workload-exchange generation cap: what it does not bound
 
-`max_live_generations` (default 4) counts live use TOKENS, not exchanges. One
-exchange keeps 1 MCP token plus 1 per model channel (mint-then-retire keeps only
-the newest generation), so with the default a template with 3 or more model
-channels is refused (`429 live_generation_cap`) on every re-exchange until the
-previous tokens expire. Raise `max_live_generations` for such templates.
+`max_live_generations` counts live generations (the tokens one exchange minted),
+not tokens, so the number of model channels does not change how many
+re-exchanges fit. It still does not bound everything:
+
+- Exchanges in flight at the same time can each pass the check before any of them
+  mints. While predecessor-retire is failing, the live set can exceed the cap by
+  the number of concurrent exchanges.
+- A live token without a generation id (minted before this version, rewritten by
+  an older binary during a mixed-version upgrade, or minted outside the exchange
+  with the same tenant and agent label) counts as one generation. The cap can be
+  reached with fewer exchanges until those tokens expire.
+- A template's channel count is not limited, so the token bound is
+  `max_live_generations x (1 + channels)`.
