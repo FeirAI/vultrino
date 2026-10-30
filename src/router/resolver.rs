@@ -195,6 +195,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_generation_count_default_fails_closed() {
+        let storage = MockStorage::new();
+        assert!(storage
+            .count_live_workload_generations("t1", "a")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
     async fn test_resolve_by_alias() {
         let storage = Arc::new(MockStorage::new());
         let cred = Credential::new(

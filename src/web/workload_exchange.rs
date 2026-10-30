@@ -46,7 +46,13 @@ pub struct WorkloadGrantTemplate {
     /// ~1,150 tokens/day/agent at a realistic L3 TTL — far past the ~150-200
     /// crossover where the grant-delete W2 leg exceeds govder's 10s enforce timeout.
     ///
-    /// So the exchange REFUSES to mint once this many LIVE (unrevoked, unexpired)
+    /// A generation is the set of tokens one exchange mints (the MCP token plus one
+    /// per model channel), all stamped with one server-drawn id; it is live while any
+    /// of its tokens is unrevoked and unexpired. A live token bound to the agent with
+    /// no generation id counts as one generation of its own. The number of model
+    /// channels therefore does not change how many re-exchanges fit.
+    ///
+    /// So the exchange REFUSES to mint once this many LIVE
     /// generations already exist for the agent. It is deliberately a refusal and not
     /// a warning: an unbounded live set degrades an authoritative containment leg,
     /// and the alternative failure (an agent that cannot refresh) is fail-closed and
@@ -60,8 +66,8 @@ pub struct WorkloadGrantTemplate {
 
 /// Default `max_live_generations` when a grant does not declare one.
 ///
-/// The honest invariant predecessor-retire provides is **<= 2 live generations during
-/// rotation** (mint-then-retire means the new and old generation coexist briefly), not
+/// A generation is the set of tokens one exchange mints. The honest invariant
+/// predecessor-retire provides is **<= 2 live generations during rotation** (mint-then-retire means the new and old generation coexist briefly), not
 /// "exactly one". The default leaves headroom above that for legitimate transients — a
 /// pod restarting while its predecessor's token is still unexpired, a rollout overlap —
 /// while keeping the set small enough that a W2 grant-delete revoke stays far inside
@@ -534,16 +540,16 @@ pub async fn exchange_workload_token(
         .max(1) as usize;
     match state
         .storage
-        .count_live_workload_tokens(&template.tenant, &template.agent_label)
+        .count_live_workload_generations(&template.tenant, &template.agent_label)
         .await
     {
-        Ok(live) if live >= gen_cap => {
+        Ok(live_generations) if live_generations >= gen_cap => {
             return error(
                 StatusCode::TOO_MANY_REQUESTS,
                 "live_generation_cap",
                 format!(
-                    "{} live token generation(s) already exist for this agent (cap {}). Refusing to mint another: an unbounded live set makes the grant-delete kill leg exceed its own timeout. Expired generations do not count, so this clears within one token TTL ({}s); if it does not, predecessor-retire is failing — check for revoke errors in this process's log.",
-                    live, gen_cap, template.ttl_secs
+                    "{} live generation(s) already exist for this agent (cap {}; a generation is the set of tokens one exchange minted). Refusing to mint another: an unbounded live set makes the grant-delete kill leg exceed its own timeout. Expired generations do not count, so this clears within one token TTL ({}s); if it does not, predecessor-retire is failing, so check for revoke errors in this process's log.",
+                    live_generations, gen_cap, template.ttl_secs
                 ),
             );
         }
@@ -557,6 +563,8 @@ pub async fn exchange_workload_token(
             );
         }
     }
+    // One server-drawn id shared by every token this exchange mints; the cap above counts these.
+    let generation = format!("wg_{}", uuid::Uuid::new_v4());
     let mint = |name: String,
                 credential_scope: String,
                 action_scope: String,
@@ -580,6 +588,7 @@ pub async fn exchange_workload_token(
     );
     mcp.agent_label = Some(template.agent_label.clone());
     mcp.tenant = Some(template.tenant.clone());
+    mcp.workload_generation = Some(generation.clone());
     if let Err(e) = state.storage.store_use_token(&mcp).await {
         return error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -605,6 +614,7 @@ pub async fn exchange_workload_token(
         );
         token.agent_label = Some(template.agent_label.clone());
         token.tenant = Some(template.tenant.clone());
+        token.workload_generation = Some(generation.clone());
         if let Err(e) = state.storage.store_use_token(&token).await {
             for id in &minted_ids {
                 let _ = state.storage.set_use_token_revoked(id).await;

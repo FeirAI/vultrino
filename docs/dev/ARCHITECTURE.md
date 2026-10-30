@@ -293,7 +293,7 @@ production entrypoint validates and snapshots that verifier before vault access 
 listener bind, and the handler never rereads environment or secret files. It fails closed on
 a forged/expired assertion (`401`), a cross-process fd-locked `jti` replay (`409`),
 or an identity-binding mismatch against the admin-authored grant template (`403`);
-a partial mint failure revokes every token already minted. A runtime then holds a
+a partial mint failure revokes every token already minted. The tokens of one exchange share a generation id, and the `max_live_generations` backstop counts live generations, not tokens. A runtime then holds a
 non-consuming liveness lease via `GET /api/v1/runtime/control`, which returns
 `409 runtime_cancelled` once the token is revoked/expired (W2) or the principal is
 halted (W3) — the in-process teardown signal for cooperative framework execution.

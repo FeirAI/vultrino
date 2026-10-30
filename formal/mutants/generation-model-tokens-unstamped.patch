@@ -1,0 +1,12 @@
+diff --git a/src/web/workload_exchange.rs b/src/web/workload_exchange.rs
+index 2fbfd91..ad4691e 100644
+--- a/src/web/workload_exchange.rs
++++ b/src/web/workload_exchange.rs
+@@ -614,7 +614,6 @@ pub async fn exchange_workload_token(
+         );
+         token.agent_label = Some(template.agent_label.clone());
+         token.tenant = Some(template.tenant.clone());
+-        token.workload_generation = Some(generation.clone());
+         if let Err(e) = state.storage.store_use_token(&token).await {
+             for id in &minted_ids {
+                 let _ = state.storage.set_use_token_revoked(id).await;

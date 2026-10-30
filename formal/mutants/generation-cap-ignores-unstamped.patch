@@ -1,0 +1,14 @@
+diff --git a/src/storage/mod.rs b/src/storage/mod.rs
+index a9e2e6b..1eedfcc 100644
+--- a/src/storage/mod.rs
++++ b/src/storage/mod.rs
+@@ -1075,7 +1075,8 @@ pub(crate) fn live_workload_generations<'a>(
+             _ => unstamped += 1,
+         }
+     }
+-    ids.len() + unstamped
++    let _ = unstamped;
++    ids.len()
+ }
+ 
+ #[cfg(test)]

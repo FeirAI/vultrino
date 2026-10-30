@@ -1230,6 +1230,22 @@
     "refusal-requeue-not-atomic": {
       "tier": "full",
       "claim": "refusal-gap-recorded"
+    },
+    "generation-cap-counts-tokens": {
+      "tier": "fast",
+      "claim": "workload-exchange-generation-cap"
+    },
+    "generation-cap-ignores-unstamped": {
+      "tier": "fast",
+      "claim": "workload-exchange-generation-cap"
+    },
+    "generation-model-tokens-unstamped": {
+      "tier": "fast",
+      "claim": "workload-exchange-generation-cap"
+    },
+    "generation-cap-off-by-one": {
+      "tier": "fast",
+      "claim": "workload-exchange-generation-cap"
     }
   },
   "claims": [
@@ -5885,6 +5901,45 @@
         "session-list-tenant-key-allowed"
       ],
       "does_not_establish": "That GET /api/v1/credentials or any other route is tenant-partitioned: the credentials list is filtered by role credential scopes, not by tenant. That keys and tokens carry the right tenant: that is provisioning. The HTML console and MCP tools/list. That the list routes are the only way to read this data. That a global key is held only by operators: who holds one is deployment configuration. The detector drives an in-memory test router, not a deployed binary."
+    },
+    {
+      "id": "workload-exchange-generation-cap",
+      "statement": "POST /api/v1/workload/exchange counts the agent's live generations, not its live tokens, against max_live_generations (default 4, minimum 1), before anything is minted. Every token one exchange mints carries the same server-drawn generation id; a generation counts while any of its tokens is unrevoked and unexpired; a live token of the same tenant and agent_label without a generation id counts as one generation. With the default cap a template with 3 or 7 model channels re-exchanges repeatedly and keeps one live generation; with cap 2 and 3 channels a second exchange succeeds, and with two live generations the next exchange is refused 429 live_generation_cap and mints nothing; two unstamped live tokens refuse an exchange at cap 2.",
+      "method": "test",
+      "artifacts": [
+        "src/web/workload_exchange.rs",
+        "src/storage/mod.rs",
+        "src/storage/file.rs",
+        "tests/workload_exchange_integration.rs"
+      ],
+      "gates": [
+        "rust"
+      ],
+      "detector": "cargo test --locked --no-default-features --test workload_exchange_integration -- --exact model_channels_re_exchange_at_the_default_cap generation_cap_counts_exchanges_and_still_refuses_at_the_limit unmarked_live_tokens_count_one_generation_each max_live_generations_refuses_an_over_cap_exchange",
+      "covers": [
+        {
+          "path": "src/web/workload_exchange.rs",
+          "symbol": "exchange_workload_token",
+          "sha256": "8e63591bb7307f2f27d091a039c70f0900ef8b242ce1c30965b7985d171a84b2"
+        },
+        {
+          "path": "src/storage/mod.rs",
+          "symbol": "live_workload_generations",
+          "sha256": "b0cc134730561e1e035ae2ab95161998c59c8088aea3aad0cf9da54fe955c885"
+        },
+        {
+          "path": "src/storage/file.rs",
+          "symbol": "StorageBackend for FileStorage::count_live_workload_generations",
+          "sha256": "6e8191aa6caeccb0a44fb42a0d85a9a47e29a28db0ae59999c320c0e98e6e1d7"
+        }
+      ],
+      "mutants": [
+        "generation-cap-counts-tokens",
+        "generation-cap-ignores-unstamped",
+        "generation-model-tokens-unstamped",
+        "generation-cap-off-by-one"
+      ],
+      "does_not_establish": "That the check is atomic with the mint: concurrent exchanges can each pass it, so while predecessor-retire is failing the live set can exceed the cap by the number of exchanges in flight. That predecessor-retire works, or that the W2 grant-delete leg meets govder's timeout. A bound on tokens per generation: a template's channel count is not limited. Which generation a token minted outside the exchange belongs to: it counts as one. The detector drives an in-memory test router over a temporary file vault, not a deployed binary, and stores extra generations directly to stand in for a failed retire."
     }
   ]
 }

@@ -1,0 +1,14 @@
+diff --git a/src/storage/mod.rs b/src/storage/mod.rs
+index a9e2e6b..a5060f6 100644
+--- a/src/storage/mod.rs
++++ b/src/storage/mod.rs
+@@ -1070,7 +1070,8 @@ pub(crate) fn live_workload_generations<'a>(
+         }
+         match t.workload_generation.as_deref().map(str::trim) {
+             Some(id) if !id.is_empty() => {
+-                ids.insert(id);
++                let _ = id;
++                unstamped += 1;
+             }
+             _ => unstamped += 1,
+         }

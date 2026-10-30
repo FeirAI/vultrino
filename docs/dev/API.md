@@ -628,7 +628,7 @@ mint failure revokes every token already minted.
 | `403` | `identity_binding_mismatch` | `iss`/`sub`/`aud`/`tenant`/`agent_label` do not match the stored template. |
 | `409` | `assertion_replay` | The `jti` was already exchanged (durable, cross-process, fd-locked). |
 | `503` | `grant_store_unavailable` / `replay_store_unavailable` | Grant/replay store I/O failure. |
-| `429` | `live_generation_cap` | At least `max_live_generations` (an optional template field, default 4, minimum 1) live (unrevoked, unexpired) use tokens are already bound to this `(tenant, agent_label)`. The cap counts tokens, not exchanges: each model-channel token counts separately, so a template with model channels reaches it after fewer exchanges. Expired tokens do not count, so it clears as they expire (within one TTL for exchange-minted tokens). |
+| `429` | `live_generation_cap` | At least `max_live_generations` (optional template field, default 4, minimum 1) live generations already exist for this `(tenant, agent_label)`. A generation is the set of tokens one exchange minted (the MCP token plus one per model channel); it counts while any of its tokens is unrevoked and unexpired. A live use token bound to the agent without a generation id (minted outside the exchange or before this version) counts as one generation. The number of model channels does not change how many re-exchanges fit. Expired tokens do not count, so the cap clears as they expire (within one TTL for exchange-minted tokens). |
 | `500` | `invalid_stored_grant` | The stored template for `(tenant, agent_label)` could not be parsed. |
 | `500` | `storage_error` | A minted token could not be stored (tokens already minted in this exchange are revoked, best-effort). |
 
