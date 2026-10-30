@@ -66,7 +66,7 @@ ring = "0.17"
 # configures wasmtime's compilation cache. Every other wasmtime 49 default feature
 # is listed explicitly so nothing else changes; re-sync on wasmtime upgrades.
 wasmtime = { version = "49.0.5", optional = true, default-features = false, features = ["anyhow", "async", "backtrace", "gc", "gc-copying", "gc-drc", "gc-null", "wat", "profiling", "parallel-compilation", "cranelift", "pooling-allocator", "demangle", "addr2line", "coredump", "debug-builtins", "runtime", "component-model", "component-model-async", "threads", "stack-switching", "std", "debug", "compile-time-builtins", "wit-parser"] }
-wasmtime-wasi = { version = "49.0.5", optional = true }
+wasmtime-wasi = { version = "50.0.0", optional = true }
 
 # OS integration (for future keychain support)
 # keyring = "3"
