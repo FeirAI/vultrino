@@ -365,6 +365,46 @@ on an LLM credential is never resumed. This does not stop an operator from
 storing a second credential for the same provider that no LLM channel references; that
 credential is an ordinary credential, governed by its policies only.
 
+## SSH and Postgres plugin inputs are validated before any child starts
+
+Credential metadata is written by whoever creates the credential, which in a multi-client
+deployment can be a client-scoped admin key, and caller parameters are untrusted whenever the
+matching `*.allow_override` is true. The SSH plugin therefore validates every value it passes to
+local `ssh`, `sshpass` and `rsync`, from both sources, in one place and before any process is
+started; a refused request starts no child.
+
+- `ssh.strict_host_key_checking` is exactly one of `yes`, `no`, `accept-new`, `ask`, `off`
+  (case-sensitive, after trimming). The value that is used is the matching constant, never the
+  stored text.
+- The `rsync -e` remote-shell string is built only from the numeric port, that constant and
+  `ConnectTimeout=30`; every element is checked to contain no whitespace, quote, backslash or
+  shell metacharacter, so a field added later without validation fails closed.
+- rsync flags (`deploy.flags` or the caller's `flags`) are an allowlist: `-a`, `--archive`, `-z`,
+  `--compress`, `-v`, `--verbose`, `-n`, `--dry-run`, `--delete`, `--delete-after`, `--checksum`,
+  `-c`, `--human-readable`, `-h`, `--partial`, `--times`, `-t`, `--recursive`, `-r`, and
+  `--exclude=<pattern>` / `--include=<pattern>`. Combined short flags (the default `-avz`) are
+  accepted only when every letter is one of `a z v n c h t r`. `--exclude`/`--include` patterns and
+  the `excludes` list must be non-empty, free of control characters and must not start with `-`.
+- `host` is a hostname (letters, digits, `-`, `.`; no leading `-` or `.`; at most 253 characters;
+  labels at most 63) or an IPv4/IPv6 literal. `user` is `[A-Za-z0-9._-]`, at most 64, not starting
+  with `-`. `port` is 1-65535.
+- `source_dir` and `dest_dir` are non-empty, free of control characters and do not start with `-`.
+  `source_dir` must not carry a `:` before its first `/` (rsync would read it as a remote source);
+  `dest_dir` must not start with `:` (rsync daemon mode) or `~-`.
+- Each `run` command must be non-empty and must not start with `-` (local ssh re-reads options
+  after the destination).
+- `--` precedes the ssh destination and the rsync source and destination.
+- The Postgres plugin restricts the credential's `sslmode` to the libpq set, and refuses a
+  `database` that libpq would read as a connection string (contains `=`, or starts with
+  `postgres://` or `postgresql://`), since `-d` would let it override the credential's host and
+  user. Backup `format` was already restricted to `plain`, `custom`, `directory`, `tar`.
+
+Not covered, by design: `run.commands` run on the REMOTE host. `deploy.source_dir` can name any
+local path the proxy user can read, and the action sends it to the credential's host. Who may
+create or change SSH credentials, and who may set `deploy.allow_override`, is therefore a
+security decision for the operator. `dest_dir` is interpreted by the remote shell, so it is
+not a filter against what the remote account can do.
+
 ## Child processes get a minimal environment; all plugin SQL is restricted
 
 Every program the proxy starts (psql, pg_dump, sshpass, ssh, rsync, openssl, git, tar,
