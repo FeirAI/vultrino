@@ -365,6 +365,33 @@ on an LLM credential is never resumed. This does not stop an operator from
 storing a second credential for the same provider that no LLM channel references; that
 credential is an ordinary credential, governed by its policies only.
 
+## Child processes get a minimal environment; all plugin SQL is restricted
+
+Every program the proxy starts (psql, pg_dump, sshpass, ssh, rsync, openssl, git, tar,
+rustup, cargo) is built by `src/plugins/child_process.rs`, which clears the inherited
+environment and passes an explicit allowlist per profile: `PATH`, `LANG`, `LC_*`, `TZ`,
+`TMPDIR`, plus what the program needs (`HOME` for psql, pg_dump and ssh; toolchain, proxy and CA
+variables and `SSH_AUTH_SOCK` for the installer). The vault master password
+(`VULTRINO_PASSWORD`, `VULTRINO_PASSWORD_FILE`) and every `VULTRINO_*`, `GOVDER_*`,
+`AVERIN_*`, `LERIA_*`, `FEIR_*` and `ORGPACK_*` variable never reach a child; the plugin adds
+only its own per-call values (`PGPASSWORD`, `SSHPASS`, ...). `tests/no_raw_child_process.rs`
+fails if a `Command::new` appears in `src/` outside the helper. The WASM runtime gives
+guests no environment (`WasiCtxBuilder::new()` without `inherit_env`). The proxy does not call
+`remove_var` on its own copy of the password: `main` runs inside the multi-threaded tokio runtime,
+so the process is already multi-threaded when the password is read and `remove_var` is not
+sound there; the allowlist is what keeps it from children.
+
+All SQL the Postgres plugin sends to psql (caller `sql` or `file` with
+`run_sql.allow_override=true`, and the credential's own `run_sql.sql` or `run_sql.file`) is
+read by the proxy and sent on stdin after `\restrict <fresh 128-bit random key>`, so psql refuses
+every meta-command (`\!`, `\copy ... to program`, `\o |cmd`, `\i`, `\setenv`, ...). Stored SQL is
+covered because a tenant-scoped admin key can create a Postgres credential with its own
+metadata. psql is never given `-f` or `-c` for run_sql. A psql without `\restrict` (older than
+17.6, 16.10, 15.14, 14.19, 13.22 or 18) makes the plugin refuse `run_sql` whatever the source.
+Still the operator's responsibility with `allow_override`: server-side effects such as
+`COPY ... TO PROGRAM` (needs a privileged database role), and arbitrary SQL against the
+database the credential can reach. See LIMITATIONS.
+
 ## Provider scope headers are the operator's
 
 Some provider headers choose which organization, project or workspace is billed and

@@ -36,13 +36,13 @@
 //! process (not visible in `ps`). The agent invoking the plugin only sees the
 //! credential alias.
 
+use super::child_process::{tokio_command, ChildEnv};
 use super::{Plugin, PluginError, PluginRequest};
 use crate::{CredentialData, CredentialType, ExecuteResponse};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
-use tokio::process::Command;
 use tokio::time::timeout;
 
 const DEFAULT_RSYNC_FLAGS: &str = "-avz";
@@ -123,13 +123,13 @@ impl SshPlugin {
     }
 
     async fn check_binary_available(name: &str) -> Result<(), PluginError> {
-        match Command::new(name).arg("-V").output().await {
+        match tokio_command(name, ChildEnv::Ssh).arg("-V").output().await {
             Ok(_) => Ok(()),
             Err(_) => {
                 // Some binaries (like `ssh`) don't support `-V`; retry with `-h`
                 // and with no arg. Either way, a missing binary yields
                 // NotFound and surfaces as an install hint.
-                match Command::new(name).output().await {
+                match tokio_command(name, ChildEnv::Ssh).output().await {
                     Ok(_) => Ok(()),
                     Err(_) => Err(PluginError::ExecutionFailed(format!(
                         "required binary '{}' not found on PATH. Install it (e.g. `brew install hudochenkov/sshpass/sshpass` for sshpass) and retry.",
@@ -176,6 +176,13 @@ impl SshPlugin {
                 "no source_dir configured: set metadata deploy.source_dir".to_string(),
             )
         })?;
+
+        // `source_dir` is a positional rsync argument; a leading `-` would be read as an option.
+        if source_dir.starts_with('-') {
+            return Err(PluginError::InvalidParams(
+                "source_dir must not start with '-'".to_string(),
+            ));
+        }
 
         let dest_dir = if allow_override {
             param("dest_dir").or_else(|| metadata.get("deploy.dest_dir").cloned())
@@ -239,7 +246,7 @@ impl SshPlugin {
         let ssh_args = Self::base_ssh_args(port, metadata);
         let ssh_cmd = format!("ssh {}", ssh_args.join(" "));
 
-        let mut cmd = Command::new("sshpass");
+        let mut cmd = tokio_command("sshpass", ChildEnv::Ssh);
         cmd.env("SSHPASS", &password);
         cmd.arg("-e").arg("rsync");
         for f in flags_str.split_whitespace() {
@@ -394,7 +401,7 @@ impl SshPlugin {
                 tokio::time::sleep(Duration::from_millis(interval_ms)).await;
             }
 
-            let mut cmd = Command::new("sshpass");
+            let mut cmd = tokio_command("sshpass", ChildEnv::Ssh);
             cmd.env("SSHPASS", &password);
             cmd.arg("-e").arg("ssh");
             for a in &ssh_base_args {

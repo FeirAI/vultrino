@@ -720,6 +720,28 @@ CONFIGURATION, `[averin]`). What that does and does not give you:
   stub averin. One `#[ignore]` test (`tests/refusals_real_averin.rs`) runs a real averin-server built
   from the averin branch, by hand: it is not a CI gate.
 
+## Child-process environment and caller SQL (Postgres)
+
+- Children (psql, pg_dump, ssh tools, installer toolchain) see only an allowlisted environment
+  (`src/plugins/child_process.rs`). An operator who relied on a child inheriting some other
+  variable (a custom `PGSSLMODE`-style default, `PGSERVICE`, `PGPASSFILE`, `SSH_AUTH_SOCK` for
+  `ssh.*`, a `GIT_*` setting for the installer) must now set it through the credential metadata
+  or the allowlist. `SSH_AUTH_SOCK` is passed only to the installer's `git`.
+- `run_sql` needs a psql with `\restrict` (17.6, 16.10, 15.14, 14.19, 13.22, 18 or later) and
+  is refused otherwise, whatever the SQL source; pre-release or unparsable `psql --version`
+  output counts as unsupported. No SQL run through the plugin can use any psql meta-command,
+  stored (`run_sql.sql`, `run_sql.file`) or caller-supplied. An operator who relied on
+  meta-commands in stored SQL (for example `\copy` from a local file, `\set`, `\i`) must move
+  that logic elsewhere.
+- Not covered: `COPY ... TO/FROM PROGRAM` and other server-side effects run with the database
+  role of the credential (use a role without `pg_execute_server_program`); a caller `file` path
+  can read any file the proxy user can read as SQL (its content can surface in error text), a
+  stored `run_sql.file` likewise, and `backup.allow_override` lets a caller choose any output path the proxy user can write. Leave
+  both overrides off unless the caller is as trusted as the operator.
+- A principal that may create or edit credentials still chooses the SQL a credential runs
+  and the file it reads, but can no longer use meta-commands to execute commands on the proxy
+  host. Restrict credential writes accordingly.
+
 ## Rate-limit windows are per-process and per-replica (vultrino#6)
 
 RateLimit rule state (the fixed-window counter) is in-memory and per-process: it resets on restart and

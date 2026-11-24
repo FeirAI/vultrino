@@ -126,8 +126,23 @@ Params (all optional):
 | `timeout_secs` | Always allowed     | Wall-clock timeout override.                                               |
 
 If both `sql` and `file` are given, `sql` is used and `file` is ignored without an error; a param takes precedence over the `run_sql.*` metadata defaults. Raw SQL is fed to `psql` via
-stdin (not `-c`), so it handles multi-statement scripts, comments, and
-`\` meta-commands correctly.
+stdin (not `-c`), so it handles multi-statement scripts and comments.
+
+**No SQL run through the plugin can use psql meta-commands, stored or caller-supplied.** psql runs backslash
+commands found in its input, and `\!` runs a shell command on the Vultrino host as
+the Vultrino user (`\copy ... to program`, `\o |cmd`, `\g |cmd`, `\i`, `\w`, `\cd`,
+`\setenv` and `\gexec` are also dangerous). So everything the plugin sends (caller `sql` or `file`, and the credential's own
+`run_sql.sql` or `run_sql.file`) runs after a `\restrict <random key>` line: psql then refuses every
+meta-command except `\unrestrict <key>`, and the key is generated fresh for each call
+and never shown to the caller. A meta-command in caller SQL makes psql fail with
+`backslash commands are restricted` (exit 3) and nothing after it runs. A `file` (caller or stored)
+is read by Vultrino and sent the same way (it is not passed to psql as `-f`, and is
+limited to 64 MiB). This needs a psql that has `\restrict`: 17.6, 16.10, 15.14, 14.19,
+13.22, or 18 and later. With an older or unrecognised psql, `run_sql` is
+refused with an error that says so, whatever the SQL source. If your stored SQL used
+meta-commands (for example `\copy` from a local file, `\set`, `\i`), move that logic
+elsewhere. `COPY ... TO PROGRAM` is server-side and is not blocked
+here; see the warning below.
 
 Response body:
 

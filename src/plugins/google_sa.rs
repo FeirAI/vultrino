@@ -466,8 +466,8 @@ fn log_upstream_failure(status: u16, body: &[u8]) {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::plugins::child_process::{std_command, ChildEnv};
     use axum::{routing::any, Json, Router};
-    use std::process::Command;
     use std::sync::{Arc, Mutex, OnceLock};
     use tokio::net::TcpListener;
 
@@ -479,7 +479,7 @@ pub(crate) mod tests {
     }
 
     fn generate_rsa_pem(bits: usize) -> String {
-        let output = Command::new("openssl")
+        let output = std_command("openssl", ChildEnv::Minimal)
             .args([
                 "genpkey",
                 "-algorithm",
@@ -683,7 +683,7 @@ pub(crate) mod tests {
             "a 1024-bit RSA key is below the floor"
         );
 
-        let ec = Command::new("openssl")
+        let ec = std_command("openssl", ChildEnv::Minimal)
             .args([
                 "genpkey",
                 "-algorithm",
@@ -794,7 +794,7 @@ pub(crate) mod tests {
 
         // A PKCS#8-framed key that is simply not RSA still gets the generic
         // not-a-usable-RSA-key message from `ring`'s parse.
-        let ec_pkcs8 = Command::new("openssl")
+        let ec_pkcs8 = std_command("openssl", ChildEnv::Minimal)
             .args([
                 "genpkey",
                 "-algorithm",
