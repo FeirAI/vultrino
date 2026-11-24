@@ -5,12 +5,12 @@
 //! - Git repositories (with optional branch/tag)
 //! - URLs (tar.gz archives)
 
+use super::child_process::{tokio_command, ChildEnv};
 use super::types::{InstalledPluginInfo, PluginManifest};
 #[cfg(feature = "wasm-plugins")]
 use super::wasm::WasmPlugin;
 use super::PluginError;
 use std::path::{Path, PathBuf};
-use tokio::process::Command;
 use tracing::{debug, info, warn};
 
 /// Plugin source types
@@ -255,14 +255,15 @@ impl PluginInstaller {
         let staging = temp_dir.join("plugin");
 
         // Clone the repository
-        let mut cmd = Command::new("git");
+        let mut cmd = tokio_command("git", ChildEnv::Installer);
         cmd.arg("clone").arg("--depth").arg("1");
 
         if let Some(r) = git_ref {
             cmd.arg("--branch").arg(r);
         }
 
-        cmd.arg(url).arg(&staging);
+        // `--` so a source starting with `-` can never be read as a git option.
+        cmd.arg("--").arg(url).arg(&staging);
 
         let output = cmd
             .output()
@@ -313,7 +314,7 @@ impl PluginInstaller {
         let archive_path = temp_dir.join("archive.tar.gz");
         tokio::fs::write(&archive_path, &bytes).await?;
 
-        let output = Command::new("tar")
+        let output = tokio_command("tar", ChildEnv::Minimal)
             .arg("-xzf")
             .arg(&archive_path)
             .arg("-C")
@@ -339,7 +340,7 @@ impl PluginInstaller {
         info!("Building WASM module...");
 
         // Check if wasm target is installed
-        let check_output = Command::new("rustup")
+        let check_output = tokio_command("rustup", ChildEnv::Installer)
             .args(["target", "list", "--installed"])
             .output()
             .await
@@ -350,7 +351,7 @@ impl PluginInstaller {
         let targets = String::from_utf8_lossy(&check_output.stdout);
         if !targets.contains("wasm32-wasip1") {
             warn!("wasm32-wasip1 target not installed. Installing...");
-            let install_output = Command::new("rustup")
+            let install_output = tokio_command("rustup", ChildEnv::Installer)
                 .args(["target", "add", "wasm32-wasip1"])
                 .output()
                 .await
@@ -368,7 +369,7 @@ impl PluginInstaller {
         }
 
         // Build with cargo
-        let output = Command::new("cargo")
+        let output = tokio_command("cargo", ChildEnv::Installer)
             .args(["build", "--release", "--target", "wasm32-wasip1"])
             .current_dir(path)
             .output()
@@ -673,5 +674,79 @@ wasm_module = "legacy.wasm"
             !installed.path().join("legacy-abi").exists(),
             "a refused plugin must not appear installed"
         );
+    }
+
+    /// git, rustup and cargo (stubs on PATH) receive the installer profile: toolchain, proxy
+    /// and agent variables yes, vault and plane secrets no.
+    // The lock serialises environment mutation across the awaits on purpose.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn installer_children_get_the_installer_environment_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let _g = crate::plugins::child_process::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let stubs = tempfile::tempdir().unwrap();
+        let script = "#!/bin/sh\nNAME=\"$(basename \"$0\")\"\nD=\"$(dirname \"$0\")\"\n\
+            if [ \"$NAME\" = rustup ]; then echo wasm32-wasip1; fi\n\
+            env | cut -d= -f1 | sort > \"$D/$NAME.names\"\nexit 0\n";
+        for n in ["git", "rustup", "cargo"] {
+            let p = stubs.path().join(n);
+            std::fs::write(&p, script).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let old = std::env::var("PATH").unwrap();
+        std::env::set_var("PATH", format!("{}:{}", stubs.path().display(), old));
+        for (k, v) in [
+            ("VULTRINO_PASSWORD", "x"),
+            ("VULTRINO_PASSWORD_FILE", "x"),
+            ("GOVDER_SECRET", "x"),
+            ("AVERIN_SECRET", "x"),
+            ("HTTPS_PROXY", "http://127.0.0.1:9"),
+            ("CARGO_HOME", "/tmp/cargo-home"),
+            ("SSH_AUTH_SOCK", "/tmp/agent"),
+            ("AWS_SECRET_ACCESS_KEY", "x"),
+        ] {
+            std::env::set_var(k, v);
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let inst = PluginInstaller::new(tmp.path().to_path_buf());
+        inst.stage_from_git("https://github.com/o/r", None, tmp.path())
+            .await
+            .unwrap();
+        inst.build_wasm(tmp.path()).await.unwrap();
+
+        for prog in ["git", "rustup", "cargo"] {
+            let names = std::fs::read_to_string(stubs.path().join(format!("{prog}.names")))
+                .unwrap_or_else(|_| panic!("{prog} stub did not run"));
+            let names: Vec<&str> = names.lines().collect();
+            for bad in [
+                "VULTRINO_PASSWORD",
+                "VULTRINO_PASSWORD_FILE",
+                "GOVDER_SECRET",
+                "AVERIN_SECRET",
+                "AWS_SECRET_ACCESS_KEY",
+            ] {
+                assert!(!names.contains(&bad), "{prog} inherited {bad}");
+            }
+            for need in ["PATH", "HTTPS_PROXY", "CARGO_HOME", "SSH_AUTH_SOCK"] {
+                assert!(names.contains(&need), "{prog} lacks {need}");
+            }
+        }
+
+        for k in [
+            "VULTRINO_PASSWORD",
+            "VULTRINO_PASSWORD_FILE",
+            "GOVDER_SECRET",
+            "AVERIN_SECRET",
+            "HTTPS_PROXY",
+            "CARGO_HOME",
+            "SSH_AUTH_SOCK",
+            "AWS_SECRET_ACCESS_KEY",
+        ] {
+            std::env::remove_var(k);
+        }
+        std::env::set_var("PATH", old);
     }
 }

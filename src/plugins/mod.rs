@@ -10,6 +10,7 @@
 //! local paths, or URLs.
 
 mod buffer;
+pub(crate) mod child_process;
 mod ecdsa;
 pub(crate) mod google_sa;
 mod hmac;

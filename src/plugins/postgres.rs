@@ -27,6 +27,20 @@
 //!   - `backup.timeout_secs` - total timeout for pg_dump (default 1800s)
 //!   - `backup.allow_override` - `"true"` to let callers pass `output_path` / `format`
 //!
+//! # Caller-supplied SQL runs in psql's restricted mode
+//!
+//! With `run_sql.allow_override=true` a caller may pass `sql` or `file`. psql executes
+//! backslash meta-commands from its input (`\!` runs a shell command on the proxy host as
+//! the proxy's user; `\copy .. to program`, `\o |cmd`, `\g |cmd`, `\i`, `\w`, `\cd`,
+//! `\setenv`, `\gexec` are also dangerous). So caller-supplied SQL (inline, or the content
+//! of a caller-named file) is fed on stdin after a `\restrict <random key>` line. In
+//! restricted mode psql refuses every meta-command except `\unrestrict <key>`, and the key
+//! is 128 random bits that the caller never sees, so nothing can lift the restriction. psql
+//! must support `\restrict` (17.6, 16.10, 15.14, 14.19, 13.22, or 18 and later); with an
+//! older or unrecognised psql, caller-supplied SQL is refused. SQL authored by the operator
+//! in credential metadata (`run_sql.sql`, `run_sql.file`) is trusted configuration and runs
+//! as before, meta-commands included.
+//!
 //! # Authentication
 //!
 //! The password is passed to `psql` and `pg_dump` via the `PGPASSWORD`
@@ -34,6 +48,7 @@
 //! output and never touches disk. The agent invoking the plugin only sees the
 //! credential alias.
 
+use super::child_process::{tokio_command, ChildEnv};
 use super::{Plugin, PluginError, PluginRequest};
 use crate::{CredentialData, CredentialType, ExecuteResponse};
 use async_trait::async_trait;
@@ -43,13 +58,14 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
 use tokio::time::timeout;
 
 const DEFAULT_RUN_SQL_TIMEOUT_SECS: u64 = 600;
 const DEFAULT_BACKUP_TIMEOUT_SECS: u64 = 1800;
 const DEFAULT_BACKUP_FILENAME_TEMPLATE: &str = "{alias}-{timestamp}.sql";
 const DEFAULT_BACKUP_FORMAT: &str = "plain";
+/// Largest caller-named SQL file the plugin will read into the restricted stdin script.
+const MAX_CALLER_SQL_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const VALID_FORMATS: &[&str] = &["plain", "custom", "directory", "tar"];
 
 /// Postgres plugin: `run_sql` and `backup` actions.
@@ -97,8 +113,73 @@ impl PostgresPlugin {
             .unwrap_or(default)
     }
 
+    /// `(major, minor)` from `psql --version` output such as
+    /// `psql (PostgreSQL) 18.3 (Homebrew)`. A pre-release (`18beta1`, `19devel`) or anything
+    /// else unrecognised yields `None`, which callers treat as "not supported".
+    fn parse_psql_version(output: &str) -> Option<(u32, u32)> {
+        let token = output
+            .split("(PostgreSQL)")
+            .nth(1)?
+            .split_whitespace()
+            .next()?;
+        let (major, rest) = token.split_once('.')?;
+        let minor_digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        Some((major.parse().ok()?, minor_digits.parse().ok()?))
+    }
+
+    /// Whether this psql has `\restrict` (CVE-2025-8714 fix, 2025-08-14 minor releases).
+    fn psql_supports_restrict(version: (u32, u32)) -> bool {
+        let (major, minor) = version;
+        match major {
+            13 => minor >= 22,
+            14 => minor >= 19,
+            15 => minor >= 14,
+            16 => minor >= 10,
+            17 => minor >= 6,
+            m => m >= 18,
+        }
+    }
+
+    /// Runs `psql --version` once for this call. `Err` if psql is missing.
+    async fn psql_version_output() -> Result<String, PluginError> {
+        match tokio_command("psql", ChildEnv::Postgres)
+            .arg("--version")
+            .output()
+            .await
+        {
+            Ok(o) => Ok(String::from_utf8_lossy(&o.stdout).into_owned()),
+            Err(_) => Err(PluginError::ExecutionFailed(
+                "required binary 'psql' not found on PATH. Install the postgresql-client package (or Homebrew's `libpq`) and ensure `psql` and `pg_dump` are available.".to_string(),
+            )),
+        }
+    }
+
+    /// A fresh psql restrict key: 128 random bits as 32 hex characters (psql accepts only
+    /// alphanumerics). Never logged, never returned.
+    fn new_restrict_key() -> String {
+        use rand::TryRng;
+        let mut bytes = [0u8; 16];
+        rand::rngs::SysRng
+            .try_fill_bytes(&mut bytes)
+            .expect("SysRng failure");
+        hex::encode(bytes)
+    }
+
+    /// The stdin script for caller-supplied SQL: restricted mode first, then the optional
+    /// statement timeout, then the caller's text. `\unrestrict` is never sent.
+    fn restricted_script(key: &str, statement_timeout_ms: u64, sql: &str) -> String {
+        let mut script = format!("\\restrict {key}\n");
+        if statement_timeout_ms > 0 {
+            script.push_str(&format!(
+                "SET statement_timeout = {statement_timeout_ms};\n"
+            ));
+        }
+        script.push_str(sql);
+        script
+    }
+
     async fn check_binary_available(name: &str) -> Result<(), PluginError> {
-        match Command::new(name).arg("--version").output().await {
+        match tokio_command(name, ChildEnv::Postgres).arg("--version").output().await {
             Ok(_) => Ok(()),
             Err(_) => Err(PluginError::ExecutionFailed(format!(
                 "required binary '{}' not found on PATH. Install the postgresql-client package (or Homebrew's `libpq`) and ensure `psql` and `pg_dump` are available.",
@@ -156,14 +237,43 @@ impl PostgresPlugin {
 
         // Resolve the actual SQL source: param (if allowed) > metadata > error.
         enum SqlSource {
+            /// Operator-authored inline SQL (metadata): trusted, meta-commands allowed.
             Inline(String),
+            /// Operator-authored file (metadata): trusted, run with `-f`.
             File(PathBuf),
+            /// Caller-supplied SQL or file content (needs `allow_override`): run in psql's
+            /// restricted mode. The second field is the `source` shown in the response.
+            Caller(String, String),
         }
 
         let sql_source: SqlSource = if let Some(s) = sql_param {
-            SqlSource::Inline(s)
+            SqlSource::Caller(s, "inline".to_string())
         } else if let Some(f) = file_param {
-            SqlSource::File(PathBuf::from(f))
+            // The file is read here and fed through the restricted stdin script, never given
+            // to psql as `-f`, because psql would execute meta-commands found in the file.
+            let p = PathBuf::from(&f);
+            if !p.is_file() {
+                return Err(PluginError::InvalidParams(format!(
+                    "SQL file not found or not a regular file: {}",
+                    p.display()
+                )));
+            }
+            let len = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(u64::MAX);
+            if len > MAX_CALLER_SQL_FILE_BYTES {
+                return Err(PluginError::InvalidParams(format!(
+                    "SQL file is larger than {} bytes: {}",
+                    MAX_CALLER_SQL_FILE_BYTES,
+                    p.display()
+                )));
+            }
+            let content = std::fs::read_to_string(&p).map_err(|e| {
+                PluginError::InvalidParams(format!(
+                    "SQL file cannot be read as UTF-8 text: {}: {}",
+                    p.display(),
+                    e
+                ))
+            })?;
+            SqlSource::Caller(content, format!("file:{}", p.display()))
         } else if let Some(s) = metadata.get("run_sql.sql") {
             SqlSource::Inline(s.clone())
         } else if let Some(f) = metadata.get("run_sql.file") {
@@ -202,9 +312,23 @@ impl PostgresPlugin {
                 )
             });
 
-        Self::check_binary_available("psql").await?;
+        let version_output = Self::psql_version_output().await?;
+        let restrict_key = if matches!(sql_source, SqlSource::Caller(..)) {
+            // Fail closed: caller-supplied SQL is only ever run in restricted mode.
+            match Self::parse_psql_version(&version_output) {
+                Some(v) if Self::psql_supports_restrict(v) => Some(Self::new_restrict_key()),
+                _ => {
+                    return Err(PluginError::ExecutionFailed(format!(
+                        "caller-supplied SQL refused: the installed psql ({}) cannot be confirmed to support \\restrict, which keeps caller SQL from running psql meta-commands such as \\!. Upgrade psql to 17.6, 16.10, 15.14, 14.19, 13.22 or 18 and later, or put the SQL in credential metadata (run_sql.sql / run_sql.file).",
+                        version_output.trim()
+                    )))
+                }
+            }
+        } else {
+            None
+        };
 
-        let mut cmd = Command::new("psql");
+        let mut cmd = tokio_command("psql", ChildEnv::Postgres);
         cmd.env("PGPASSWORD", &conn.password);
         cmd.env("PGSSLMODE", &conn.sslmode);
         cmd.env("PGCONNECT_TIMEOUT", "30");
@@ -216,17 +340,18 @@ impl PostgresPlugin {
         if wrap_in_transaction {
             cmd.arg("--single-transaction");
         }
-        if statement_timeout_ms > 0 {
-            cmd.arg("-c")
-                .arg(format!("SET statement_timeout = {};", statement_timeout_ms));
-        }
-
         match &sql_source {
             SqlSource::File(p) => {
+                if statement_timeout_ms > 0 {
+                    cmd.arg("-c")
+                        .arg(format!("SET statement_timeout = {};", statement_timeout_ms));
+                }
                 cmd.arg("-f").arg(p);
                 cmd.stdin(Stdio::null());
             }
-            SqlSource::Inline(_) => {
+            // With `-c` psql does not read stdin at all, so for stdin-fed SQL the timeout is
+            // set by a statement inside the script instead.
+            SqlSource::Inline(_) | SqlSource::Caller(..) => {
                 cmd.stdin(Stdio::piped());
             }
         }
@@ -247,9 +372,22 @@ impl PostgresPlugin {
         };
 
         // Feed inline SQL via stdin (safe against shell injection; not via -c).
-        if let SqlSource::Inline(sql) = &sql_source {
+        let stdin_script: Option<String> = match &sql_source {
+            SqlSource::Caller(sql, _) => Some(Self::restricted_script(
+                restrict_key.as_deref().unwrap_or_default(),
+                statement_timeout_ms,
+                sql,
+            )),
+            SqlSource::Inline(sql) => Some(if statement_timeout_ms > 0 {
+                format!("SET statement_timeout = {statement_timeout_ms};\n{sql}")
+            } else {
+                sql.clone()
+            }),
+            SqlSource::File(_) => None,
+        };
+        if let Some(script) = stdin_script {
             if let Some(mut stdin) = child.stdin.take() {
-                let bytes = sql.clone().into_bytes();
+                let bytes = script.into_bytes();
                 if let Err(e) = stdin.write_all(&bytes).await {
                     return Err(PluginError::ExecutionFailed(format!(
                         "failed to write SQL to psql stdin: {}",
@@ -295,6 +433,7 @@ impl PostgresPlugin {
         let source_display = match &sql_source {
             SqlSource::File(p) => format!("file:{}", p.display()),
             SqlSource::Inline(_) => "inline".to_string(),
+            SqlSource::Caller(_, shown) => shown.clone(),
         };
 
         let body = serde_json::json!({
@@ -393,7 +532,7 @@ impl PostgresPlugin {
 
         Self::check_binary_available("pg_dump").await?;
 
-        let mut cmd = Command::new("pg_dump");
+        let mut cmd = tokio_command("pg_dump", ChildEnv::Postgres);
         cmd.env("PGPASSWORD", &conn.password);
         cmd.env("PGSSLMODE", &conn.sslmode);
         cmd.env("PGCONNECT_TIMEOUT", "30");
@@ -689,6 +828,60 @@ mod tests {
         assert_eq!(
             p.supported_credential_types(),
             vec![CredentialType::Postgres]
+        );
+    }
+
+    #[test]
+    fn psql_version_parsing_and_restrict_support() {
+        let p = PostgresPlugin::parse_psql_version;
+        assert_eq!(p("psql (PostgreSQL) 18.3 (Homebrew)\n"), Some((18, 3)));
+        assert_eq!(
+            p("psql (PostgreSQL) 16.10 (Ubuntu 16.10-1)"),
+            Some((16, 10))
+        );
+        assert_eq!(p("psql (PostgreSQL) 18beta1"), None);
+        assert_eq!(p("psql (PostgreSQL) 19devel"), None);
+        assert_eq!(p("garbage"), None);
+        assert_eq!(p(""), None);
+        let ok = PostgresPlugin::psql_supports_restrict;
+        for v in [
+            (13, 22),
+            (14, 19),
+            (15, 14),
+            (16, 10),
+            (17, 6),
+            (18, 0),
+            (19, 2),
+        ] {
+            assert!(ok(v), "{v:?} has \\restrict");
+        }
+        for v in [
+            (13, 21),
+            (14, 18),
+            (15, 13),
+            (16, 9),
+            (17, 5),
+            (12, 22),
+            (9, 6),
+        ] {
+            assert!(!ok(v), "{v:?} lacks \\restrict");
+        }
+    }
+
+    #[test]
+    fn restricted_script_puts_restrict_first_and_never_unrestricts() {
+        let key = PostgresPlugin::new_restrict_key();
+        assert_eq!(key.len(), 32);
+        assert!(key.chars().all(|c| c.is_ascii_alphanumeric()));
+        assert_ne!(key, PostgresPlugin::new_restrict_key());
+        let sql = "select 1;\n\\! id\n";
+        let script = PostgresPlugin::restricted_script(&key, 250, sql);
+        assert!(script.starts_with(&format!("\\restrict {key}\nSET statement_timeout = 250;\n")));
+        assert!(script.ends_with(sql));
+        assert!(!script.contains("\\unrestrict"));
+        assert_eq!(
+            PostgresPlugin::restricted_script(&key, 0, "x"),
+            format!("\\restrict {key}\nx")
         );
     }
 
