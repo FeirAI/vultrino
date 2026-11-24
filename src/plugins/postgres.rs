@@ -66,6 +66,15 @@ const DEFAULT_BACKUP_FORMAT: &str = "plain";
 /// Largest SQL file the plugin will read into the restricted stdin script.
 const MAX_SQL_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const VALID_FORMATS: &[&str] = &["plain", "custom", "directory", "tar"];
+/// The libpq `sslmode` values; the credential's value is exported as `PGSSLMODE`.
+const VALID_SSLMODES: &[&str] = &[
+    "disable",
+    "allow",
+    "prefer",
+    "require",
+    "verify-ca",
+    "verify-full",
+];
 
 /// Postgres plugin: `run_sql` and `backup` actions.
 pub struct PostgresPlugin;
@@ -84,18 +93,61 @@ impl PostgresPlugin {
                 user,
                 password,
                 sslmode,
-            } => Ok(PgConn {
-                host: host.clone(),
-                port: *port,
-                database: database.clone(),
-                user: user.clone(),
-                password: password.expose().to_string(),
-                sslmode: sslmode.clone(),
-            }),
+            } => {
+                Self::validate_connection_fields(host, database, user, sslmode)?;
+                Ok(PgConn {
+                    host: host.clone(),
+                    port: *port,
+                    database: database.clone(),
+                    user: user.clone(),
+                    password: password.expose().to_string(),
+                    sslmode: sslmode.clone(),
+                })
+            }
             _ => Err(PluginError::UnsupportedCredentialType(
                 "postgres plugin requires a postgres credential".to_string(),
             )),
         }
+    }
+
+    /// Credential fields are written by whoever creates the credential, so they are checked
+    /// before any child starts. Host, user and database are the argument of `-h`, `-U` and `-d`
+    /// and cannot become options; the exception is `-d`, which libpq reads as a full connection
+    /// string when the value contains `=` or starts with `postgres://` or `postgresql://`, and
+    /// that could redirect the connection (host, user, sslmode) away from the credential.
+    fn validate_connection_fields(
+        host: &str,
+        database: &str,
+        user: &str,
+        sslmode: &str,
+    ) -> Result<(), PluginError> {
+        let bad = |field: &str, why: &str| {
+            PluginError::InvalidParams(format!("postgres credential {} is invalid: {}", field, why))
+        };
+        for (field, v) in [("host", host), ("user", user), ("database", database)] {
+            if v.is_empty() {
+                return Err(bad(field, "empty"));
+            }
+            if v.chars().any(|c| c.is_control()) {
+                return Err(bad(field, "contains a control character"));
+            }
+        }
+        if database.contains('=')
+            || database.starts_with("postgres://")
+            || database.starts_with("postgresql://")
+        {
+            return Err(bad(
+                "database",
+                "must be a database name, not a connection string",
+            ));
+        }
+        if !VALID_SSLMODES.contains(&sslmode) {
+            return Err(bad(
+                "sslmode",
+                &format!("must be one of: {}", VALID_SSLMODES.join(", ")),
+            ));
+        }
+        Ok(())
     }
 
     fn metadata_bool(metadata: &HashMap<String, String>, key: &str, default: bool) -> bool {
@@ -832,6 +884,50 @@ mod tests {
             PostgresPlugin::restricted_script(&key, 0, "x"),
             format!("\\restrict {key}\nx")
         );
+    }
+
+    #[test]
+    fn test_connection_fields_validation() {
+        let ok = |h: &str, d: &str, u: &str, m: &str| {
+            PostgresPlugin::validate_connection_fields(h, d, u, m)
+        };
+        for m in VALID_SSLMODES {
+            assert!(ok("db.example.com", "app", "u", m).is_ok());
+        }
+        for m in [
+            "",
+            "Disable",
+            "require ",
+            "prefer\nx",
+            "off",
+            "require sslcert=x",
+        ] {
+            assert!(
+                ok("h", "d", "u", m)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("sslmode"),
+                "{m:?}"
+            );
+        }
+        for d in [
+            "host=evil.example",
+            "dbname=x user=y",
+            "postgresql://evil/x",
+            "postgres://evil/x",
+            "",
+            "a\nb",
+        ] {
+            assert!(
+                ok("h", d, "u", "prefer")
+                    .unwrap_err()
+                    .to_string()
+                    .contains("database"),
+                "{d:?}"
+            );
+        }
+        assert!(ok("", "d", "u", "prefer").is_err());
+        assert!(ok("h", "d", "u\n", "prefer").is_err());
     }
 
     #[test]

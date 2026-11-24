@@ -80,7 +80,7 @@ vultrino meta unset prod-api deploy.excludes
 | `deploy.source_dir`      | —              | Local directory. Trailing `/` is significant to rsync — see `man rsync`.    |
 | `deploy.dest_dir`        | —              | Remote directory.                                                           |
 | `deploy.excludes`        | `[]`           | JSON array of rsync `--exclude` patterns.                                   |
-| `deploy.flags`           | `-avz`         | Rsync flags as a single string.                                             |
+| `deploy.flags`           | `-avz`         | Rsync flags as a single string, checked against an allowlist (see below).   |
 | `deploy.timeout_secs`    | `1800` (30min) | Kill local rsync if it exceeds this.                                        |
 | `deploy.allow_override`  | `false`        | If `true`, callers can override `source_dir` / `dest_dir` / `excludes` / `flags` in params. |
 
@@ -98,7 +98,39 @@ vultrino meta unset prod-api deploy.excludes
 
 | Key                             | Default        | Description                                         |
 |---------------------------------|----------------|-----------------------------------------------------|
-| `ssh.strict_host_key_checking`  | `accept-new`   | Forwarded to `ssh -o StrictHostKeyChecking=…`. Sensible choices are `accept-new`, `yes`, `no`. |
+| `ssh.strict_host_key_checking`  | `accept-new`   | Forwarded to `ssh -o StrictHostKeyChecking=…`. Exactly one of `yes`, `no`, `accept-new`, `ask`, `off` (case-sensitive, after trimming); anything else is refused. |
+
+## Input validation
+
+Credential metadata and, where `*.allow_override` is true, caller parameters are validated before
+any process starts. A refused request starts no `sshpass`, `ssh` or `rsync` and returns an error
+that names the field (never the password).
+
+**rsync flags** (`deploy.flags` or the `flags` param) accept only these, exactly as written:
+`-a`, `--archive`, `-z`, `--compress`, `-v`, `--verbose`, `-n`, `--dry-run`, `--delete`,
+`--delete-after`, `--checksum`, `-c`, `--human-readable`, `-h`, `--partial`, `--times`, `-t`,
+`--recursive`, `-r`, plus `--exclude=<pattern>` and `--include=<pattern>`. Combined short flags such
+as the default `-avz` are accepted when every letter is one of `a z v n c h t r`. Any other flag
+(for example `-e`, `--rsh`, `--rsync-path`, `--files-from`) is refused and named. Patterns, and
+entries of `excludes`, must be non-empty, free of control characters and must not start with `-`.
+
+**Field rules**
+
+| Field | Rule |
+|-------|------|
+| `host` | Hostname (letters, digits, `-`, `.`; no leading `-` or `.`; at most 253 characters) or an IPv4/IPv6 literal. |
+| `user` | `A-Z a-z 0-9 . _ -`, at most 64 characters, not starting with `-`. |
+| `port` | 1-65535. |
+| `source_dir` | Non-empty, no control characters, not starting with `-`, no `:` before the first `/` (use `./` for such a relative path). |
+| `dest_dir` | Non-empty, no control characters, not starting with `-`, `~-` or `:`. |
+| `run` command | Non-empty, not starting with `-`. |
+
+`--` is passed before the ssh destination and before the rsync source and destination.
+
+**Operator responsibility.** `run.commands` run on the remote host by design and are not filtered.
+`deploy.source_dir` can be any local path the proxy user can read, and it is sent to the
+credential's host; `dest_dir` is read by the remote shell. Decide carefully who may create SSH
+credentials and who may enable `deploy.allow_override`.
 
 ## Actions
 
@@ -132,7 +164,7 @@ Response body:
   "duration_ms": 4213,
   "timed_out": false,
   "dry_run": false,
-  "command_display": "sshpass -e rsync -avz --exclude=.git -e \"ssh -p 22 -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30\" /src/ user@host:/dest/"
+  "command_display": "sshpass -e rsync -avz --exclude=.git -e \"ssh -p 22 -o StrictHostKeyChecking=accept-new -o ConnectTimeout=30\" -- /src/ user@host:/dest/"
 }
 ```
 
@@ -188,8 +220,8 @@ none timed out.
   owner's opt-in.
 - **Host key verification.** `StrictHostKeyChecking=accept-new` is the
   default — trust on first use, reject on key change. Change it via the
-  `ssh.strict_host_key_checking` metadata key if you need stricter or
-  looser behavior.
+  `ssh.strict_host_key_checking` metadata key (`yes`, `no`, `accept-new`,
+  `ask`, `off`) if you need stricter or looser behavior.
 - **Timeouts actually kill.** Commands that exceed their timeout have
   the *local* ssh/rsync process sent SIGKILL (`tokio::Command::kill_on_drop(true)`).
   The remote side is best-effort — SIGHUP from the closed SSH channel

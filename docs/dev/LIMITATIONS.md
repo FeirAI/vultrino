@@ -720,6 +720,26 @@ CONFIGURATION, `[averin]`). What that does and does not give you:
   stub averin. One `#[ignore]` test (`tests/refusals_real_averin.rs`) runs a real averin-server built
   from the averin branch, by hand: it is not a CI gate.
 
+## SSH plugin input validation
+
+- A credential whose `ssh.strict_host_key_checking` is not one of `yes`, `no`, `accept-new`, `ask`,
+  `off`, whose `deploy.flags` (or caller `flags`) contain anything outside the rsync allowlist, or
+  whose host, user, port, `source_dir`, `dest_dir` or `excludes` fail the rules in `docs/dev/SECURITY.md`,
+  now fails with an error naming the field. There is no way to pass other rsync flags (for example
+  `--rsync-path`, `--files-from`, `-e`, `--delete-excluded`); combined short flags are accepted
+  only for the letters `a z v n c h t r`. A `run` command may not start with `-`; start it with a
+  path or `env` if you need that.
+- `run.commands` run on the REMOTE host by design and are not filtered. `deploy.source_dir` can be
+  any local path the proxy user can read, and the action sends it to the credential's host, so who
+  may create SSH credentials (including a client-scoped admin key) and who may set
+  `deploy.allow_override` matters. `dest_dir` is parsed by the remote shell and is not a filter.
+- The tests use stub programs that record argv. The `-e ... -- src dest` form was checked by hand
+  against macOS openrsync only (a local dry run); GNU rsync 3.x and real ssh handling of `--` is
+  not exercised in CI.
+- The Postgres plugin refuses a credential `sslmode` outside the libpq set and a `database` that
+  libpq would read as a connection string (`=` or a `postgres(ql)://` prefix). A backup
+  `output_path` given with `backup.allow_override=true` is still any path the proxy user can write.
+
 ## Child-process environment and caller SQL (Postgres)
 
 - Children (psql, pg_dump, ssh tools, installer toolchain) see only an allowlisted environment
