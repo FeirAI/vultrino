@@ -727,18 +727,20 @@ CONFIGURATION, `[averin]`). What that does and does not give you:
   variable (a custom `PGSSLMODE`-style default, `PGSERVICE`, `PGPASSFILE`, `SSH_AUTH_SOCK` for
   `ssh.*`, a `GIT_*` setting for the installer) must now set it through the credential metadata
   or the allowlist. `SSH_AUTH_SOCK` is passed only to the installer's `git`.
-- Caller-supplied SQL (`run_sql.allow_override=true`) needs a psql with `\restrict` (17.6,
-  16.10, 15.14, 14.19, 13.22, 18 or later) and is refused otherwise; pre-release or unparsable
-  `psql --version` output counts as unsupported. Caller SQL can no longer use any meta-command.
-  Operator SQL in metadata is not restricted.
+- `run_sql` needs a psql with `\restrict` (17.6, 16.10, 15.14, 14.19, 13.22, 18 or later) and
+  is refused otherwise, whatever the SQL source; pre-release or unparsable `psql --version`
+  output counts as unsupported. No SQL run through the plugin can use any psql meta-command,
+  stored (`run_sql.sql`, `run_sql.file`) or caller-supplied. An operator who relied on
+  meta-commands in stored SQL (for example `\copy` from a local file, `\set`, `\i`) must move
+  that logic elsewhere.
 - Not covered: `COPY ... TO/FROM PROGRAM` and other server-side effects run with the database
   role of the credential (use a role without `pg_execute_server_program`); a caller `file` path
-  can read any file the proxy user can read as SQL (its content can surface in error text) and
-  `backup.allow_override` lets a caller choose any output path the proxy user can write. Leave
+  can read any file the proxy user can read as SQL (its content can surface in error text), a
+  stored `run_sql.file` likewise, and `backup.allow_override` lets a caller choose any output path the proxy user can write. Leave
   both overrides off unless the caller is as trusted as the operator.
-- A credential's metadata is operator-authored, so a principal that may create or edit
-  credentials can put meta-commands in `run_sql.sql` / `run_sql.file`. Restrict credential
-  writes accordingly.
+- A principal that may create or edit credentials still chooses the SQL a credential runs
+  and the file it reads, but can no longer use meta-commands to execute commands on the proxy
+  host. Restrict credential writes accordingly.
 
 ## Rate-limit windows are per-process and per-replica (vultrino#6)
 

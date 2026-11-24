@@ -194,6 +194,11 @@ async fn postgres_ssh_children_get_minimal_environment() {
     let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let stubs = tempdir().unwrap();
     write_stubs(stubs.path());
+    std::fs::write(
+        stubs.path().join("psql.version"),
+        "psql (PostgreSQL) 18.3 (stub)\n",
+    )
+    .unwrap();
     let old = poison_env(stubs.path());
 
     let (s, st) = server().await;
@@ -272,7 +277,7 @@ const META_ATTEMPTS: &[&str] = &[
 ];
 
 #[tokio::test(flavor = "multi_thread")]
-async fn caller_sql_is_sent_only_behind_a_restrict_line() {
+async fn all_sql_is_sent_only_behind_a_restrict_line() {
     let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let stubs = tempdir().unwrap();
     write_stubs(stubs.path());
@@ -346,16 +351,57 @@ async fn caller_sql_is_sent_only_behind_a_restrict_line() {
     assert!(stdin_of(stubs.path()).starts_with("\\restrict "));
     assert!(!recorded_argv(stubs.path()).contains("-f"));
 
-    // Operator-authored SQL from metadata is unchanged: no restrict line, meta-commands kept.
+    // Stored SQL (metadata) is restricted too: restrict line first, fresh key, timeout SET.
+    let stored = "\\set a 1\n\\! id\nselect :a;\n";
     st.store(
-        &pg_cred("pg-op", 5432, false).with_metadata("run_sql.sql", "\\set a 1\nselect :a;\n"),
+        &pg_cred("pg-op", 5432, false)
+            .with_metadata("run_sql.sql", stored)
+            .with_metadata("run_sql.statement_timeout_ms", "7000"),
     )
     .await
     .unwrap();
-    run(&s, &st, "pg-op", "postgres.run_sql", serde_json::json!({}))
+    let mut stored_keys = Vec::new();
+    for _ in 0..2 {
+        let r = run(&s, &st, "pg-op", "postgres.run_sql", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(r["source"], "inline");
+        let got = stdin_of(stubs.path());
+        let (first, rest) = got.split_once('\n').unwrap();
+        stored_keys.push(
+            first
+                .strip_prefix("\\restrict ")
+                .expect("restrict first")
+                .to_string(),
+        );
+        assert!(!got.contains("\\unrestrict"));
+        assert_eq!(rest, format!("SET statement_timeout = 7000;\n{stored}"));
+        assert!(!recorded_argv(stubs.path()).contains("-c"));
+    }
+    assert_ne!(stored_keys[0], stored_keys[1], "fresh key per call");
+
+    // A stored file is read by the proxy and sent behind the restrict line, never as `-f`.
+    let sf = stubs.path().join("stored.sql");
+    std::fs::write(&sf, "\\! id\ncreate table t(a int);\nselect 1;\n").unwrap();
+    st.store(&pg_cred("pg-file", 5432, false).with_metadata("run_sql.file", sf.to_str().unwrap()))
         .await
         .unwrap();
-    assert_eq!(stdin_of(stubs.path()), "\\set a 1\nselect :a;\n");
+    let r = run(
+        &s,
+        &st,
+        "pg-file",
+        "postgres.run_sql",
+        serde_json::json!({}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(r["source"], format!("file:{}", sf.display()));
+    let got = stdin_of(stubs.path());
+    assert!(got.starts_with("\\restrict "));
+    assert!(got.ends_with("\\! id\ncreate table t(a int);\nselect 1;\n"));
+    assert!(!recorded_argv(stubs.path()).contains("-f"));
+    // Without a timeout configured there is no SET line, only restrict then the file text.
+    assert!(!got.contains("statement_timeout"));
     restore_env(&old);
 }
 
@@ -368,7 +414,7 @@ fn recorded_argv(stubs: &Path) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn caller_sql_is_refused_when_psql_is_too_old_or_unrecognised() {
+async fn all_sql_is_refused_when_psql_is_too_old_or_unrecognised() {
     let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let stubs = tempdir().unwrap();
     write_stubs(stubs.path());
@@ -396,21 +442,35 @@ async fn caller_sql_is_refused_when_psql_is_too_old_or_unrecognised() {
         )
         .await;
         let e = r.expect_err(&format!("caller SQL must be refused for {v:?}"));
-        assert!(e.contains("restrict"), "clear error: {e}");
+        assert!(
+            e.contains("restrict") && e.contains("17.6"),
+            "clear error: {e}"
+        );
         assert!(
             !stubs.path().join("psql.rec").exists(),
             "psql must not run the SQL for {v:?}"
         );
     }
-    // Operator SQL from metadata still runs on an old psql.
-    std::fs::write(
-        stubs.path().join("psql.version"),
-        "psql (PostgreSQL) 12.22\n",
-    )
-    .unwrap();
-    run(&s, &st, "pg", "postgres.run_sql", serde_json::json!({}))
+    // Stored SQL (inline and file) is refused on an old psql too, and psql never runs.
+    let sf = stubs.path().join("stored.sql");
+    std::fs::write(&sf, "\\! id\n").unwrap();
+    st.store(&pg_cred("pg-file", 5432, false).with_metadata("run_sql.file", sf.to_str().unwrap()))
         .await
         .unwrap();
+    for v in ["psql (PostgreSQL) 12.22\n", "something unexpected\n"] {
+        std::fs::write(stubs.path().join("psql.version"), v).unwrap();
+        for alias in ["pg", "pg-file"] {
+            let _ = std::fs::remove_file(stubs.path().join("psql.rec"));
+            let e = run(&s, &st, alias, "postgres.run_sql", serde_json::json!({}))
+                .await
+                .expect_err("stored SQL must be refused on an old psql");
+            assert!(
+                e.contains("restrict") && e.contains("17.6"),
+                "clear error: {e}"
+            );
+            assert!(!stubs.path().join("psql.rec").exists());
+        }
+    }
     // The new releases are accepted.
     for v in [
         "psql (PostgreSQL) 17.6\n",
@@ -444,7 +504,7 @@ fn tool(name: &str) -> Option<PathBuf> {
 
 /// End to end with a REAL psql against a minimal wire-protocol stub server (not Postgres).
 #[tokio::test(flavor = "multi_thread")]
-async fn real_psql_does_not_run_meta_commands_from_caller_sql() {
+async fn real_psql_does_not_run_meta_commands_from_any_sql() {
     let _g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let psql_dir = ["/opt/homebrew/opt/libpq/bin", "/usr/local/opt/libpq/bin"]
         .iter()
@@ -529,8 +589,8 @@ async fn real_psql_does_not_run_meta_commands_from_caller_sql() {
         assert_ne!(r["exit_code"], 0, "meta-command must fail: {r}");
         assert!(!m.exists(), "meta-command {i} executed a shell command");
     }
-    // Operator-authored metadata SQL still runs its meta-commands.
-    let m = marker.path().join("operator");
+    // Stored SQL and a stored file are restricted too: the meta-command must not run.
+    let m = marker.path().join("stored-sql");
     st.store(
         &pg_cred("pg-op", port, false)
             .with_metadata("run_sql.sql", format!("\\! touch {}\n", m.display())),
@@ -540,8 +600,46 @@ async fn real_psql_does_not_run_meta_commands_from_caller_sql() {
     let r = run(&s, &st, "pg-op", "postgres.run_sql", serde_json::json!({}))
         .await
         .unwrap();
+    assert_ne!(r["exit_code"], 0, "stored meta-command must fail: {r}");
+    assert!(!m.exists(), "stored SQL executed a shell command");
+
+    let m2 = marker.path().join("stored-file");
+    let sf = marker.path().join("stored.sql");
+    std::fs::write(&sf, format!("select 1;\n\\! touch {}\n", m2.display())).unwrap();
+    st.store(&pg_cred("pg-file", port, false).with_metadata("run_sql.file", sf.to_str().unwrap()))
+        .await
+        .unwrap();
+    let r = run(
+        &s,
+        &st,
+        "pg-file",
+        "postgres.run_sql",
+        serde_json::json!({}),
+    )
+    .await
+    .unwrap();
+    assert_ne!(r["exit_code"], 0, "stored-file meta-command must fail: {r}");
+    assert!(!m2.exists(), "stored file executed a shell command");
+
+    // Plain stored SQL and a plain stored file still run.
+    st.store(&pg_cred("pg-ok", port, false).with_metadata("run_sql.sql", "select 1;\nselect 2;\n"))
+        .await
+        .unwrap();
+    let r = run(&s, &st, "pg-ok", "postgres.run_sql", serde_json::json!({}))
+        .await
+        .unwrap();
     assert_eq!(r["exit_code"], 0, "{r}");
-    assert!(m.exists(), "operator SQL keeps meta-commands");
+    std::fs::write(&sf, "select 1;\nselect 2;\n").unwrap();
+    let r = run(
+        &s,
+        &st,
+        "pg-file",
+        "postgres.run_sql",
+        serde_json::json!({}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(r["exit_code"], 0, "{r}");
 
     std::env::remove_var("VULTRINO_PASSWORD");
     std::env::set_var("PATH", old);
